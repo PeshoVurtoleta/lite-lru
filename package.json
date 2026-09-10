@@ -1,0 +1,72 @@
+{
+  "name": "@zakkster/lite-lru",
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "version": "0.1.0",
+  "description": "Tiny, fast, zero-dependency, zero-GC LRU cache with O(1) get/put/delete over a preallocated intrusive doubly-linked list.",
+  "type": "module",
+  "main": "./Lru.js",
+  "module": "./Lru.js",
+  "types": "./Lru.d.ts",
+  "exports": {
+    ".": {
+      "types": "./Lru.d.ts",
+      "node": "./Lru.js",
+      "import": "./Lru.js",
+      "default": "./Lru.js"
+    }
+  },
+  "files": [
+    "Lru.js",
+    "Lru.d.ts",
+    "llms.txt",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "torture": "node --expose-gc test/torture.mjs",
+    "torture:controls": "node test/controls.mjs",
+    "verify": "npm test && npm run torture && npm run torture:controls"
+  },
+  "keywords": [
+    "lru",
+    "cache",
+    "lru-cache",
+    "zero-gc",
+    "gc",
+    "garbage-collection",
+    "memory",
+    "performance",
+    "o1",
+    "linked-list",
+    "game",
+    "lightweight",
+    "zero-dependency"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "homepage": "https://github.com/PeshoVurtoleta/lite-lru#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-lru.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-lru/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
+  },
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "^1.15.0",
+    "@zakkster/lite-leak": "^1.8.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false
+}
