@@ -29,7 +29,8 @@
  *   - Fail closed: an invalid capacity throws at the door; null is not zero.
  *   - ASCII-only source. Single file. Zero runtime deps.
  *
- * Design decisions live in decisions/ (D1..D10) and are summarized in ROADMAP.md.
+ * Design decisions live in decisions/ (D1..D10 in 0001; the onEvict reentrancy
+ * contract in 0002) and are summarized in ROADMAP.md.
  */
 
 /** Shared no-op eviction callback, so a cache without an onEvict handler
@@ -40,6 +41,14 @@ const NOOP = () => {};
 /** Sentinel for "no slot" -- used for empty head/tail and free-list end.
  *  -1 because slots are non-negative indices, so it can never collide. */
 const NIL = -1;
+
+/** Message for the onEvict reentrancy guard (amends D8; decisions/0002). A mutating
+ *  method called from within the onEvict callback would operate on the intrusive
+ *  lists while an eviction is in flight; we fail CLOSED and reject it loudly
+ *  rather than silently corrupt the structure. Built once, thrown only on misuse. */
+const REENTRANT_MSG =
+    "[lite-lru] a mutating method (put/get/delete/clear) was called from within " +
+    "onEvict; the callback must not reenter this cache instance (use has/peek to read)";
 
 export const VERSION = "0.1.0";
 
@@ -84,6 +93,11 @@ export class LiteLru {
 
         // D8 -- optional zero-GC eviction hook (e.g. return the value to a pool).
         this._onEvict = (options && options.onEvict) || NOOP;
+
+        // Reentrancy guard (amends D8; decisions/0002). True only while _onEvict is
+        // executing. A mutating method entered during that window throws. A plain
+        // boolean: zero allocation, one predicted-not-taken branch on the hot path.
+        this._inOnEvict = false;
     }
 
     get size() { return this._size; }
@@ -146,6 +160,7 @@ export class LiteLru {
      *          disambiguate, or peek(). (Roadmap S3 adds a get(key, default).)
      */
     get(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._map.get(key);
         // Slots are >= 0, so a strict `undefined` check is a clean miss test even
         // when the slot is 0 (which is falsy -- do NOT use truthiness here).
@@ -159,6 +174,7 @@ export class LiteLru {
      * first (and fires onEvict). Amortized O(1).
      */
     put(key, value) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const existing = this._map.get(key);
         if (existing !== undefined) {         // update-in-place + promote
             this._vals[existing] = value;
@@ -166,17 +182,18 @@ export class LiteLru {
             return;
         }
 
-        let s;
+        let s, evKey, evVal;
+        let evicted = false;
         if (this._size === this._capacity) {
             // D6 -- evict the LRU (tail) and REUSE its slot in place, skipping a
             // free-list round trip. One unlink, one map delete, one relink.
             s = this._tail;
-            const evKey = this._keys[s];
-            const evVal = this._vals[s];
+            evKey = this._keys[s];
+            evVal = this._vals[s];
             this._detach(s);
             this._map.delete(evKey);
             this._size--;
-            this._onEvict(evKey, evVal); // after unlink, before reuse
+            evicted = true;
         } else {
             s = this._allocSlot();
         }
@@ -186,6 +203,21 @@ export class LiteLru {
         this._map.set(key, s);
         this._pushFront(s);
         this._size++;
+
+        // Reentrancy fix (decisions/0002) -- fire onEvict LAST, when the cache is
+        // fully consistent (the new entry is inserted, size restored). Firing
+        // mid-eviction left slot `s` detached-but-unreclaimed; a reentrant put()
+        // then popped an empty free list (slot -1 == NIL) and corrupted the lists.
+        // The guard rejects any mutating reentry; because the cache is already
+        // consistent here, that throw leaves it intact.
+        if (evicted) {
+            this._inOnEvict = true;
+            try {
+                this._onEvict(evKey, evVal);
+            } finally {
+                this._inOnEvict = false;
+            }
+        }
     }
 
     /** True if key is present. Does NOT change recency (D7). */
@@ -202,6 +234,7 @@ export class LiteLru {
      * free stack, so the cache can sit below capacity again.
      */
     delete(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._map.get(key);
         if (s === undefined) return false;
         this._detach(s);
@@ -213,6 +246,7 @@ export class LiteLru {
 
     /** Empty the cache. Rebuilds the free list; allocates nothing. O(capacity). */
     clear() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         this._map.clear();
         const cap = this._capacity;
         for (let i = 0; i < cap; i++) {

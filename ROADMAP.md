@@ -39,8 +39,8 @@ Two structural consequences follow, and they reorder the whole plan:
 
 Open questions and the points where I diverge from the originating analysis are in
 `DEBATE.md`. This roadmap is written as if those are settled the recommended way;
-`DEBATE.md` item 1 (does the family REPLACE or EXTEND the v1.0.0 plan) is the one
-still genuinely open -- everything below assumes REPLACE.
+`DEBATE.md` item 1 (does the family REPLACE or EXTEND the v1.0.0 plan) is now
+RESOLVED = REPLACE (B), confirmed at S1 -- everything below is on the live path.
 
 **State.** v0.1.0 ships the classic core: `Lru.js` (Map + intrusive preallocated
 DLL), `package.json`, `LICENSE`, `decisions/0001-structure.md`. Core semantics are
@@ -52,7 +52,8 @@ substrate, every modern strategy, the docs -- is ahead.
 | `Lru.js` classic core (get/put/delete/has/peek/clear) | **built, smoke-verified** |
 | package scaffold (package.json, LICENSE) | **built** |
 | decisions/0001-structure | **written** |
-| node:test suite + torture harness + oracle | S1 |
+| node:test suite + torture harness + oracle | **built + gated (S1)** |
+| Lru.js onEvict reentrancy fix (decisions/0002, amends D8) | **built + gated (S1)** |
 | `Lru.d.ts` + family interface | S2 |
 | shared keyed-index substrate (was S4, now the keystone) | S3 |
 | SIEVE | S4 |
@@ -285,16 +286,26 @@ NON-GOALS met: no tests yet, no docs, no d.ts.
 ===============================================================================
 ```markdown
 version_target: 0.1.1
-status: planned
+status: implemented -- gated green, awaiting /release 0.1.1
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0   # slot layer strict; Map layer amortized until S3 (D3)
 leak_cycles: 4096
 peers: ["@zakkster/lite-gc-profiler", "@zakkster/lite-leak"]
-decisions: [D10]
+decisions: [D10, "0002 (onEvict reentrancy, amends D8)"]
 depends_on: [S0]
 blocks: [S2, S3]
 ```
+WHAT LANDED (S1, working tree, uncommitted; VERSION still 0.1.0 until /release):
+  - test/: node:test suite (32 cases) + torture harness with the POLICY-PARAMETERIZED
+    differential runner (drives LiteLru + a FIFO seam policy) + oracles + T0/T1/T2/T5/T6/T7/T9
+    + out-of-process must-fail controls. validate() = the generalized conservation invariant.
+  - Gates: npm test 32/32; torture prints "ok"/exit 0; controls "ok"/exit 0; npm pack excludes
+    test/ + decisions/. Writes-per-hit baseline pinned: head 0 / interior 5 / tail 4.
+  - DEFECT FOUND + FIXED (qa): onEvict reentrancy corrupted the lists (size>capacity, phantom
+    slot -1, validate() hang). Fix = fire onEvict LAST (cache consistent) + fail-closed guard on
+    put/get/delete/clear (has/peek stay open). Recorded in decisions/0002 (amends D8). Regression
+    pinned; reviewer verified the tests fail against the pre-fix code (real teeth).
 PURPOSE
   Prove the classic structure AND build the harness the whole family leans on.
   Highest priority; nothing else starts until the gate is green and controls fail.
@@ -605,6 +616,7 @@ gate for each minor updates it.
 | ID | Decision | Session |
 | --- | --- | --- |
 | D1-D10 | classic structure (Map+DLL, slots, links, free stack, evict-in-place, miss policy, onEvict, fail-closed capacity, test-only introspection) | 0001 (S0) |
+| D8+ | onEvict reentrancy contract: fire-after ordering + fail-closed guard (amends D8; found by S1 qa) | 0002 (S1) |
 | D11 | shared keyed-index substrate (open-addressed typed-array index + Map fallback) | 0011 (S3) |
 | D12 | SIEVE (visited bit + hand; Uint8Array vs bit-pack) | 0012 (S4) |
 | D13 | S3-FIFO (three queues + bounded ghost ring) | 0013 (S5) |

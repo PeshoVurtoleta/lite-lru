@@ -32,6 +32,11 @@ strategies before releasing) while making the release *mean* something.
 **This is genuinely your call, not mine** -- it is positioning, not code. If you
 want A, say so and I move the family to a v2 track and leave S0-S6 as they were.
 
+**RESOLVED (S1): B (reframe).** Confirmed by the maintainer. The family is the
+identity from v1.0.0; classic LRU is the reference member + differential oracle +
+honest floor. S1 accordingly builds the policy-parameterized oracle runner (proven
+by a second stub policy), not a single-policy harness.
+
 ---
 
 ## 2. The "lock-free / scalable" argument does NOT transfer to this suite

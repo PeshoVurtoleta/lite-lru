@@ -62,8 +62,8 @@
     "url": "https://github.com/sponsors/PeshoVurtoleta"
   },
   "devDependencies": {
-    "@zakkster/lite-gc-profiler": "^1.15.0",
-    "@zakkster/lite-leak": "^1.8.1"
+    "@zakkster/lite-gc-profiler": "^1.16.0",
+    "@zakkster/lite-leak": "^1.10.0"
   },
   "engines": {
     "node": ">=18"
