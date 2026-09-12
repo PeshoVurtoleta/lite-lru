@@ -158,7 +158,7 @@ interface LiteCacheOptions<K, V> {
 `Bench.mjs` ships in the tarball as both a runnable and a subpath import. It imports ONLY the cache implementation -- zero runtime deps, no test-only devDeps.
 
 ```ts
-import { runBench, beladyOpt } from '@zakkster/lite-lru/Bench.mjs';
+import { runBench, beladyOpt } from '@zakkster/lite-lru/benchmark/Bench.mjs';
 
 runBench(opts?): BenchResult
 // opts: { capacity?, length?, seed?, workloads?: [{ name, capacity, trace: number[] }] }
@@ -177,7 +177,7 @@ Run directly, it prints a table; imported, it returns structured results and pri
 
 | Constant  | Value     | Meaning                                                       |
 | --------- | --------- | ------------------------------------------------------------ |
-| `VERSION` | `'0.1.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
+| `VERSION` | `'1.0.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
 
 Both members and `VERSION` are named exports; `LiteLru` is also the default export.
 
@@ -189,7 +189,7 @@ The end-to-end "measure, then deploy" loop the family is built for -- pick a pol
 
 ```js
 import { LiteLru, Sieve } from '@zakkster/lite-lru';
-import { runBench, beladyOpt } from '@zakkster/lite-lru/Bench.mjs';
+import { runBench, beladyOpt } from '@zakkster/lite-lru/benchmark/Bench.mjs';
 
 // 1. Capture (or synthesize) YOUR access trace as an array of integer keys.
 const trace = /* e.g. request key per event, in order */ [];
@@ -269,7 +269,7 @@ A `CountedLru` / `CountedSieve` proxy tallies every index store in the torture g
 Hit ratio and throughput are OUTPUTS of your trace, never headline claims. The bench is how you get them -- for the members AND for Belady's clairvoyant optimum, so you see how much room is actually left:
 
 ```bash
-npm run bench     # or: node Bench.mjs
+npm run bench     # or: node benchmark/Bench.mjs
 ```
 
 The default run reports each member on three named, seeded workloads -- `zipf` (skewed popularity), `loop` (a sequential scan larger than the cache), and `scan` (a one-hit-wonder flood over a stable hot set) -- as a fraction of OPT. On the default seeded trace in this repo (capacity 256, 200000 ops, seed `0x9e3779b9`), the deterministic outputs are:

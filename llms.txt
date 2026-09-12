@@ -8,7 +8,7 @@ dependencies, node:test only. Ships a runnable + importable benchmark tool
 (Bench.mjs) with Belady OPT so a caller measures which policy fits their trace
 instead of guessing.
 
-## Status: 0.1.0 - S9: docs + shipped bench tool + Belady OPT (the v1.0.0 gate)
+## Status: 1.0.0 - the release: a cache family (LiteLru + Sieve) under one interface, on the shared substrate, with the shipped bench + Belady OPT tool
 
 The family is the identity from v1.0.0: classic LRU is the reference member +
 differential oracle + honest floor, SIEVE is the headline, and the shipped
@@ -23,7 +23,7 @@ fail-closed guard, decisions/0002). S3 factored the shared keyed-index substrate
 STRICT zero-alloc (decisions/0011). S4 added SIEVE as the first modern member on
 that substrate (decisions/0012). S9 (this session) adds the docs, the shipped
 bench + Belady OPT tool, and the OPT torture gate -- with ZERO change to Lru.js /
-Lru.d.ts (only VERSION moves at /release; it stays 0.1.0 until then).
+Lru.d.ts (the three version sites move together, only at /release).
 
 ## Members (decisions/0001, 0012)
 
@@ -89,11 +89,11 @@ INTERNAL, so new LiteLru(n) swaps for new Sieve(n) and stays type-checked.
 
 ## Bench tool (Bench.mjs, decisions D20 / DEBATE item 13)
 
-Ships in the tarball AND in exports as "./Bench.mjs". A runnable ESM tool AND an
+Ships in the tarball AND in exports as "./benchmark/Bench.mjs". A runnable ESM tool AND an
 importable module; imports ONLY ./Lru.js (zero runtime deps).
 
-- npm run bench  /  node Bench.mjs  -> prints a per-workload, per-member table.
-- import { runBench, beladyOpt } from '@zakkster/lite-lru/Bench.mjs'
+- npm run bench  /  node benchmark/Bench.mjs  -> prints a per-workload, per-member table.
+- import { runBench, beladyOpt } from '@zakkster/lite-lru/benchmark/Bench.mjs'
   - runBench(opts?) -> structured results (hitRatio, writesPerHit, nsPerOp,
     pctOptimal) per workload (zipf / loop / scan; or a caller-supplied trace) per
     member, plus each workload's OPT. Deterministic for a given seed. ns/op is
@@ -111,15 +111,15 @@ drops LiteLru's body from the bundle (and vice versa). The shared substrate is
 INTERNAL, not an export; there is NO subpath-per-policy. Bench.mjs is a separate
 runnable tool, not a second implementation.
 
-## API (0.1.0)
+## API (1.0.0)
 
 Named exports from @zakkster/lite-lru:
 
 - LiteLru: the classic LRU member (also the default export).
 - Sieve: the SIEVE member.
-- VERSION: '0.1.0'
+- VERSION: '1.0.0'
 
-Named exports from @zakkster/lite-lru/Bench.mjs:
+Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
 - runBench(opts?), beladyOpt(trace, capacity), plus the seeded trace generators
   (zipfTrace, loopTrace, scanTrace, makePrng) used to build reproducible traces.

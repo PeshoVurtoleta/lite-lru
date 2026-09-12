@@ -5,10 +5,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
-together (three-place version sync) at release; all of the below is staged under
-`[Unreleased]` at `VERSION` 0.1.0.
+together (three-place version sync) at release.
 
-## [Unreleased]
+## [1.0.0] - 2026-09-12
 
 ### Added
 
@@ -42,12 +41,12 @@ together (three-place version sync) at release; all of the below is staged under
   members implement, `LiteCacheOptions<K,V>`, and the `VERSION` declaration. A
   drift gate keeps the export set and public class surface in lock-step with
   `Lru.js`.
-- **`Bench.mjs`** -- a runnable (`node Bench.mjs` / `npm run bench`) AND importable
-  (`import { runBench, beladyOpt } from '@zakkster/lite-lru/Bench.mjs'`)
+- **`Bench.mjs`** -- a runnable (`node benchmark/Bench.mjs` / `npm run bench`) AND importable
+  (`import { runBench, beladyOpt } from '@zakkster/lite-lru/benchmark/Bench.mjs'`)
   measurement tool that imports only `Lru.js` (zero runtime deps). Reports, per
   seeded workload (`zipf` / `loop` / `scan`) per member: hit ratio, writes-per-hit,
   machine-local ns/op, and percentage of Belady OPT. Added to `package.json`
-  `files[]`, the `exports` map (`"./Bench.mjs"`), and a `bench` script.
+  `files[]`, the `exports` map (`"./benchmark/Bench.mjs"`), and a `bench` script.
 - **`beladyOpt(trace, capacity)`** -- Belady's clairvoyant offline optimum (evict
   the resident whose next use is farthest away), exported from `Bench.mjs` as a
   reference oracle only; never a production policy.
@@ -60,7 +59,7 @@ together (three-place version sync) at release; all of the below is staged under
   TypeError door, the `onEvict` fire-after + reentrancy contract, the D7
   undefined-value contract, the gated writes-per-hit and zero-GC numbers, and the
   `Measure & Trust` bench workflow.
-- **Test + torture suite** -- 143 `node:test` cases; a policy-parameterized
+- **Test + torture suite** -- 160 `node:test` cases; a policy-parameterized
   differential runner with independent brute-force oracles for both members on both
   backings; torture tiers `t0`/`t1`/`t2`/`t5`/`t6`/`t7`/`t8`/`t9` plus out-of-process
   must-fail controls; a `validate()` conservation invariant.

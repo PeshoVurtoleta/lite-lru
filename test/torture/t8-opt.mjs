@@ -20,7 +20,7 @@
  */
 
 import { LiteLru, Sieve } from '../../Lru.js';
-import { beladyOpt } from '../../Bench.mjs';
+import { beladyOpt } from '../../benchmark/Bench.mjs';
 import { makePrng, SEED, check } from './harness.mjs';
 
 /* -------------------------------------------------------------------------- *
@@ -65,7 +65,7 @@ function memberHits(CacheClass, trace, capacity) {
 
 /* -------------------------------------------------------------------------- *
  * Seeded trace builders (self-contained; the bench's generators are exercised
- * separately by node Bench.mjs). Plain integer-key Arrays so hit counts reproduce.
+ * separately by node benchmark/Bench.mjs). Plain integer-key Arrays so hit counts reproduce.
  * -------------------------------------------------------------------------- */
 function zipfish(prng, length, keyspace) {
     const t = new Array(length);

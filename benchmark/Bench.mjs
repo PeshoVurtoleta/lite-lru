@@ -3,11 +3,11 @@
  *
  * A runnable ESM tool AND an importable module. Two entry paths, both supported:
  *
- *   node Bench.mjs                                   -- prints a readable table
+ *   node benchmark/Bench.mjs                         -- prints a readable table
  *   npm run bench                                    -- the same
- *   import { runBench, beladyOpt } from '@zakkster/lite-lru/Bench.mjs'
+ *   import { runBench, beladyOpt } from '@zakkster/lite-lru/benchmark/Bench.mjs'
  *
- * It imports ONLY ./Lru.js (the single implementation) -- zero runtime deps, and
+ * It imports ONLY ../Lru.js (the single implementation) -- zero runtime deps, and
  * NOT the test-only devDeps. It is a TOOL, not a hot path: zero-alloc is NOT a
  * requirement of the bench itself; it must only stay dependency-free and never
  * mutate global state.
@@ -29,12 +29,12 @@
  * @license MIT
  */
 
-import { LiteLru, Sieve, VERSION } from './Lru.js';
+import { LiteLru, Sieve, VERSION } from '../Lru.js';
 
 /* -------------------------------------------------------------------------- *
  * Seeded PRNG -- xorshift32, the same generator the torture harness uses, so a
  * trace is byte-reproducible from its seed. Kept local: Bench.mjs imports only
- * ./Lru.js.
+ * ../Lru.js.
  * -------------------------------------------------------------------------- */
 
 /** Seeded xorshift32. Returns a function yielding a uint32 each call. */
@@ -448,7 +448,7 @@ function printBench(out) {
     process.stdout.write(lines.join('\n') + '\n');
 }
 
-// Run the printer only when invoked directly (node Bench.mjs / npm run bench),
+// Run the printer only when invoked directly (node benchmark/Bench.mjs / npm run bench),
 // not when imported. Kept dependency-free: node:url is a builtin.
 import { pathToFileURL } from 'node:url';
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

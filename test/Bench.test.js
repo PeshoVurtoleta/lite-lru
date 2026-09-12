@@ -11,7 +11,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { beladyOpt, runBench } from '../Bench.mjs';
+import { beladyOpt, runBench } from '../benchmark/Bench.mjs';
 import { LiteLru, Sieve } from '../Lru.js';
 
 /* -------------------------------------------------------------------------- *
@@ -122,7 +122,7 @@ test('beladyOpt: hits are within [0, trace.length) and >= each member on small t
 
 /* -------------------------------------------------------------------------- *
  * runBench -- structural contract on a small, fast configuration (the heavy,
- * realistic-scale numbers are a `node Bench.mjs` concern, verified manually;
+ * realistic-scale numbers are a `node benchmark/Bench.mjs` concern, verified manually;
  * this only pins the SHAPE and RANGES of what runBench returns).
  * -------------------------------------------------------------------------- */
 

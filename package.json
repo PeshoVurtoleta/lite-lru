@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-lru",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Zero-dependency, zero-GC cache family under one LiteCache<K,V> surface: a classic LRU reference member and the modern SIEVE headline, tree-shakeable to one policy, with a shipped bench + Belady OPT measurement tool.",
   "type": "module",
   "main": "./Lru.js",
@@ -14,12 +14,12 @@
       "import": "./Lru.js",
       "default": "./Lru.js"
     },
-    "./Bench.mjs": "./Bench.mjs"
+    "./benchmark/Bench.mjs": "./benchmark/Bench.mjs"
   },
   "files": [
     "Lru.js",
     "Lru.d.ts",
-    "Bench.mjs",
+    "benchmark/Bench.mjs",
     "llms.txt",
     "README.md",
     "CHANGELOG.md",
@@ -30,7 +30,7 @@
     "test:types": "tsc -p test/types/tsconfig.json",
     "torture": "node --expose-gc test/torture.mjs",
     "torture:controls": "node test/controls.mjs",
-    "bench": "node Bench.mjs",
+    "bench": "node benchmark/Bench.mjs",
     "verify": "npm test && npm run test:types && npm run torture && npm run torture:controls"
   },
   "keywords": [

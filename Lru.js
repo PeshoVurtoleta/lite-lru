@@ -83,7 +83,7 @@ const INT_KEY_MSG =
 const INT_MIN = -2147483648;
 const INT_MAX = 2147483647;
 
-export const VERSION = "0.1.0";
+export const VERSION = "1.0.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
