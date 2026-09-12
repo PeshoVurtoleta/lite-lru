@@ -70,7 +70,7 @@ LiteMGLRU, meta-policy; distilled into DEBATE items 13-15).
 | node:test suite + torture harness + oracle | **built + gated (S1)** |
 | Lru.js onEvict reentrancy fix (decisions/0002, amends D8) | **built + gated (S1)** |
 | `Lru.d.ts` + family interface | S2 |
-| shared keyed-index substrate (was S4, now the keystone) | S3 |
+| shared keyed-index substrate (was S4, now the keystone) | **built + gated (S3)** |
 | SIEVE | S4 |
 | S3-FIFO | S5 |
 | W-TinyLFU | S6 |
@@ -386,7 +386,7 @@ drift -- the blueprint lists d.ts drift as a recurring finding class). Add to
 ===============================================================================
 ```markdown
 version_target: 0.3.0
-status: planned
+status: implemented -- gated green (74 tests, int strict-zero Gate INT, +33 int-backing node:tests), awaiting /release 0.3.0
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0

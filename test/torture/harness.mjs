@@ -153,10 +153,20 @@ export function wrapLru(cache) {
     };
 }
 
-/** The classic-LRU policy: the reference member + differential oracle + floor. */
+/** The classic-LRU policy: the reference member + differential oracle + floor.
+ *  Default backing (Map): arbitrary keys, honestly amortized (decisions/0011). */
 export const lruPolicy = {
     name: 'lru',
     real: (cap) => wrapLru(new LiteLru(cap)),
+    oracle: (cap) => makeLruOracle(cap),
+};
+
+/** The classic-LRU policy on the INTEGER substrate backing (`keys: 'int'`). Driven
+ *  against the SAME lru oracle as the default backing: the open-addressed
+ *  typed-array index must return byte-identical values + victims (decisions/0011). */
+export const lruIntPolicy = {
+    name: 'lru-int',
+    real: (cap) => wrapLru(new LiteLru(cap, { keys: 'int' })),
     oracle: (cap) => makeLruOracle(cap),
 };
 

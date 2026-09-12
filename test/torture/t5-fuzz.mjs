@@ -6,12 +6,14 @@
  * divergence the runner returns a record; this tier prints the seed + op index so
  * the case replays via  TORTURE_SEED=<n> node --expose-gc test/torture.mjs.
  *
- * TWO policies are driven, proving the runner is policy-parameterized (not a
- * single-policy harness): classic LRU (real LiteLru vs brute array oracle) and
- * FIFO (real Map+queue vs brute array oracle). A future member is a third line.
+ * THREE policies are driven, proving the runner is policy-parameterized (not a
+ * single-policy harness): classic LRU on the DEFAULT Map backing, classic LRU on
+ * the INTEGER substrate backing (`keys: 'int'`) -- BOTH against the SAME lru oracle
+ * so the substrate is byte-identical (decisions/0011) -- and FIFO (real Map+queue
+ * vs brute array oracle). A future member is a fourth line.
  */
 
-import { runDifferential, lruPolicy, fifoPolicy, SEED, die } from './harness.mjs';
+import { runDifferential, lruPolicy, lruIntPolicy, fifoPolicy, SEED, die } from './harness.mjs';
 
 const OPS = 100000;
 
@@ -32,12 +34,18 @@ function fuzzPolicy(policy, configs) {
 
 export function run() {
     // Keyspace tuned so hits and evictions both happen often: keyspace ~ 2..4x cap.
-    fuzzPolicy(lruPolicy, [
+    const lruConfigs = [
         { cap: 1, keyspace: 4, ops: OPS, salt: 0x51 },   // degenerate cap-1
         { cap: 8, keyspace: 24, ops: OPS, salt: 0x52 },
         { cap: 64, keyspace: 200, ops: OPS, salt: 0x53 },
         { cap: 256, keyspace: 300, ops: OPS, salt: 0x54 }, // high hit rate
-    ]);
+    ];
+    fuzzPolicy(lruPolicy, lruConfigs);
+
+    // The SUBSTRATE proof (decisions/0011): the integer open-addressed backing is
+    // driven across the SAME corpus against the SAME lru oracle -- identical values
+    // + victims. Keys are `prng() % keyspace` (non-negative int32), valid int-mode.
+    fuzzPolicy(lruIntPolicy, lruConfigs);
 
     // The SEAM proof: the SAME runner drives a second policy unchanged.
     fuzzPolicy(fifoPolicy, [

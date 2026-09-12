@@ -1,12 +1,18 @@
 /**
  * t6 -- the zero-alloc gate (+ writes-per-hit), the THING UNDER TEST.
  *
- * HONEST POSTURE (D3): the DLL/slot layer is STRICTLY zero-alloc; the Map layer is
- * AMORTIZED-stable (its internal resize can allocate). This tier isolates the
- * STRICT claim by running the hot loop on a PRE-FILLED, at-capacity cache with a
- * FIXED key set -- get(existing) and put(update existing) only touch Map.get + the
- * Int32Array link columns, so no Map resize is ever in scope. (The strict-index
- * claim with NO pre-fill caveat is deferred to S3, the substrate.)
+ * HONEST POSTURE (D3): the DLL/slot layer is STRICTLY zero-alloc; the default Map
+ * layer is AMORTIZED-stable (its internal resize can allocate). This tier isolates
+ * the STRICT claim for the Map path by running the hot loop on a PRE-FILLED,
+ * at-capacity cache with a FIXED key set -- get(existing) and put(update existing)
+ * only touch Map.get + the Int32Array link columns, so no Map resize is ever in
+ * scope.
+ *
+ * S3 (decisions/0011): the INTEGER substrate backing (`keys: 'int'`) is STRICT with
+ * NO pre-fill caveat -- Gate INT churns NEW integer keys from an EMPTY cache so
+ * every op inserts + evicts (idxSet + backshift idxDelete), and asserts maxMajor:0
+ * AND that the `_ixSlot` / `_ixKey` index buffers never grow. The whole point of
+ * the substrate is that even the keyed index never allocates.
  *
  * Two channels, separate windows (one measurement at a time):
  *   Gate 1  the get() re-hit loop (relinks the DLL every op)   -- zero-alloc.
@@ -99,6 +105,43 @@ export async function run() {
     if (!g2a.ok) {
         die('t6 Gate 2 (put update) retained-alloc gate rejected -- verdict=' + g2a.report.verdict +
             ' settled=' + g2a.result.settled + ' bytesPerCall=' + g2a.bytesPerCall);
+    }
+
+    // --- Gate INT: the integer substrate backing -- STRICT, NO pre-fill caveat ---
+    // Churn NEW integer keys from an EMPTY cache: after warm-up every op inserts a
+    // fresh key AND evicts the LRU, exercising the open-addressed idxSet + the
+    // backward-shift idxDelete every iteration. Values are small ints (SMI, no
+    // boxing) so the ONLY allocation frontier under test is the keyed index -- and
+    // it must be zero, with the index backing stores never growing (decisions/0011).
+    const icache = new LiteLru(CAP, { keys: 'int' });
+    const iNextBytes = icache._next.buffer.byteLength;
+    const iPrevBytes = icache._prev.buffer.byteLength;
+    const ixSlotBytes = icache._store._ixSlot.buffer.byteLength;
+    const ixKeyBytes = icache._store._ixKey.buffer.byteLength;
+    let ik = 0;
+    const intHot = () => {
+        icache.put(ik, ik & 0xffff); // fresh int key each op; SMI value (no boxing)
+        ik++;
+    };
+    const gi = runOpsGate(intHot, { ops: OPS, warmup: WARMUP });
+    check(icache._next.buffer.byteLength === iNextBytes,
+        () => 't6 Gate INT: _next.buffer grew ' + iNextBytes + ' -> ' + icache._next.buffer.byteLength);
+    check(icache._prev.buffer.byteLength === iPrevBytes,
+        () => 't6 Gate INT: _prev.buffer grew ' + iPrevBytes + ' -> ' + icache._prev.buffer.byteLength);
+    check(icache._store._ixSlot.buffer.byteLength === ixSlotBytes,
+        () => 't6 Gate INT: _ixSlot.buffer grew ' + ixSlotBytes + ' -> ' + icache._store._ixSlot.buffer.byteLength);
+    check(icache._store._ixKey.buffer.byteLength === ixKeyBytes,
+        () => 't6 Gate INT: _ixKey.buffer grew ' + ixKeyBytes + ' -> ' + icache._store._ixKey.buffer.byteLength);
+    check(icache.size === CAP, () => 't6 Gate INT: churn did not stay at capacity (size ' + icache.size + ')');
+    if (!gi.report.ok) {
+        const g = gi.summary.gc;
+        die('t6 Gate INT (int churn) ops gate rejected -- verdict=' + gi.report.verdict +
+            ' source=' + gi.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gia = runAllocsGate(intHot, { iterations: 50000, batches: 8 });
+    if (!gia.ok) {
+        die('t6 Gate INT (int churn) retained-alloc gate rejected -- verdict=' + gia.report.verdict +
+            ' settled=' + gia.result.settled + ' bytesPerCall=' + gia.bytesPerCall);
     }
 
     // --- Gate 3: writes-per-hit, MEASURED (DEBATE item 2) ------------------------

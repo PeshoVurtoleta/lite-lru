@@ -186,11 +186,33 @@ function simulateBeladyOpt(trace, capacity) {
 }
 ```
 
-### Important observation
+### Important observation: when LRU's bookkeeping is pure overhead (the measured-environment case)
 
-In a measured environment with fixed capacity, there exist workloads (and prefixes of workloads) in which the cache
-never fills. In that regime, classic doubly-linked-list move-to-front operations become pure overhead. Flag-based and
-lazy-promotion policies (SIEVE, S3-FIFO, generational designs) naturally win.
+LRU pays its cost UNCONDITIONALLY but collects its benefit CONDITIONALLY. Every `get` relinks ~5 cells (detach 2 +
+push-front 3) -- paid on every hit. But that bookkeeping only pays off at an EVICTION, and only if recency actually
+predicts reuse. So the cost lands at the head (always); the benefit lands at the tail (conditionally). When the benefit
+-> 0, the cost does not -- it is net overhead. Two regimes, both common in a measured/provisioned deployment, drive the
+benefit to zero:
+
+1. The cache rarely/never evicts. If capacity >= working set (which a measured deployment sizes for deliberately),
+   recency order is never consulted, so every move-to-front is 100% waste. A plain hash map or insertion-order/FIFO is
+   optimal there.
+2. The access pattern is known/predictable. Then a policy that does NO per-hit reordering matches LRU's hit-ratio at a
+   fraction of the writes: SIEVE (1 bit), S3-FIFO (~0 writes/hit, promotion deferred to eviction). The limit case is a
+   fully known trace, where Belady OPT is the answer with ZERO online bookkeeping -- the ultimate measured-environment
+   policy (sec 2, and why the bench tool reports "% of optimal").
+
+Two honest refinements: (a) LRU is not globally obsolete -- it stays right for genuinely UNPREDICTABLE, recency-skewed,
+chronically-at-capacity workloads (the case it was designed for); a measured environment is, almost by definition, not
+that case. (b) Classic LRU already has a built-in predictability discount: re-hitting the MRU early-returns at 0 writes
+(the `_moveToFront` head check; our writes-per-hit pin is head:0 / interior:5), so it sheds the relink for a hot key that
+stays hot -- it just cannot shed it for interior re-hits.
+
+Consequence for this project: this is exactly why LRU is the reference/floor (not the headline), why flag- and
+lazy-promotion policies (SIEVE, S3-FIFO, generational designs) are the members, and why the shipped bench tool + OPT
+exist -- to let a caller DISCOVER their environment is predictable and that a lazy/flag policy (or no eviction at all)
+wins, turning "head/tail is overhead" from folklore into a measured recommendation. It is also the precise niche for the
+v2 self-measuring meta-policy: detect that recency is not paying and drop the relink overhead automatically.
 
 ---
 

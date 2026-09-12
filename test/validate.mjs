@@ -8,10 +8,17 @@
  * it with ONE more term, not a rewrite. The invariant is a SUM over intrusive
  * active lists:
  *
+ *   index buffers fixed (int backing)             (the substrate never resizes)
  *   size + freeListLength === capacity            (every slot accounted for)
- *   map.size === size                             (keyed index and lists agree)
+ *   index.size === size                           (keyed index and lists agree)
  *   sum(length of every active list) === size     (no lost / duplicated links)
  *   prev/next reciprocity for every active DLL     (_prev[_next[s]] === s, NIL ends)
+ *
+ * The keyed index is read through the SlotStore surface (decisions/0011), so the
+ * SAME checker validates BOTH backings -- the default Map AND the opt-in integer
+ * open-addressed table -- unchanged. For the int backing the store also exposes
+ * `checkStable()`: its ArrayBuffer byteLengths are fixed at construction and must
+ * never grow (a "growing index" is a bug, caught here).
  *
  * `activeListsOf(cache)` returns the member's active-list descriptors. Classic LRU
  * has exactly one (the recency DLL, head=MRU .. tail=LRU). A member with N
@@ -44,6 +51,12 @@ export function activeListsOf(cache) {
 export function validate(cache, lists) {
     const cap = cache._capacity;
     const size = cache._size;
+    const store = cache._store;
+
+    // --- term 0: the int-backing index buffers are fixed (never resize) ---------
+    // A no-op for the Map backing (no checkStable). Runs FIRST so a "growing index"
+    // is reported as exactly that, not as a downstream cross-check failure.
+    if (typeof store.checkStable === 'function') store.checkStable();
 
     // --- term 1: every slot is in exactly one place (active + free == cap) ------
     const freeLen = cache._freeListLength();
@@ -54,8 +67,9 @@ export function validate(cache, lists) {
     }
 
     // --- term 2: the keyed index agrees with the list population ----------------
-    if (cache._map.size !== size) {
-        throw new Error('[validate] map.size(' + cache._map.size + ') != size(' + size + ')');
+    const ixSize = store.indexSize();
+    if (ixSize !== size) {
+        throw new Error('[validate] index.size(' + ixSize + ') != size(' + size + ')');
     }
 
     // --- term 3 + 4: sum of active-list lengths == size, with reciprocity -------
@@ -90,15 +104,16 @@ export function validate(cache, lists) {
     }
 
     // --- term 5: the keyed index maps back into an active slot with the same key -
-    // (cheap cross-check that keys in the map resolve to live slots holding them)
-    for (const [key, slot] of cache._map) {
+    // (cheap cross-check that keys in the index resolve to live slots holding them).
+    // Read through the store surface so it holds for BOTH backings.
+    store.indexEntries((key, slot) => {
         if (slot < 0 || slot >= cap) {
-            throw new Error('[validate] map key resolves to out-of-range slot ' + slot);
+            throw new Error('[validate] index key resolves to out-of-range slot ' + slot);
         }
         const stored = cache._keys[slot];
         const same = stored === key || (stored !== stored && key !== key); // SameValueZero
         if (!same) {
-            throw new Error('[validate] map key/slot disagree at slot ' + slot);
+            throw new Error('[validate] index key/slot disagree at slot ' + slot);
         }
-    }
+    });
 }

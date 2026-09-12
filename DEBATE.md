@@ -65,6 +65,15 @@ variant, the concurrency argument comes back -- but that is a separate package
 JS-single-thread benefit (writes/hit + hit ratio), and the torture suite measures
 *writes per hit* as a first-class number, not just allocation.
 
+**The sharp form of the thesis (RESEARCH.md sec 2, "when LRU's bookkeeping is pure
+overhead"):** LRU pays its relink cost UNCONDITIONALLY (every hit) but earns its
+benefit CONDITIONALLY (only at an eviction, only if recency predicts reuse). In a
+MEASURED environment -- cache sized >= working set (never evicts), or a known/
+predictable pattern -- the benefit -> 0 while the cost remains, so head/tail work
+becomes pure overhead. That asymmetry is why LRU is the floor and flag/lazy-promotion
+policies are the members; the bench tool + OPT let a caller measure it, and the v2
+meta-policy can shed the overhead at runtime.
+
 ---
 
 ## 3. The moat is the substrate + oracle + uniform API -- not any one algorithm

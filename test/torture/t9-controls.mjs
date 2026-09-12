@@ -10,10 +10,11 @@
  *
  * Broken variants (subclasses / ad-hoc policies -- Lru.js is never modified):
  *   C1 _detach that dangles a prev            -> validate() reciprocity fails
- *   C2 evict that forgets _map.delete         -> validate() map.size != size fails
+ *   C2 evict that forgets the index delete    -> validate() index.size != size fails
  *   C3 get that skips _moveToFront            -> diverges from the LRU oracle
  *   C4 a hot loop that allocates per op        -> the alloc gates reject it
  *   C5 a broken SECOND policy (FIFO)           -> the runner catches it (the seam)
+ *   C6 a growing int index buffer             -> validate()'s stability check fails
  */
 
 import { LiteLru } from '../../Lru.js';
@@ -37,32 +38,33 @@ class BrokenDetach extends LiteLru {
     }
 }
 
-/** C2: an eviction that reuses the slot but forgets to delete the old map key. */
+/** C2: an eviction that reuses the slot but forgets to delete the old index key. */
 class BrokenEvict extends LiteLru {
     put(key, value) {
-        const existing = this._map.get(key);
-        if (existing !== undefined) { this._vals[existing] = value; this._moveToFront(existing); return; }
+        const store = this._store;
+        const existing = store.get(key);
+        if (existing >= 0) { this._vals[existing] = value; this._moveToFront(existing); return; }
         let s;
         if (this._size === this._capacity) {
             s = this._tail;
             const evKey = this._keys[s];
             const evVal = this._vals[s];
             this._detach(s);
-            // BUG: this._map.delete(evKey) is dropped -> the stale key leaks in the map.
+            // BUG: store.delete(evKey) is dropped -> the stale key leaks in the index.
             this._size--;
             this._onEvict(evKey, evVal);
         } else {
-            s = this._allocSlot();
+            s = store.allocSlot();
         }
-        this._keys[s] = key; this._vals[s] = value; this._map.set(key, s); this._pushFront(s); this._size++;
+        this._keys[s] = key; this._vals[s] = value; store.set(key, s); this._pushFront(s); this._size++;
     }
 }
 
 /** C3: a get that returns the value but skips the recency promotion. */
 class BrokenGet extends LiteLru {
     get(key) {
-        const s = this._map.get(key);
-        if (s === undefined) return undefined;
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
         // BUG: this._moveToFront(s) is dropped -> recency never updates.
         return this._vals[s];
     }
@@ -110,13 +112,13 @@ export function run() {
         if (!threw) die('t9 C1: validate() passed a cache with a dangling prev link (no teeth)');
     }
 
-    // --- C2: evict forgets _map.delete -> validate() map.size != size fails ------
+    // --- C2: evict forgets the index delete -> validate() index.size != size -----
     {
         const c = new BrokenEvict(4);
-        for (let i = 0; i < 5; i++) c.put(i, i); // the 5th put evicts and leaks a map key
+        for (let i = 0; i < 5; i++) c.put(i, i); // the 5th put evicts and leaks an index key
         let threw = false;
         try { validate(c); } catch (e) { threw = true; }
-        if (!threw) die('t9 C2: validate() passed a cache leaking an evicted map key (no teeth)');
+        if (!threw) die('t9 C2: validate() passed a cache leaking an evicted index key (no teeth)');
     }
 
     // --- C3: get skips _moveToFront -> diverges from the LRU oracle --------------
@@ -159,5 +161,21 @@ export function run() {
         // the divergence above is a victim mismatch, not a value/size accident.
         check(r.why === 'victim' || r.why === 'value' || r.why === 'size',
             () => 't9 C5: divergence reason was ' + r.why + ' (unexpected)');
+    }
+
+    // --- C6: a GROWING int index -> validate()'s stability check fails -----------
+    // The int substrate's whole promise (decisions/0011) is that even the keyed
+    // index never allocates: its ArrayBuffers are fixed at construction. Simulate
+    // the forbidden event -- an index that resized -- and assert validate() catches
+    // it. Non-vacuity: the same cache validates clean BEFORE the buffer is grown.
+    {
+        const c = new LiteLru(64, { keys: 'int' });
+        for (let i = 0; i < 80; i++) c.put(i, i); // churn past capacity (evictions)
+        validate(c); // clean: the index buffers are the construction-time size
+        // Grow the index backing store -- exactly what the fixed-capacity index forbids.
+        c._store._ixSlot = new Int32Array(c._store._ixSlot.length * 2);
+        let threw = false;
+        try { validate(c); } catch (e) { threw = true; }
+        if (!threw) die('t9 C6: validate() passed a grown int index buffer (the stability gate is toothless)');
     }
 }

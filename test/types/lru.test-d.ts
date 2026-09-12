@@ -52,6 +52,11 @@ new LiteLru<string, number>(10, {
 const opts: LiteCacheOptions<string, number> = { onEvict: (_k, _v) => {} };
 void opts;
 
+// ---- keys:'int' opt-in backing (decisions/0011) -----------------------------
+new LiteLru<number, number>(10, { keys: "int" });
+const intOpts: LiteCacheOptions<number, number> = { keys: "int" };
+void intOpts;
+
 // ---- negative checks (teeth: these MUST NOT compile) ------------------------
 
 // @ts-expect-error -- V is number; a string value is rejected.
@@ -65,3 +70,6 @@ new LiteLru<string, number>("10");
 
 // @ts-expect-error -- size is readonly.
 c.size = 5;
+
+// @ts-expect-error -- 'float' is not a valid keys backing (only 'int').
+new LiteLru<number, number>(10, { keys: "float" });

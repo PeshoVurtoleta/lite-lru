@@ -78,6 +78,17 @@ export interface LiteCacheOptions<K, V> {
    *     already inserted and the victim already gone (`size === capacity`).
    */
   onEvict?: (key: K, value: V) => void;
+  /**
+   * Keyed-index backing, chosen ONCE at construction (decisions/0011, D11).
+   *   - omitted (default): a JS `Map` -- arbitrary keys, honestly AMORTIZED (its
+   *     internal resize can allocate); byte-identical to v0.1.0.
+   *   - `"int"`: an open-addressed typed-array index for STRICT zero-alloc (even
+   *     the keyed index never allocates). Keys MUST be 32-bit signed integers
+   *     ([-2147483648, 2147483647]); a non-integer or out-of-range key throws a
+   *     `[lite-lru]`-tagged `TypeError` (fail-closed; decisions/0011). Values
+   *     remain arbitrary.
+   */
+  keys?: "int";
 }
 
 /**
