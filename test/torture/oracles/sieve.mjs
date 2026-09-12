@@ -20,17 +20,21 @@
  * SameValueZero key equality (svz) mirrors JS Map, matching the default backing.
  */
 
-import { svz } from './lru.mjs';
+import { svz, oracleExpiry } from './lru.mjs';
 
 /**
  * @param {number} cap
+ * @param {{ttl?:number, clock?:()=>number}} [opts]  opt-in TTL (decisions/0017)
  * @returns {{get,put,has,peek,delete,size,victim}}
  */
-export function makeSieveOracle(cap) {
+export function makeSieveOracle(cap, opts) {
     let head = null; // newest
     let tail = null; // oldest
     let hand = null; // the sweeping hand; null means "start from the tail"
     let size = 0;
+    const ttl = opts && opts.ttl;
+    const clock = (opts && opts.clock) || (() => 0);
+    const hasTtl = ttl !== undefined;
 
     function find(k) {
         for (let n = head; n !== null; n = n.next) if (svz(n.key, k)) return n;
@@ -42,6 +46,16 @@ export function makeSieveOracle(cap) {
         if (n.next !== null) n.next.prev = n.prev; else tail = n.prev;
         n.prev = null;
         n.next = null;
+    }
+
+    /** Lazy TTL (decisions/0017, D17.3): reap a stale node in place, mirroring the real
+     *  Sieve delete (hand repair -> detach -> size--). No visited/second-chance change. */
+    function reapIfStale(n) {
+        if (!hasTtl || n.exp > clock()) return false;
+        if (hand === n) { let h = n.prev; if (h === null) h = n.next; hand = h; }
+        detach(n);
+        size--;
+        return true;
     }
 
     function pushFront(n) {
@@ -66,12 +80,14 @@ export function makeSieveOracle(cap) {
         get(k) {
             const n = find(k);
             if (n === null) return undefined;
+            if (reapIfStale(n)) return undefined; // stale = MISS, no visited bump (D17.3)
             n.visited = true; // set visited only; nothing structural
             return n.val;
         },
-        put(k, v) {
+        put(k, v, ttlMs) {
+            const exp = hasTtl ? oracleExpiry(clock, ttl, ttlMs) : undefined;
             const n = find(k);
-            if (n !== null) { n.val = v; n.visited = true; return; } // update + visit
+            if (n !== null) { n.val = v; n.visited = true; n.exp = exp; return; } // update + visit
             if (size === cap) {
                 const victim = sweepVictim();
                 const park = victim.prev; // toward the head
@@ -79,11 +95,11 @@ export function makeSieveOracle(cap) {
                 hand = park !== null ? park : tail; // wrap to the post-detach tail
                 size--;
             }
-            pushFront({ key: k, val: v, visited: false, prev: null, next: null });
+            pushFront({ key: k, val: v, visited: false, exp, prev: null, next: null });
             size++;
         },
-        has(k) { return find(k) !== null; },
-        peek(k) { const n = find(k); return n === null ? undefined : n.val; },
+        has(k) { const n = find(k); if (n === null) return false; return !reapIfStale(n); },
+        peek(k) { const n = find(k); if (n === null) return undefined; if (reapIfStale(n)) return undefined; return n.val; },
         delete(k) {
             const n = find(k);
             if (n === null) return false;

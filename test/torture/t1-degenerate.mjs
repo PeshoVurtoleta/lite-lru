@@ -9,7 +9,7 @@
  * These are contract, not accident -- pinned so a refactor cannot drift them.
  */
 
-import { LiteLru } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../../Lru.js';
 import { check, validate } from './harness.mjs';
 
 export function run() {
@@ -96,6 +96,59 @@ export function run() {
         // has() is true for all of them even where the value is falsy:
         check(c.has('null') && c.has('zero') && c.has('nan') && c.has('obj'),
             () => 't1: has() false on a present falsy value');
+        validate(c);
+    }
+
+    // --- TTL fail-closed validation (decisions/0017, D17.2/D17.4) ----------------
+    // Bad ttl / ttlMs / clock are caller bugs, thrown at the door. Pinned across ALL
+    // four members so the shared door stays uniform.
+    {
+        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu]];
+        const bad = (fn, why) => {
+            let threw = false;
+            try { fn(); } catch (e) { threw = /^\[lite-lru\]/.test(e.message); }
+            check(threw, why);
+        };
+        for (const [name, C] of members) {
+            // ttl default: <= 0, NaN, non-number all throw; Infinity + positive are fine.
+            bad(() => new C(4, { ttl: 0 }), () => 't1 TTL: ' + name + ' ttl 0 did not throw');
+            bad(() => new C(4, { ttl: -1 }), () => 't1 TTL: ' + name + ' ttl -1 did not throw');
+            bad(() => new C(4, { ttl: NaN }), () => 't1 TTL: ' + name + ' ttl NaN did not throw');
+            bad(() => new C(4, { ttl: '5' }), () => 't1 TTL: ' + name + ' ttl "5" did not throw');
+            new C(4, { ttl: Infinity }); // never-expire default: valid
+            new C(4, { ttl: 10 });       // positive default: valid
+            // clock: non-function throws; a function is fine.
+            bad(() => new C(4, { ttl: 10, clock: 123 }), () => 't1 TTL: ' + name + ' non-fn clock did not throw');
+            new C(4, { ttl: 10, clock: () => 0 });
+            // per-put ttlMs on a NON-ttl instance throws (no _exp column to stamp).
+            bad(() => { const c = new C(4); c.put('k', 1, 5); },
+                () => 't1 TTL: ' + name + ' ttlMs on a non-ttl instance did not throw');
+            // per-put ttlMs bad value throws on a ttl instance.
+            bad(() => { const c = new C(4, { ttl: 10 }); c.put('k', 1, 0); },
+                () => 't1 TTL: ' + name + ' ttlMs 0 did not throw');
+            bad(() => { const c = new C(4, { ttl: 10 }); c.put('k', 1, -3); },
+                () => 't1 TTL: ' + name + ' ttlMs -3 did not throw');
+            bad(() => { const c = new C(4, { ttl: 10 }); c.put('k', 1, NaN); },
+                () => 't1 TTL: ' + name + ' ttlMs NaN did not throw');
+            // a valid per-put ttlMs + Infinity are accepted.
+            { const c = new C(4, { ttl: 10 }); c.put('k', 1, 5); c.put('n', 2, Infinity); validate(c); }
+        }
+    }
+
+    // --- D7 under TTL: a stale entry storing `undefined` (decisions/0017) --------
+    // D7 says a stored `undefined` is indistinguishable from a miss via get(); once the
+    // entry goes STALE it becomes a genuine miss for get/has/peek alike (reaped).
+    {
+        let now = 0; const clock = () => now;
+        const c = new LiteLru(4, { ttl: 5, clock });
+        c.put('u', undefined);
+        check(c.get('u') === undefined, () => 't1 D7-TTL: fresh stored-undefined get != undefined');
+        check(c.has('u') === true, () => 't1 D7-TTL: fresh stored-undefined has must be true');
+        now = 6; // stale now
+        check(c.get('u') === undefined, () => 't1 D7-TTL: stale get != undefined');
+        check(c.has('u') === false, () => 't1 D7-TTL: stale has must be false (reaped)');
+        check(c.peek('u') === undefined, () => 't1 D7-TTL: stale peek != undefined');
+        check(c.size === 0, () => 't1 D7-TTL: stale entry not reaped (size ' + c.size + ')');
         validate(c);
     }
 }

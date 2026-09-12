@@ -135,4 +135,45 @@ export async function run() {
         check(censusOk(wrefs),
             () => 't7 wtinylfu: an evicted/cleared value is still live -- a retention leak');
     }
+
+    // --- TTL soak (decisions/0017): expiry churn + conservation + purgeStale + census
+    // Build each cycle PAST capacity under a virtual clock, half the entries with a
+    // finite ttl (they expire mid-build) and half never-expire. Assert conservation
+    // mid-life (the `_exp` term: free slots read Infinity, the column never grows),
+    // purgeStale() reaps every currently-expired resident (and its count is positive
+    // across the run -- non-vacuity), no resident is stale afterwards, clear() empties,
+    // and every sampled expired/evicted/cleared VALUE object is collectible (the `_exp`
+    // column holds primitive timestamps only -- it pins nothing).
+    {
+        const ttlrefs = [];
+        const ttltracker = createLeakTracker({ name: 'ttl-soak' });
+        let totalPurged = 0;
+        for (let cyc = 0; cyc < 1024; cyc++) {
+            let now = 0; const clock = () => now;
+            const cache = new LiteLru(CAP, { ttl: 5, clock });
+            const h = ttltracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
+            for (let i = 0; i < CAP * 2; i++) {
+                const val = { c: cyc, i };
+                cache.put(i, val, (i & 1) === 0 ? Infinity : 5); // half never, half ttl 5
+                if ((cyc & 63) === 0 && (i & 7) === 0) ttlrefs.push(new WeakRef(val));
+                now++; // advance the clock so the ttl-5 entries expire within a few ops
+            }
+            validate(cache); // conservation mid-life incl. the _exp term
+            const purged = cache.purgeStale();
+            totalPurged += purged;
+            validate(cache); // conservation after purge
+            // No resident is stale after purgeStale: a subsequent purge reaps zero.
+            check(cache.purgeStale() === 0, () => 't7 ttl: purgeStale left stale residents (cycle ' + cyc + ')');
+            cache.clear();
+            check(cache.size === 0, () => 't7 ttl: size != 0 after clear (cycle ' + cyc + ')');
+            validate(cache);
+            ttltracker.untrack(h);
+        }
+        check(ttltracker.size() === 0, () => 't7 ttl: leak tracker size ' + ttltracker.size() + ' != 0');
+        check(totalPurged > 0, () => 't7 ttl: purgeStale never reaped anything (vacuous)');
+        await settleGc(6);
+        check(ttlrefs.length > 0, () => 't7 ttl: census sample was empty (nothing to prove)');
+        check(censusOk(ttlrefs),
+            () => 't7 ttl: an expired/evicted/cleared value is still live -- the _exp column is retaining values');
+    }
 }

@@ -226,4 +226,41 @@ export function run() {
         check(survivors < N, () => 't2 I: too many scan keys survived (' + survivors + ') -- eviction not exercised');
         void wrapWTinyLfu(c);
     }
+
+    // --- J: the LAZY-SEMANTICS TRIPLE as executable laws (decisions/0017, D17.3) --
+    // For EVERY member: an expired entry is a MISS through get/has/peek alike, and each
+    // of the three REAPS it in place (fires onEvict once, size drops). A fresh Infinity
+    // sibling is untouched by any of them. validate() nets each reap.
+    {
+        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu]];
+        // one probe method per fresh cache (each reap is destructive, so isolate them)
+        const probes = [
+            ['get', (c, k) => c.get(k), undefined],
+            ['has', (c, k) => c.has(k), false],
+            ['peek', (c, k) => c.peek(k), undefined],
+        ];
+        for (const [name, C] of members) {
+            for (const [pname, probe, missVal] of probes) {
+                let now = 0; const clock = () => now;
+                const ev = [];
+                const c = new C(8, { ttl: 10, clock, onEvict: (k, v) => ev.push(k) });
+                c.put('x', 1);              // ttl 10
+                c.put('keep', 2, Infinity); // never expires
+                now = 11;                   // x is stale, keep is not
+                const r = probe(c, 'x');
+                check(Object.is(r, missVal),
+                    () => 't2 J: ' + name + '.' + pname + '(stale) returned ' + String(r) + ', expected ' + String(missVal));
+                check(ev.length === 1 && ev[0] === 'x',
+                    () => 't2 J: ' + name + '.' + pname + '(stale) did not reap+fire onEvict once');
+                check(c.size === 1 && c.has('keep'),
+                    () => 't2 J: ' + name + '.' + pname + ' reaped the fresh Infinity sibling');
+                validate(c);
+                // A SECOND probe of the same reaped key is a plain miss (idempotent, no
+                // second onEvict).
+                const r2 = probe(c, 'x');
+                check(Object.is(r2, missVal), () => 't2 J: ' + name + '.' + pname + ' re-probe not a miss');
+                check(ev.length === 1, () => 't2 J: ' + name + '.' + pname + ' fired onEvict twice');
+            }
+        }
+    }
 }

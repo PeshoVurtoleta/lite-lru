@@ -217,4 +217,58 @@ export function run() {
         validate(c);
         void wrapWTinyLfu(c); // exercise the driver wrapper on a churned cache
     }
+
+    // --- TTL laws (decisions/0017) ----------------------------------------------
+
+    // T1: stale = MISS, and the MISS does NOTHING to policy state. get() on an expired
+    // key returns undefined, reaps the entry, fires onEvict exactly once with the right
+    // (key, value), and -- crucially -- does NOT promote (no recency change): the LRU
+    // order is exactly what it was minus the reaped entry.
+    {
+        let now = 0; const clock = () => now;
+        const ev = [];
+        const c = new LiteLru(4, { ttl: 10, clock, onEvict: (k, v) => ev.push([k, v]) });
+        c.put('a', 1); c.put('b', 2); c.put('c', 3); // exp all 10; MRU=c .. LRU=a
+        now = 11; // everything is now stale
+        check(c.get('b') === undefined, () => 't0 TTL T1: stale get did not miss');
+        check(ev.length === 1 && ev[0][0] === 'b' && ev[0][1] === 2,
+            () => 't0 TTL T1: onEvict not fired once with (b,2)');
+        check(c.size === 2, () => 't0 TTL T1: size ' + c.size + ' != 2 after one reap');
+        check(c._keys[c._head] === 'c', () => 't0 TTL T1: a stale get PROMOTED (head changed)');
+        validate(c);
+    }
+
+    // T2: per-put ttlMs OVERRIDES the instance default (D17.4). A short per-put ttl
+    // expires before the default; Infinity never expires.
+    {
+        let now = 0; const clock = () => now;
+        const c = new LiteLru(4, { ttl: 100, clock });
+        c.put('def', 1);            // default ttl 100
+        c.put('short', 2, 5);       // per-put 5
+        c.put('never', 3, Infinity);// never
+        now = 6;
+        check(c.get('short') === undefined, () => 't0 TTL T2: per-put short ttl did not expire');
+        check(c.get('def') === 1, () => 't0 TTL T2: default-ttl entry expired too early');
+        check(c.get('never') === 3, () => 't0 TTL T2: Infinity ttl expired');
+        now = 200;
+        check(c.get('def') === undefined, () => 't0 TTL T2: default ttl did not expire by 200');
+        check(c.get('never') === 3, () => 't0 TTL T2: Infinity ttl expired at 200');
+        validate(c);
+    }
+
+    // T3: capacity eviction does NOT prefer stale slots (D17.3). An untouched stale
+    // entry still counts toward size and is evicted by the ordinary policy victim, not
+    // preferentially because it is stale. Here the stale tail is the LRU victim anyway,
+    // but the point is size stays at capacity with a stale resident until touched.
+    {
+        let now = 0; const clock = () => now;
+        const c = new LiteLru(3, { ttl: 5, clock });
+        c.put(1, 1); c.put(2, 2, Infinity); c.put(3, 3, Infinity);
+        now = 10; // key 1 is stale but untouched
+        check(c.size === 3, () => 't0 TTL T3: stale-but-untouched entry dropped from size early');
+        c.put(4, 4, Infinity); // ordinary LRU eviction: tail (1) leaves
+        check(!c.has(1), () => 't0 TTL T3: LRU tail was not evicted at capacity');
+        check(c.size === 3, () => 't0 TTL T3: size drifted from capacity');
+        validate(c);
+    }
 }

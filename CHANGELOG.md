@@ -7,6 +7,77 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.3.0] - 2026-09-13
+
+### Added
+
+- **Opt-in TTL across all four members** (`LiteLru`, `Sieve`, `S3Fifo`, `WTinyLfu`)
+  behind the same `LiteCache<K,V>` surface. A new `ttl` construction option
+  (milliseconds) adds a lazy time-to-live stored in an optional `_exp`
+  `Float64Array` allocated ONLY when `ttl` is configured -- a cache without `ttl`
+  carries zero extra bytes and `_exp === null`. A resident slot's expiry is
+  `clock() + ttlMs`; the never-expire sentinel is `Infinity`, never `0` (a `0`
+  timestamp reads as already expired). Expiry is checked LAZILY on `get`/`peek`/
+  `has`, BEFORE each member's hit policy: a stale entry is a MISS (no LRU
+  promotion, no visited bit, no sketch bump), is evicted in place (firing
+  `onEvict`), and reads as `undefined` (`get`/`peek`) or `false` (`has`). No
+  timers and no background sweep on the hot path. Untouched-stale entries count
+  toward `size` until touched or purged; capacity eviction ignores staleness.
+- **Injectable `clock` option** -- a zero-argument function returning milliseconds,
+  defaulting to `Date.now()`. Validated at construction (a non-function throws a
+  `[lite-lru]` error). Enables deterministic expiry in tests and the oracle.
+- **Per-entry TTL override** -- `put(key, value, ttlMs?)` takes an optional
+  positional milliseconds argument overriding the instance default for that entry
+  (`Infinity` = never expire). Positional, not an options object, so the call
+  allocates nothing. Passing `ttlMs` to an instance with no `ttl` throws
+  `[lite-lru]` (fail-closed).
+- **`purgeStale(): number`** -- a cold, `O(size)` bulk reclamation that evicts every
+  currently-expired resident (firing `onEvict` per victim) and returns the count.
+  Returns `0` on a cache with no `ttl`. Not a hot path.
+- **`decisions/0017-ttl.md`** -- D17.1 the expiry column + `Infinity` sentinel; D17.2
+  the clock source + injection; D17.3 lazy-only semantics and how a stale hit
+  interacts with each member's policy; D17.4 the per-instance default + per-put
+  override with fail-closed validation (`ttl`/`ttlMs` <= 0, `NaN`, or non-number
+  throw `RangeError`); D17.5 `purgeStale` including the fail-closed
+  purge-under-reentrancy contract; plus the off-path decision resolved by
+  measurement (a single monomorphic `this._exp === null` guard, kept).
+- **`test/Ttl.test.js`** -- 117 node:test boundary cases parameterized over all four
+  members: fail-closed construction, lazy miss + slot free, the no-rescue law, the
+  per-put override, D7-under-TTL (stored-`undefined` vs stale), the `<=` expiry
+  boundary, `keys:'int'` + ttl, and `purgeStale` incl. the reentrancy-abort
+  regression pin.
+- TTL torture coverage in tiers t0/t1/t2/t5/t6/t7/t9: ttl laws; fail-closed throws;
+  the lazy-semantics triple as executable laws; a virtual-clock differential vs
+  each member's brute oracle; the ttl-OFF byte-identical + ttl-ON strict-zero
+  allocation gates; expiry-churn soak; and three new controls (skip-gate,
+  stale-promotes, growing-`_exp`), each of which fails.
+
+### Changed
+
+- `LiteCache<K,V>` (`Lru.d.ts`) is additive: `put` gains an optional trailing
+  `ttlMs`, the options gain `ttl?` and `clock?`, and `purgeStale(): number` joins
+  the surface (all four members implement it). The one-line policy swap stays
+  type-checked; `dts-drift` pins the enlarged surface.
+- Test suite grows from 312 to 429 node:test cases. `README.md` and `llms.txt` gain
+  a TTL section and the updated count.
+- The four brute-force oracles (`lru`, `sieve`, `s3fifo`, `wtinylfu`) and the
+  differential harness now drive a virtual clock and mirror the lazy expiry rule;
+  `validate()` conservation gains a free-slot `_exp === Infinity` term.
+- Clarified (not changed): when an `onEvict` illegally re-enters the instance during
+  `purgeStale()`, the reentrancy guard throws and the sweep aborts, leaving later
+  stale residents in place; the cache stays structurally consistent and they are
+  reaped lazily on next touch. This is intended fail-closed behavior (`decisions/
+  0002`, D17.5), recorded and regression-pinned rather than altered.
+
+### Gated (measured this release)
+
+- writes-per-hit unchanged with ttl OFF: `LiteLru` 0/5/4 (head/interior/tail),
+  `Sieve` 0/1, `S3Fifo` 0/1, `WTinyLfu` window-MRU 0; a non-ttl cache has
+  `_exp === null`.
+- ttl ON strict zero-alloc: gc major 0, minor 0, maxPauseMs 0.00, ~0.0003 B/op;
+  `_exp.byteLength` stable (32768 = capacity * 8) over a 100000-op churn at capacity.
+- npm test 429/429; `test:types` clean; torture "ok" (exit 0); controls all fail.
+
 ## [1.2.0] - 2026-09-13
 
 ### Added

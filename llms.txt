@@ -10,7 +10,7 @@ dependencies, node:test only. Ships a runnable + importable benchmark tool
 (Bench.mjs) with Belady OPT so a caller measures which policy fits their trace
 instead of guessing.
 
-## Status: 1.2.0 - W-TinyLFU completes the headline trio: LiteLru + Sieve + S3Fifo + WTinyLfu under one interface, on the shared substrate, with the shipped bench + Belady OPT tool
+## Status: 1.3.0 - opt-in zero-GC TTL across all four members (LiteLru + Sieve + S3Fifo + WTinyLfu): a lazy expiry column allocated only when ttl is used, injectable clock, per-put override, and purgeStale() - on the shared substrate, with the shipped bench + Belady OPT tool
 
 The family is the identity from v1.0.0: classic LRU is the reference member +
 differential oracle + honest floor, SIEVE is the headline, and the shipped
@@ -79,12 +79,18 @@ new WTinyLfu(n) and stays type-checked.
 - get(key) -> V | undefined. Applies the member's hit policy (LiteLru promotes to
   MRU; Sieve and S3Fifo set the visited bit; WTinyLfu bumps the frequency sketch
   and promotes within its segment).
-- put(key, value) -> void. Insert or update; at capacity evicts the member's
-  victim first (firing onEvict). Amortized O(1) default / O(1) with keys:'int'.
-- has(key) -> boolean. Presence test; NEVER changes recency / visited state.
-- peek(key) -> V | undefined. Read without applying the hit policy.
+- put(key, value, ttlMs?) -> void. Insert or update; at capacity evicts the
+  member's victim first (firing onEvict). Amortized O(1) default / O(1) with
+  keys:'int'. Optional positional ttlMs overrides the instance ttl default for this
+  entry (positive ms, Infinity = never, omitted = default); see TTL below.
+- has(key) -> boolean. Presence test; NEVER changes recency / visited state. A stale
+  (TTL) entry is a MISS and is reaped in place.
+- peek(key) -> V | undefined. Read without applying the hit policy. A stale (TTL)
+  entry is a MISS and is reaped in place.
 - delete(key) -> boolean. Remove; true if it was present.
 - clear() -> void. Empty the cache; allocates nothing.
+- purgeStale() -> number. Evict every currently-expired entry now (cold, O(size),
+  fires onEvict per victim); returns the count. 0 on a cache with no ttl. (TTL)
 - size -> number (0 .. capacity, getter). capacity -> number (getter).
 
 ## Construction options
@@ -100,6 +106,31 @@ new WTinyLfu(n) and stays type-checked.
   out-of-range key throws a [lite-lru]-tagged TypeError. Values stay arbitrary.
   Omitted, the default is a JS Map: arbitrary keys, honestly AMORTIZED (its resize
   can allocate). An unknown keys value throws with a did-you-mean hint.
+- ttl (decisions/0017): opt-in TTL default in ms. Positive-finite-or-Infinity, else
+  a [lite-lru] RangeError. Allocates one fixed Float64Array expiry column (8 B/slot,
+  never grown) ONLY when set; omitted keeps the ttl-OFF hot path byte-identical
+  (_exp === null). Per-entry override via put(key, value, ttlMs).
+- clock (decisions/0017): injectable zero-arg fn returning ms, default Date.now.
+  Non-function throws a [lite-lru] TypeError. Only meaningful with ttl.
+
+## TTL (decisions/0017, D17)
+
+- Opt-in, LAZY, pay-for-what-you-use. No timers, no async, no background sweep.
+- An entry expires on the next get/has/peek that touches it: a stale touch is a MISS
+  (no promotion / visited bump / sketch bump), reaped in place (fires onEvict via the
+  0002 fire-after + reentrancy guard), returns undefined/false. purgeStale() is the
+  optional eager path.
+- Capacity eviction does NOT prefer stale slots: an untouched stale entry counts
+  toward size until touched or purgeStale()'d.
+- Fail-closed: ttlMs on a cache with no ttl configured throws [lite-lru]; ttl/ttlMs
+  <= 0 / NaN throw [lite-lru] RangeError; Infinity = never (NEVER 0).
+- All four members support it identically over the shared SlotStore _exp column.
+- Off-path decision (measured, D17): a single monomorphic this._exp===null guard.
+  ttl-OFF writes-per-hit unchanged (LiteLru 0/5/4, Sieve/S3Fifo 0 links + 1 vis,
+  WTinyLfu window-MRU 0); ttl-ON strict zero-alloc (maxMajor 0), _exp.byteLength
+  stable under churn.
+- vs lru-cache: lazy TTL only (no autopurge timer thread), no async fetch, no
+  size-aware maxSize.
 
 ## Invariants (suite CLAUDE.md + ROADMAP)
 
@@ -142,7 +173,7 @@ drops LiteLru's body from the bundle (and vice versa). The shared substrate is
 INTERNAL, not an export; there is NO subpath-per-policy. Bench.mjs is a separate
 runnable tool, not a second implementation.
 
-## API (1.2.0)
+## API (1.3.0)
 
 Named exports from @zakkster/lite-lru:
 
@@ -150,7 +181,7 @@ Named exports from @zakkster/lite-lru:
 - Sieve: the SIEVE member.
 - S3Fifo: the S3-FIFO member.
 - WTinyLfu: the W-TinyLFU member.
-- VERSION: '1.2.0'
+- VERSION: '1.3.0'
 
 Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
@@ -159,8 +190,9 @@ Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
 ## Testing
 
-- npm test        -- 312 node:test cases (all four members, recency/SIEVE/S3-FIFO/
-  W-TinyLFU laws, degenerate keys/values, dts drift, family surface).
+- npm test        -- 429 node:test cases (all four members, recency/SIEVE/S3-FIFO/
+  W-TinyLFU laws, TTL laws + fail-closed + purgeStale, degenerate keys/values, dts
+  drift, family surface).
 - npm run test:types -- tsc: the LiteCache<K,V> surface + the one-line-swap check.
 - npm run torture -- @zakkster/lite-leak + lite-gc-profiler, --expose-gc: prints
   "ok"; tiers t0/t1/t2/t5/t6/t7/t8/t9 (t8 = the Belady OPT gate).

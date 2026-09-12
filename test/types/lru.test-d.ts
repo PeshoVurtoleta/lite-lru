@@ -187,3 +187,38 @@ new WTinyLfu<number, number>(10, { keys: "lfu" });
 
 // @ts-expect-error -- size is readonly on WTinyLfu.
 wt.size = 5;
+
+// ---- TTL surface (decisions/0017) -------------------------------------------
+// `ttl` + `clock` options, the positional `put(k, v, ttlMs?)`, and `purgeStale()`
+// are part of the SAME uniform LiteCache surface every member satisfies.
+const ttlLru = new LiteLru<number, number>(10, { ttl: 1000, clock: () => Date.now() });
+ttlLru.put(1, 1);            // default ttl
+ttlLru.put(2, 2, 500);       // per-put override (positional ttlMs)
+ttlLru.put(3, 3, Infinity);  // never-expire
+expectTrue<Equal<ReturnType<typeof ttlLru.purgeStale>, number>>();
+
+// purgeStale + the ttl put arity flow through the LiteCache binding (the swap holds).
+const ttlIface: LiteCache<number, number> = new LiteLru<number, number>(10, { ttl: 1000 });
+ttlIface.put(1, 1, 5);
+expectTrue<Equal<ReturnType<typeof ttlIface.purgeStale>, number>>();
+
+// TTL options are part of the shared, generic options shape.
+const ttlOpts: LiteCacheOptions<number, number> = { ttl: 1000, clock: () => 0 };
+void ttlOpts;
+
+// The same ttl surface on the other three members (swap into LiteCache too).
+const svTtl: LiteCache<number, number> = new Sieve<number, number>(10, { ttl: 5 });
+svTtl.put(1, 1, 5);
+const s3Ttl: LiteCache<number, number> = new S3Fifo<number, number>(10, { ttl: 5 });
+s3Ttl.put(1, 1, Infinity);
+const wtTtl: LiteCache<number, number> = new WTinyLfu<number, number>(10, { ttl: 5 });
+expectTrue<Equal<ReturnType<typeof wtTtl.purgeStale>, number>>();
+
+// @ts-expect-error -- ttl must be a number.
+new LiteLru<number, number>(10, { ttl: "1000" });
+
+// @ts-expect-error -- clock must be a zero-arg function returning number.
+new LiteLru<number, number>(10, { ttl: 10, clock: 5 });
+
+// @ts-expect-error -- the positional ttlMs must be a number.
+ttlLru.put(4, 4, "500");

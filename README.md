@@ -57,6 +57,7 @@ One `LiteCache<K,V>` surface, `get`/`put`/`has`/`peek`/`delete`/`clear`, all O(1
 - [API reference](#api-reference)
   - [The members](#the-members)
   - [Construction options](#construction-options)
+  - [TTL -- opt-in, lazy expiry](#ttl----opt-in-lazy-expiry)
   - [The bench tool](#the-bench-tool)
   - [Constants](#constants)
 - [Composability](#composability)
@@ -138,14 +139,15 @@ new Sieve<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
 new S3Fifo<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
 new WTinyLfu<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
 
-cache.get(key: K): V | undefined      // returns the value AND applies the member's hit policy
-cache.put(key: K, value: V): void     // insert/update; at capacity, evicts the member's victim first
-cache.has(key: K): boolean            // presence test; NEVER changes recency / visited state
-cache.peek(key: K): V | undefined     // read without applying the hit policy
-cache.delete(key: K): boolean         // remove; true if it was present
-cache.clear(): void                   // empty the cache; allocates nothing
-cache.size: number                    // current entry count, 0 .. capacity (getter)
-cache.capacity: number                // fixed maximum, set at construction (getter)
+cache.get(key: K): V | undefined            // returns the value AND applies the member's hit policy
+cache.put(key: K, value: V, ttlMs?): void   // insert/update (+ optional per-entry TTL); evicts the victim at capacity
+cache.has(key: K): boolean                  // presence test; NEVER changes recency / visited state
+cache.peek(key: K): V | undefined           // read without applying the hit policy
+cache.delete(key: K): boolean               // remove; true if it was present
+cache.clear(): void                         // empty the cache; allocates nothing
+cache.purgeStale(): number                  // evict every currently-expired entry now; returns the count (TTL)
+cache.size: number                          // current entry count, 0 .. capacity (getter)
+cache.capacity: number                      // fixed maximum, set at construction (getter)
 ```
 
 - **`capacity`** -- must be an integer `>= 1`. Anything else throws a `[lite-lru]`-tagged `RangeError` at the door (fail-closed -- `null` is not zero).
@@ -158,12 +160,39 @@ cache.capacity: number                // fixed maximum, set at construction (get
 interface LiteCacheOptions<K, V> {
   onEvict?: (key: K, value: V) => void;
   keys?: "int";
+  ttl?: number;            // opt-in TTL default in ms (Infinity = never); see below
+  clock?: () => number;    // injectable clock, defaults to Date.now
 }
 ```
 
 - **`onEvict(key, value)`** -- called once per eviction with the evicted pair (e.g. to return a value to a pool). Zero-GC: pass a hoisted function, not a fresh closure per construction.
-  - **Reentrancy contract (fires LAST, fail-closed).** `onEvict` fires AFTER the cache is fully consistent -- the newcomer already inserted, the victim already gone. It MUST NOT call `put`/`get`/`delete`/`clear` on the same instance; doing so throws a `[lite-lru]`-tagged `Error` rather than corrupting the intrusive lists mid-eviction. `has` and `peek` ARE allowed from within the callback (they cannot mutate) -- use them to inspect.
+  - **Reentrancy contract (fires LAST, fail-closed).** `onEvict` fires AFTER the cache is fully consistent -- the newcomer already inserted, the victim already gone. It MUST NOT call `put`/`get`/`delete`/`clear` on the same instance; doing so throws a `[lite-lru]`-tagged `Error` rather than corrupting the intrusive lists mid-eviction. `has` and `peek` ARE allowed from within the callback (they cannot mutate) -- use them to inspect. An expiry reap fires `onEvict` under the same contract.
 - **`keys: "int"`** -- opt into the open-addressed typed-array keyed index for STRICT zero allocation (even the index never allocates -- no pre-fill caveat). Keys MUST be 32-bit signed integers in `[-2147483648, 2147483647]`; a non-integer or out-of-range key throws a `[lite-lru]`-tagged `TypeError` (fail-closed). Values remain arbitrary. Omitted, the default is a JS `Map`: arbitrary keys, honestly AMORTIZED (its internal resize can allocate), byte-identical to the pre-`keys` behavior. An unknown `keys` value throws with a did-you-mean hint.
+- **`ttl` / `clock`** -- opt into time-to-live (see [TTL](#ttl----opt-in-lazy-expiry) below). Both are validated fail-closed at the door.
+
+### TTL -- opt-in, lazy expiry
+
+TTL is **opt-in, lazy, and pay-for-what-you-use**. A cache that never asks for it is byte-identical to the pre-TTL build -- no extra column, no per-op check that costs anything. When you do opt in, expiry is **lazy**: an entry expires the next time a `get`/`has`/`peek` touches it (a stale touch is a MISS and reaps the entry in place, firing `onEvict`). **No timers. No async. No background sweep.** All four members support it identically (decisions/0017).
+
+```ts
+import { LiteLru } from '@zakkster/lite-lru';
+
+const cache = new LiteLru<string, Buf>(1024, { ttl: 60_000 }); // 60s default TTL
+cache.put('a', bufA);              // expires 60s from now (the default)
+cache.put('b', bufB, 5_000);       // per-entry override: 5s
+cache.put('c', bufC, Infinity);    // never expires
+
+cache.get('a');   // within 60s -> bufA; after -> undefined (reaped in place)
+cache.purgeStale(); // OPTIONAL: evict every currently-expired entry now, returns the count
+```
+
+- **Per-instance default + per-entry override.** `{ ttl }` sets the default in ms; the positional `put(key, value, ttlMs)` overrides it for one entry. `Infinity` means never-expire (`NEVER 0`). Omit `ttlMs` to use the default.
+- **Fail-closed.** `ttl`/`ttlMs` must be positive-finite-or-`Infinity` -- `<= 0`, `NaN`, and non-numbers throw a `[lite-lru]` `RangeError`. Passing a `ttlMs` to a cache built **without** a `ttl` option throws a `[lite-lru]` `Error` (there is no expiry column to stamp -- a caller bug, not a silent no-op).
+- **Deterministic + testable.** Inject a `clock: () => number` (defaults to `Date.now`) to drive expiry from your own time source; the torture differential runs the whole feature against a brute oracle on a virtual clock.
+- **Zero-GC on both paths.** The expiry column is one fixed `Float64Array` (8 bytes/slot), allocated only when `ttl` is set, never grown. Stamping on `put` and reaping on a stale touch are strictly zero-allocation; a freed slot's timestamp is dropped so no value is pinned.
+- **`purgeStale(): number`** -- the explicit, cold reclamation path (walks the index once, reaps every expired resident, returns the count). Lazy expiry already reclaims on touch; call this when you want eager reclamation. Returns `0` on a cache with no `ttl`.
+
+**vs `lru-cache`.** This is deliberately narrower and cheaper: **lazy TTL only** (no `ttlAutopurge` timer thread), **no async `fetch`/`fetchMethod`**, and **no size-aware `maxSize`/`sizeCalculation`**. If you need clairvoyant fetch coalescing or byte-budgeted caches, reach for `lru-cache`. If you need a zero-GC fixed-capacity cache with optional lazy TTL and no background work, this is the smaller tool.
 
 ### The bench tool
 
@@ -189,7 +218,7 @@ Run directly, it prints a table; imported, it returns structured results and pri
 
 | Constant  | Value     | Meaning                                                       |
 | --------- | --------- | ------------------------------------------------------------ |
-| `VERSION` | `'1.2.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
+| `VERSION` | `'1.3.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
 
 All four members and `VERSION` are named exports; `LiteLru` is also the default export.
 
@@ -323,7 +352,7 @@ Hit % and % of OPT are deterministic (seeded trace, deterministic policies); `ns
 **143 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
 
 ```bash
-npm test               # 312 node:test cases (all members, laws, boundary, dts drift)
+npm test               # 429 node:test cases (all members, laws, TTL, boundary, dts drift)
 npm run test:types     # tsc: the LiteCache<K,V> surface + one-line-swap type-check
 npm run torture        # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + gated numbers
 npm run torture:controls  # the deliberately-broken variants -- every gate must fail
@@ -338,7 +367,7 @@ The torture suite runs tiers strictly sequentially: `t0` recency/policy laws, `t
 ## What this is not
 
 - **Not "the zero-GC LRU."** `lru-cache` is already typed-array-backed; that is not the moat and is never the claim. The moat is the family + the interface + the measurement tool.
-- **Not feature parity with `lru-cache`.** No TTL, size/cost-aware capacity, async `fetchMethod`, or `dispose` in the core today. TTL and zero-GC iteration are on the roadmap as opt-in, pay-for-what-you-use columns; async fetch and size-aware capacity change the model and belong in separate packages, not this hot core.
+- **Not feature parity with `lru-cache`.** TTL ships as an opt-in, lazy, pay-for-what-you-use column (see [TTL](#ttl----opt-in-lazy-expiry)) -- but deliberately lazy-only: no autopurge timer thread. Still out of the core: size/cost-aware capacity, async `fetchMethod`, and `dispose`. Async fetch and size-aware capacity change the model and belong in separate packages, not this hot core; zero-GC iteration remains on the roadmap.
 - **Not a growable cache.** Capacity is fixed and load-bearing -- there is no growth path. An LRU never exceeds capacity, so there is nothing to grow.
 - **Not lock-free or multi-core.** This is single-threaded zero-GC JavaScript; there is no lock to avoid. The measured win is fewer writes per hit, not scalability.
 - **Not a concurrency primitive.** No atomics, no cross-worker synchronization. Coordinate shared access yourself.

@@ -83,6 +83,31 @@ export function validate(cache, lists) {
     // is reported as exactly that, not as a downstream cross-check failure.
     if (typeof store.checkStable === 'function') store.checkStable();
 
+    // --- term 0b: the ttl `_exp` column is fixed at construction (decisions/0017) --
+    // A no-op unless the cache was built with a `ttl` option (`_exp === null` off).
+    // When present it is one Float64Array slot per cache slot (8 bytes each), sized
+    // ONCE and never grown -- a "growing _exp" is a bug, caught here. Every FREE slot
+    // must read Infinity (freeSlot/reset drop the expiry, retention/hygiene mirror of
+    // the payload columns), so a stale expiry can never leak into a reused slot.
+    const exp = cache._exp;
+    if (exp !== undefined && exp !== null) {
+        if (exp.length !== cap) {
+            throw new Error('[validate] ttl _exp.length(' + exp.length + ') != capacity(' + cap + ')');
+        }
+        if (exp.buffer.byteLength !== cap * 8) {
+            throw new Error(
+                '[validate] ttl _exp buffer(' + exp.buffer.byteLength + ') != fixed size(' +
+                (cap * 8) + ') -- the _exp column must never grow');
+        }
+        for (let s = cache._store._free; s !== NIL; s = cache._next[s]) {
+            if (exp[s] !== Infinity) {
+                throw new Error(
+                    '[validate] ttl free slot ' + s + ' has a leftover expiry ' + exp[s] +
+                    ' (expected Infinity)');
+            }
+        }
+    }
+
     // --- term 1: every slot is in exactly one place (active + free == cap) ------
     const freeLen = cache._freeListLength();
     if (size + freeLen !== cap) {

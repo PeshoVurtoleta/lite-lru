@@ -144,6 +144,36 @@ class AdmitAlwaysWTinyLfu extends WTinyLfu {
     _admit(_candSlot, _victimSlot) { return true; } // BUG: never reject
 }
 
+/** C-skip-gate (decisions/0017): a get that SKIPS the ttl staleness gate entirely, so a
+ *  stale hit returns its (expired) value and promotes it instead of missing + reaping.
+ *  It MUST diverge from the ttl oracle (which reaps a stale hit). */
+class SkipTtlGateLru extends LiteLru {
+    get(key) {
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        // BUG: no `this._exp[s] <= this._clock()` check -> stale entries never expire.
+        this._moveToFront(s);
+        return this._vals[s];
+    }
+}
+
+/** C-stale-promotes (decisions/0017): a get that DETECTS a stale hit but PROMOTES it
+ *  (treats it as a normal hit) instead of reaping. The lazy rule (D17.3) is "stale =
+ *  MISS, reap in place, no promotion"; this breaks it, so it MUST diverge from the oracle. */
+class StalePromotesLru extends LiteLru {
+    get(key) {
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            // BUG: promote + return the stale value instead of reap + miss.
+            this._moveToFront(s);
+            return this._vals[s];
+        }
+        this._moveToFront(s);
+        return this._vals[s];
+    }
+}
+
 const leak = [];
 const retainSink = [];
 
@@ -285,5 +315,46 @@ export function run() {
         if (r.ok) die('t9 C9: a W-TinyLFU that admits-always did NOT diverge from the wtinylfu oracle (no teeth)');
         check(r.why === 'victim' || r.why === 'value' || r.why === 'size',
             () => 't9 C9: divergence reason was ' + r.why + ' (unexpected)');
+    }
+
+    // --- C-skip-gate (decisions/0017): a get that skips the ttl gate -> diverges ---
+    // The lazy TTL rule (D17.3): a stale hit is a MISS, reaped in place. A get that never
+    // checks staleness returns the expired value and keeps it resident, so it MUST
+    // diverge from the ttl oracle. Non-vacuity: the CORRECT ttl LRU agrees (t5).
+    {
+        const brokenPolicy = {
+            name: 'lru-skip-ttl-gate',
+            real: (cap, o) => wrapLru(new SkipTtlGateLru(cap, o)),
+            oracle: (cap, o) => makeLruOracle(cap, o),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 8, ops: 20000, seed: 0x7771, keyspace: 20, ttl: 8 });
+        if (r.ok) die('t9 C-skip-gate: a get() that skips the ttl gate did NOT diverge from the ttl oracle (no teeth)');
+    }
+
+    // --- C-stale-promotes (decisions/0017): a get that promotes a stale hit -> diverges
+    // Detecting staleness but PROMOTING (not reaping) also breaks D17.3, so it MUST
+    // diverge from the ttl oracle. Non-vacuity: the CORRECT ttl LRU agrees (t5).
+    {
+        const brokenPolicy = {
+            name: 'lru-stale-promotes',
+            real: (cap, o) => wrapLru(new StalePromotesLru(cap, o)),
+            oracle: (cap, o) => makeLruOracle(cap, o),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 8, ops: 20000, seed: 0x7772, keyspace: 20, ttl: 8 });
+        if (r.ok) die('t9 C-stale-promotes: a get() that promotes a stale hit did NOT diverge from the ttl oracle (no teeth)');
+    }
+
+    // --- C-growing-_exp (decisions/0017): a grown _exp buffer -> validate() fails ------
+    // The ttl `_exp` column is fixed at construction and must NEVER grow (like the int
+    // index). Simulate the forbidden event and assert validate() catches it. Non-vacuity:
+    // the same cache validates clean BEFORE the buffer is grown.
+    {
+        const c = new LiteLru(64, { ttl: 1000 });
+        for (let i = 0; i < 80; i++) c.put(i, i); // churn past capacity (evictions)
+        validate(c); // clean: the _exp column is the construction-time size
+        c._exp = new Float64Array(c._exp.length * 2); // grow -- exactly what is forbidden
+        let threw = false;
+        try { validate(c); } catch (e) { threw = true; }
+        if (!threw) die('t9 C-growing-_exp: validate() passed a grown _exp buffer (the stability gate is toothless)');
     }
 }

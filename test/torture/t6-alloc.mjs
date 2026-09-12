@@ -414,4 +414,79 @@ export async function run() {
             () => 't6 Gate WTINYLFU: window-MRU re-hit relinked ' + cw.writes() +
                 ' cells, expected ' + WTINYLFU_WRITES_WINDOW_MRU_REHIT);
     }
+
+    // --- Gate TTL-OFF: byte-identical hot path (decisions/0017) -------------------
+    // The off-path decision (D17): a single monomorphic `this._exp === null` guard,
+    // KEPT because it costs zero writes on the ttl-OFF path. Proof (a): a non-ttl cache
+    // has NO `_exp` column, and the CountedLru writes-per-hit are UNCHANGED from the S1
+    // baseline (0 / 5 / 4) even with the ttl branches present in the source -- the guard
+    // is predicted-not-taken and writes nothing. This is the "pay nothing when you do
+    // not use it" gate.
+    {
+        const off = new LiteLru(8);
+        check(off._exp === null, () => 't6 Gate TTL-OFF: a non-ttl cache allocated an _exp column');
+        const N2 = 8;
+        const co = new CountedLru(N2);
+        for (let i = 0; i < N2; i++) co.put(i, i);
+        co.resetWrites(); co.get(N2 - 1);
+        check(co.writes() === LRU_WRITES_HEAD_REHIT,
+            () => 't6 Gate TTL-OFF: head re-hit wrote ' + co.writes() + ', expected ' + LRU_WRITES_HEAD_REHIT);
+        const co2 = new CountedLru(N2);
+        for (let i = 0; i < N2; i++) co2.put(i, i);
+        co2.resetWrites(); co2.get(4);
+        check(co2.writes() === LRU_WRITES_INTERIOR_REHIT,
+            () => 't6 Gate TTL-OFF: interior re-hit wrote ' + co2.writes() + ', expected ' + LRU_WRITES_INTERIOR_REHIT);
+        const co3 = new CountedLru(N2);
+        for (let i = 0; i < N2; i++) co3.put(i, i);
+        co3.resetWrites(); co3.get(0);
+        check(co3.writes() === LRU_WRITES_TAIL_REHIT,
+            () => 't6 Gate TTL-OFF: tail re-hit wrote ' + co3.writes() + ', expected ' + LRU_WRITES_TAIL_REHIT);
+    }
+
+    // --- Gate TTL-ON: STRICT zero-alloc incl. expiring gets + _exp stable ---------
+    // (decisions/0017) An int-backed ttl cache pre-filled to capacity with never-expire
+    // entries, then churned: every op puts a fresh finite-ttl key (evicts the LRU +
+    // STAMPS `_exp`) AND does a stale get on an older key (which REAPS it in place --
+    // freeSlot resets `_exp`). A virtual clock advances 1 ms/op. Both the put-stamp and
+    // the get-reap ttl paths run every iteration and must be strictly zero-alloc, with
+    // `_exp` / `_next` / `_prev` / the int index buffers all fixed (never grown).
+    let tnow = 0;
+    const ttlCache = new LiteLru(CAP, { keys: 'int', ttl: 8, clock: () => tnow });
+    for (let i = 0; i < CAP; i++) ttlCache.put(-1 - i, i, Infinity); // never-expire pre-fill
+    check(ttlCache.size === CAP, () => 't6 Gate TTL-ON: pre-fill did not reach capacity');
+    const ttlExpBytes = ttlCache._exp.buffer.byteLength;
+    const ttlNextBytes = ttlCache._next.buffer.byteLength;
+    const ttlPrevBytes = ttlCache._prev.buffer.byteLength;
+    const ttlIxSlotBytes = ttlCache._store._ixSlot.buffer.byteLength;
+    const ttlIxKeyBytes = ttlCache._store._ixKey.buffer.byteLength;
+    check(ttlExpBytes === CAP * 8, () => 't6 Gate TTL-ON: _exp buffer ' + ttlExpBytes + ' != ' + (CAP * 8));
+    const ttlSink = new Int32Array(1);
+    let tk2 = 0;
+    const ttlHot = () => {
+        ttlCache.put(tk2, tk2 & 0xffff, 4);          // fresh key, ttl 4 -> stamps _exp, evicts LRU
+        ttlSink[0] += ttlCache.get((tk2 - 6) | 0) | 0; // older key is stale -> reap in place
+        tnow++;                                        // advance the virtual clock 1 ms/op
+        tk2++;
+    };
+    const gttl = runOpsGate(ttlHot, { ops: OPS, warmup: WARMUP });
+    check(ttlCache._exp.buffer.byteLength === ttlExpBytes,
+        () => 't6 Gate TTL-ON: _exp.buffer grew ' + ttlExpBytes + ' -> ' + ttlCache._exp.buffer.byteLength);
+    check(ttlCache._next.buffer.byteLength === ttlNextBytes,
+        () => 't6 Gate TTL-ON: _next.buffer grew ' + ttlNextBytes + ' -> ' + ttlCache._next.buffer.byteLength);
+    check(ttlCache._prev.buffer.byteLength === ttlPrevBytes,
+        () => 't6 Gate TTL-ON: _prev.buffer grew ' + ttlPrevBytes + ' -> ' + ttlCache._prev.buffer.byteLength);
+    check(ttlCache._store._ixSlot.buffer.byteLength === ttlIxSlotBytes,
+        () => 't6 Gate TTL-ON: _ixSlot.buffer grew ' + ttlIxSlotBytes + ' -> ' + ttlCache._store._ixSlot.buffer.byteLength);
+    check(ttlCache._store._ixKey.buffer.byteLength === ttlIxKeyBytes,
+        () => 't6 Gate TTL-ON: _ixKey.buffer grew ' + ttlIxKeyBytes + ' -> ' + ttlCache._store._ixKey.buffer.byteLength);
+    if (!gttl.report.ok) {
+        const g = gttl.summary.gc;
+        die('t6 Gate TTL-ON (ttl churn) ops gate rejected -- verdict=' + gttl.report.verdict +
+            ' source=' + gttl.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gttla = runAllocsGate(ttlHot, { iterations: 50000, batches: 8 });
+    if (!gttla.ok) {
+        die('t6 Gate TTL-ON (ttl churn) retained-alloc gate rejected -- verdict=' + gttla.report.verdict +
+            ' settled=' + gttla.result.settled + ' bytesPerCall=' + gttla.bytesPerCall);
+    }
 }

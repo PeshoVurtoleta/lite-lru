@@ -39,20 +39,38 @@ export interface LiteCache<K, V> {
    *          `undefined` is indistinguishable from a miss via `get` -- use `has`.
    */
   get(key: K): V | undefined;
-  /** Insert or update. At capacity a new key evicts the policy's victim first
-   *  (firing `onEvict`). */
-  put(key: K, value: V): void;
-  /** True if the key is present. Does NOT change recency. */
+  /**
+   * Insert or update. At capacity a new key evicts the policy's victim first
+   * (firing `onEvict`).
+   *
+   * (D17) OPTIONAL TTL. The positional `ttlMs` overrides the instance `ttl` default
+   * for THIS entry (decisions/0017): a positive number of ms, `Infinity` for
+   * never-expire, or omitted for the default. Passing `ttlMs` on a cache constructed
+   * WITHOUT a `ttl` option throws a `[lite-lru]`-tagged Error (fail-closed); a
+   * `<= 0` / `NaN` `ttlMs` throws a RangeError. TTL is LAZY: an entry expires on the
+   * next `get`/`has`/`peek` that touches it (a stale touch is a MISS + reap), never on
+   * a timer.
+   */
+  put(key: K, value: V, ttlMs?: number): void;
+  /** True if the key is present. Does NOT change recency. A stale entry (TTL) is a
+   *  MISS and is reaped in place. */
   has(key: K): boolean;
   /**
    * Read a value WITHOUT changing recency.
-   * @returns the value, or `undefined` on a miss (see D7 -- pair with `has`).
+   * @returns the value, or `undefined` on a miss (see D7 -- pair with `has`). A stale
+   *          entry (TTL) is a MISS and is reaped in place.
    */
   peek(key: K): V | undefined;
   /** Remove a key. @returns true if it was present. */
   delete(key: K): boolean;
   /** Empty the cache. Allocates nothing. */
   clear(): void;
+  /**
+   * Evict every currently-expired resident entry now (decisions/0017, D17.5). COLD,
+   * O(size); fires `onEvict` per victim. @returns the number of entries evicted (0 on
+   * a cache with no `ttl` configured).
+   */
+  purgeStale(): number;
   /** Current entry count (0 .. capacity). */
   readonly size: number;
   /** Fixed maximum entry count, set at construction. */
@@ -90,6 +108,24 @@ export interface LiteCacheOptions<K, V> {
    *     remain arbitrary.
    */
   keys?: "int";
+  /**
+   * Opt-in TTL default in ms (decisions/0017, D17). PAY-FOR-WHAT-YOU-USE: supplying
+   * `ttl` allocates one fixed `Float64Array` expiry column (8 bytes/slot); omitting it
+   * keeps the ttl-OFF hot path byte-identical (no column, no per-op check that fires).
+   * Must be a POSITIVE FINITE number, or `Infinity` for a never-expire default;
+   * `<= 0` / `NaN` throw a `[lite-lru]` RangeError (fail-closed). Per-entry overrides
+   * go through `put(key, value, ttlMs)`. TTL is LAZY: expiry happens on the next
+   * `get`/`has`/`peek` touch (a stale touch is a MISS + reap), never on a timer -- no
+   * timers, no async, no background sweep.
+   */
+  ttl?: number;
+  /**
+   * Injectable clock (decisions/0017, D17.2): a hoisted zero-arg function returning the
+   * current time in ms. Defaults to `Date.now`. Only meaningful alongside `ttl`; a
+   * non-function value throws a `[lite-lru]` TypeError (fail-closed). Keep it a hoisted
+   * function, not a per-call closure (zero-GC).
+   */
+  clock?: () => number;
 }
 
 /**
@@ -112,11 +148,12 @@ export class LiteLru<K = unknown, V = unknown> implements LiteCache<K, V> {
    */
   constructor(capacity: number, options?: LiteCacheOptions<K, V>);
   get(key: K): V | undefined;
-  put(key: K, value: V): void;
+  put(key: K, value: V, ttlMs?: number): void;
   has(key: K): boolean;
   peek(key: K): V | undefined;
   delete(key: K): boolean;
   clear(): void;
+  purgeStale(): number;
   get size(): number;
   get capacity(): number;
 }
@@ -149,11 +186,12 @@ export class Sieve<K = unknown, V = unknown> implements LiteCache<K, V> {
    */
   constructor(capacity: number, options?: LiteCacheOptions<K, V>);
   get(key: K): V | undefined;
-  put(key: K, value: V): void;
+  put(key: K, value: V, ttlMs?: number): void;
   has(key: K): boolean;
   peek(key: K): V | undefined;
   delete(key: K): boolean;
   clear(): void;
+  purgeStale(): number;
   get size(): number;
   get capacity(): number;
 }
@@ -190,11 +228,12 @@ export class S3Fifo<K = unknown, V = unknown> implements LiteCache<K, V> {
    */
   constructor(capacity: number, options?: LiteCacheOptions<K, V>);
   get(key: K): V | undefined;
-  put(key: K, value: V): void;
+  put(key: K, value: V, ttlMs?: number): void;
   has(key: K): boolean;
   peek(key: K): V | undefined;
   delete(key: K): boolean;
   clear(): void;
+  purgeStale(): number;
   get size(): number;
   get capacity(): number;
 }
@@ -235,11 +274,12 @@ export class WTinyLfu<K = unknown, V = unknown> implements LiteCache<K, V> {
    */
   constructor(capacity: number, options?: LiteCacheOptions<K, V>);
   get(key: K): V | undefined;
-  put(key: K, value: V): void;
+  put(key: K, value: V, ttlMs?: number): void;
   has(key: K): boolean;
   peek(key: K): V | undefined;
   delete(key: K): boolean;
   clear(): void;
+  purgeStale(): number;
   get size(): number;
   get capacity(): number;
 }

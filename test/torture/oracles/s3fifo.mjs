@@ -28,16 +28,20 @@
  * SameValueZero key equality (svz) mirrors JS Map/Set, matching the default backing.
  */
 
-import { svz } from './lru.mjs';
+import { svz, oracleExpiry } from './lru.mjs';
 
 /**
  * @param {number} cap
+ * @param {{ttl?:number, clock?:()=>number}} [opts]  opt-in TTL (decisions/0017)
  * @returns {{get,put,has,peek,delete,size,victim}}
  */
-export function makeS3FifoOracle(cap) {
+export function makeS3FifoOracle(cap, opts) {
     const smallCap = Math.max(1, Math.floor(cap / 10));
     const mainCap = cap - smallCap;
     const ghostCap = mainCap;
+    const ttl = opts && opts.ttl;
+    const clock = (opts && opts.clock) || (() => 0);
+    const hasTtl = ttl !== undefined;
 
     const small = []; // small[0] = oldest (eviction end); push = newest
     const main = [];  // main[0]  = oldest;                push = newest
@@ -48,6 +52,15 @@ export function makeS3FifoOracle(cap) {
         return null;
     }
     function find(k) { return findIn(small, k) || findIn(main, k); }
+
+    /** Lazy TTL (decisions/0017, D17.3): reap a stale node from whichever ring, mirroring
+     *  delete (NOT ghosted, no visited change). Returns true if it reaped. */
+    function reapIfStale(n) {
+        if (!hasTtl || n.exp > clock()) return false;
+        for (let i = 0; i < small.length; i++) if (small[i] === n) { small.splice(i, 1); return true; }
+        for (let i = 0; i < main.length; i++) if (main[i] === n) { main.splice(i, 1); return true; }
+        return true;
+    }
 
     function ghostIndex(k) {
         for (let i = 0; i < ghost.length; i++) if (svz(ghost[i], k)) return i;
@@ -87,20 +100,22 @@ export function makeS3FifoOracle(cap) {
         get(k) {
             const n = find(k);
             if (n === null) return undefined;
+            if (reapIfStale(n)) return undefined; // stale = MISS, no visited bump (D17.3)
             n.visited = true; // set visited only; nothing structural
             return n.val;
         },
-        put(k, v) {
+        put(k, v, ttlMs) {
+            const exp = hasTtl ? oracleExpiry(clock, ttl, ttlMs) : undefined;
             const n = find(k);
-            if (n !== null) { n.val = v; n.visited = true; return; } // update + visit
+            if (n !== null) { n.val = v; n.visited = true; n.exp = exp; return; } // update + visit
             const toMain = ghostIndex(k) >= 0;
             if (toMain) ghostRemove(k);
             if (small.length + main.length === cap) evictStep();
-            const entry = { key: k, val: v, visited: false };
+            const entry = { key: k, val: v, visited: false, exp };
             if (toMain) main.push(entry); else small.push(entry);
         },
-        has(k) { return find(k) !== null; },
-        peek(k) { const n = find(k); return n === null ? undefined : n.val; },
+        has(k) { const n = find(k); if (n === null) return false; return !reapIfStale(n); },
+        peek(k) { const n = find(k); if (n === null) return undefined; if (reapIfStale(n)) return undefined; return n.val; },
         delete(k) {
             for (let i = 0; i < small.length; i++) if (svz(small[i].key, k)) { small.splice(i, 1); return true; }
             for (let i = 0; i < main.length; i++) if (svz(main[i].key, k)) { main.splice(i, 1); return true; }

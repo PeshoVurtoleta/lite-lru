@@ -109,7 +109,59 @@ const SK_SEEDS = [0x9e3779b1, 0x85ebca77, 0xc2b2ae3d, 0x27d4eb2f];
  *  default (arbitrary-key) backing, never on a hot path. */
 function sameKey(a, b) { return a === b || (a !== a && b !== b); }
 
-export const VERSION = "1.2.0";
+/** TTL (decisions/0017). A per-put `ttlMs` on a cache that was NOT constructed with a
+ *  `ttl` option is a caller bug: no `_exp` column exists to stamp it. Fail closed.
+ *  Built once, thrown only on misuse. */
+const TTL_NO_COLUMN_MSG =
+    "[lite-lru] put(key, value, ttlMs) requires the cache to be constructed with a " +
+    "{ ttl } option; this instance has no ttl configured";
+
+/**
+ * Validate the optional injectable `clock` (decisions/0017, D17.2): a hoisted zero-arg
+ * function returning ms, or `undefined` for the `Date.now` default. Anything else fails
+ * closed at the door. Returns the resolved clock function.
+ */
+function validateClock(clock) {
+    if (clock === undefined) return Date.now;
+    if (typeof clock !== "function") {
+        throw new TypeError(
+            "[lite-lru] clock must be a zero-arg function returning ms, got " + String(clock));
+    }
+    return clock;
+}
+
+/**
+ * Validate a ttl duration in ms (decisions/0017, D17.1/D17.4): a POSITIVE FINITE number,
+ * or `Infinity` for never-expire. `<= 0` / `NaN` / non-number fail closed (RangeError).
+ * `undefined` means "no ttl default" and is returned as-is (the caller decides).
+ */
+function validateTtl(ttl) {
+    if (ttl === undefined) return undefined;
+    if (ttl === Infinity) return Infinity;
+    if (typeof ttl !== "number" || !(ttl > 0) || !Number.isFinite(ttl)) {
+        throw new RangeError(
+            "[lite-lru] ttl must be a positive number of ms or Infinity, got " + String(ttl));
+    }
+    return ttl;
+}
+
+/**
+ * Compute the absolute expiry timestamp for a put (decisions/0017, D17.1/D17.4). `ttlMs`
+ * omitted -> the instance default `ttl`; `Infinity` -> never (Infinity, NEVER 0); else
+ * `now() + ttlMs`. A per-put `ttlMs` is validated fail-closed (positive-finite-or-Infinity).
+ * Only ever called when a `_exp` column exists (the ttl-on path).
+ */
+function expiryFor(clock, ttl, ttlMs) {
+    if (ttlMs === undefined) return ttl === Infinity ? Infinity : clock() + ttl;
+    if (ttlMs === Infinity) return Infinity;
+    if (typeof ttlMs !== "number" || !(ttlMs > 0) || !Number.isFinite(ttlMs)) {
+        throw new RangeError(
+            "[lite-lru] ttlMs must be a positive number of ms or Infinity, got " + String(ttlMs));
+    }
+    return clock() + ttlMs;
+}
+
+export const VERSION = "1.3.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -129,7 +181,7 @@ function hashInt(key, mask) {
  * -------------------------------------------------------------------------- */
 
 class SlotStore {
-    constructor(capacity) {
+    constructor(capacity, hasTtl) {
         this._capacity = capacity;
 
         // The slot columns (D2/D4). Object arrays for the payload, Int32Array
@@ -139,6 +191,12 @@ class SlotStore {
         this._vals = new Array(capacity).fill(undefined);
         this._next = new Int32Array(capacity); // active: toward LRU; free: next free
         this._prev = new Int32Array(capacity); // active: toward MRU (unused when free)
+
+        // TTL expiry column (decisions/0017, D17.1). PAY-FOR-WHAT-YOU-USE: allocated
+        // ONLY when a `ttl` option was supplied; `null` otherwise so the ttl-OFF hot
+        // path stays byte-identical. A ms timestamp per slot; never-expire = Infinity
+        // (NEVER 0), so a fresh/freed slot defaults to never-expire, not expired-at-0.
+        this._exp = hasTtl ? new Float64Array(capacity).fill(Infinity) : null;
 
         // Build the initial FREE list: 0 -> 1 -> 2 -> ... -> capacity-1 -> NIL.
         for (let i = 0; i < capacity; i++) this._next[i] = i + 1;
@@ -160,6 +218,7 @@ class SlotStore {
     freeSlot(s) {
         this._keys[s] = undefined;
         this._vals[s] = undefined;
+        if (this._exp !== null) this._exp[s] = Infinity; // drop the expiry (decisions/0017)
         this._next[s] = this._free;
         this._free = s;
     }
@@ -184,6 +243,7 @@ class SlotStore {
         }
         next[cap - 1] = NIL;
         this._free = 0;
+        if (this._exp !== null) this._exp.fill(Infinity); // reset expiries (decisions/0017)
         this.clearIndex();
     }
 }
@@ -194,8 +254,8 @@ class SlotStore {
  * policy's miss test is a single `s < 0` for both backings.
  */
 class MapSlotStore extends SlotStore {
-    constructor(capacity) {
-        super(capacity);
+    constructor(capacity, hasTtl) {
+        super(capacity, hasTtl);
         // The hash half (D1/D3): key -> slot index. JS Map handles arbitrary key
         // types and SameValueZero equality for free. Amortized O(1).
         this._map = new Map();
@@ -216,8 +276,8 @@ class MapSlotStore extends SlotStore {
  * 32-bit signed integers, validated at the door (fail-closed).
  */
 class IntSlotStore extends SlotStore {
-    constructor(capacity) {
-        super(capacity);
+    constructor(capacity, hasTtl) {
+        super(capacity, hasTtl);
         // Next power of two >= capacity / 0.75. Because size > capacity always, an
         // empty bucket ALWAYS exists (the cache holds <= capacity entries), so every
         // probe loop terminates.
@@ -318,9 +378,9 @@ class IntSlotStore extends SlotStore {
  * value. Both `LiteLru` and `Sieve` (decisions/0012) ride this ONE factory so the
  * keyed-index backing choice + int-key door stay identical across the family.
  */
-function newStore(capacity, keys) {
-    if (keys === undefined) return new MapSlotStore(capacity);
-    if (keys === 'int') return new IntSlotStore(capacity);
+function newStore(capacity, keys, hasTtl) {
+    if (keys === undefined) return new MapSlotStore(capacity, hasTtl);
+    if (keys === 'int') return new IntSlotStore(capacity, hasTtl);
     throw new TypeError(
         "[lite-lru] unknown keys option " + String(keys) + " (did you mean 'int'?)");
 }
@@ -345,9 +405,15 @@ export class LiteLru {
 
         this._capacity = capacity;
 
+        // TTL (decisions/0017). Validated fail-closed at the door. `_ttl === undefined`
+        // means no ttl (the `_exp` column is never allocated -- pay-for-what-you-use).
+        this._clock = validateClock(options && options.clock);
+        this._ttl = validateTtl(options && options.ttl);
+
         // The keyed-index backing is chosen ONCE here (decisions/0011); each hot
-        // path stays monomorphic. The store owns the columns + free stack.
-        this._store = this._makeStore(capacity, options && options.keys);
+        // path stays monomorphic. The store owns the columns + free stack (and the
+        // opt-in `_exp` ttl column).
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
 
         // Cache references to the store's columns so the DLL relinks stay direct
         // (and so test/debug introspection -- validate, torture -- keeps working).
@@ -355,6 +421,7 @@ export class LiteLru {
         this._vals = this._store._vals;
         this._next = this._store._next; // active: toward LRU; free: next free
         this._prev = this._store._prev; // active: toward MRU (unused when free)
+        this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
 
         this._head = NIL; // MRU end of the active list
         this._tail = NIL; // LRU end of the active list
@@ -372,8 +439,8 @@ export class LiteLru {
     /** The store factory (decisions/0011), delegating to the shared `newStore` so
      *  every family member composes the SAME substrate + int-key door. A
      *  member/control can override this to compose a different substrate. */
-    _makeStore(capacity, keys) {
-        return newStore(capacity, keys);
+    _makeStore(capacity, keys, hasTtl) {
+        return newStore(capacity, keys, hasTtl);
     }
 
     get size() { return this._size; }
@@ -421,6 +488,9 @@ export class LiteLru {
         // clean miss test for BOTH backings (do NOT use truthiness: slot 0 is valid).
         const s = this._store.get(key);
         if (s < 0) return undefined;
+        // TTL gate (decisions/0017, D17.3): a stale hit is a MISS -- no promotion,
+        // reaped in place (fires onEvict). Only reached when ttl is configured.
+        if (this._exp !== null && this._exp[s] <= this._clock()) { this._reap(s); return undefined; }
         this._moveToFront(s);
         return this._vals[s];
     }
@@ -428,13 +498,20 @@ export class LiteLru {
     /**
      * Insert or update. On a new key at full capacity, evicts the LRU entry
      * first (and fires onEvict). Amortized O(1) (default backing) / O(1) (int).
+     * The optional positional `ttlMs` (decisions/0017, D17.4) overrides the instance
+     * ttl default for THIS entry: a positive number of ms, `Infinity` for never, or
+     * omitted for the default. Passing `ttlMs` on a non-ttl instance fails closed.
      */
-    put(key, value) {
+    put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        let expiresAt;
+        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                  // update-in-place + promote
             this._vals[existing] = value;
+            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
             this._moveToFront(existing);
             return;
         }
@@ -457,6 +534,7 @@ export class LiteLru {
 
         this._keys[s] = key;
         this._vals[s] = value;
+        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
         store.set(key, s);
         this._pushFront(s);
         this._size++;
@@ -475,13 +553,57 @@ export class LiteLru {
         }
     }
 
-    /** True if key is present. Does NOT change recency (D7). */
-    has(key) { return this._store.has(key); }
+    /** True if key is present. Does NOT change recency (D7). A stale entry is a MISS
+     *  and is reaped in place (decisions/0017, D17.3). */
+    has(key) {
+        const s = this._store.get(key);
+        if (s < 0) return false;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s); // never nest onEvict (fail closed)
+            return false;
+        }
+        return true;
+    }
 
-    /** Read a value WITHOUT changing recency. undefined if absent. */
+    /** Read a value WITHOUT changing recency. undefined if absent. A stale entry is a
+     *  MISS and is reaped in place (decisions/0017, D17.3). */
     peek(key) {
         const s = this._store.get(key);
-        return s < 0 ? undefined : this._vals[s];
+        if (s < 0) return undefined;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return undefined;
+        }
+        return this._vals[s];
+    }
+
+    /** Reap an expired slot in place (decisions/0017): unlink, drop from the index,
+     *  free the slot, and fire onEvict LAST via the 0002 guard (cache consistent). */
+    _reap(s) {
+        const evKey = this._keys[s];
+        const evVal = this._vals[s];
+        this._detach(s);
+        this._store.delete(evKey);
+        this._store.freeSlot(s);
+        this._size--;
+        this._inOnEvict = true;
+        try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+    }
+
+    /**
+     * Evict every expired resident entry now (decisions/0017, D17.5). COLD, O(size):
+     * never a hot path, so it MAY allocate a small victim list. Fires onEvict per
+     * victim (0002 fire-after + reentrancy guard) and returns the count evicted.
+     */
+    purgeStale() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG);
+        if (this._exp === null) return 0;
+        const now = this._clock();
+        const exp = this._exp;
+        const victims = [];
+        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
+        return victims.length;
     }
 
     /**
@@ -560,8 +682,12 @@ export class Sieve {
 
         this._capacity = capacity;
 
+        // TTL (decisions/0017), validated fail-closed at the door -- identical to LiteLru.
+        this._clock = validateClock(options && options.clock);
+        this._ttl = validateTtl(options && options.ttl);
+
         // Same shared substrate + int-key door as LiteLru (decisions/0011, 0012).
-        this._store = this._makeStore(capacity, options && options.keys);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
 
         // Cache the store's columns so the ring relinks stay direct (and so the
         // conservation invariant + torture introspection keep working).
@@ -569,6 +695,7 @@ export class Sieve {
         this._vals = this._store._vals;
         this._next = this._store._next; // toward the tail (older)
         this._prev = this._store._prev; // toward the head (newer)
+        this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
 
         // D12 -- the visited column: one byte per slot, so a hit is a single store
         // with no mask/shift. Fixed size, allocated once, never grown.
@@ -584,8 +711,8 @@ export class Sieve {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys) {
-        return newStore(capacity, keys);
+    _makeStore(capacity, keys, hasTtl) {
+        return newStore(capacity, keys, hasTtl);
     }
 
     get size() { return this._size; }
@@ -637,6 +764,9 @@ export class Sieve {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
         if (s < 0) return undefined;
+        // TTL gate (decisions/0017, D17.3): a stale hit is a MISS -- no visited bump,
+        // reaped in place. Only reached when ttl is configured.
+        if (this._exp !== null && this._exp[s] <= this._clock()) { this._reap(s); return undefined; }
         this._vis[s] = 1; // the whole hot path: a single byte store
         return this._vals[s];
     }
@@ -645,14 +775,19 @@ export class Sieve {
      * Insert or update. An update rewrites the value and sets visited (an update is
      * a write -> it matches a hit). A new key at capacity sweeps for the victim
      * (second chance for visited entries), evicts it in place, and inserts the
-     * newcomer UNVISITED at the head. onEvict fires LAST (decisions/0002).
+     * newcomer UNVISITED at the head. onEvict fires LAST (decisions/0002). The optional
+     * positional `ttlMs` (decisions/0017, D17.4) overrides the instance ttl default.
      */
-    put(key, value) {
+    put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        let expiresAt;
+        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                 // update-in-place + mark visited
             this._vals[existing] = value;
+            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
             this._vis[existing] = 1;
             return;
         }
@@ -681,6 +816,7 @@ export class Sieve {
 
         this._keys[s] = key;
         this._vals[s] = value;
+        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
         this._vis[s] = 0; // a newcomer starts UNVISITED
         store.set(key, s);
         this._pushFront(s);
@@ -698,13 +834,61 @@ export class Sieve {
         }
     }
 
-    /** True if key is present. Visited-NEUTRAL: it does NOT grant a second chance. */
-    has(key) { return this._store.has(key); }
+    /** True if key is present. Visited-NEUTRAL: it does NOT grant a second chance. A
+     *  stale entry is a MISS and is reaped in place (decisions/0017, D17.3). */
+    has(key) {
+        const s = this._store.get(key);
+        if (s < 0) return false;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return false;
+        }
+        return true;
+    }
 
-    /** Read a value WITHOUT setting visited. undefined if absent (see D7). */
+    /** Read a value WITHOUT setting visited. undefined if absent (see D7). A stale entry
+     *  is a MISS and is reaped in place (decisions/0017, D17.3). */
     peek(key) {
         const s = this._store.get(key);
-        return s < 0 ? undefined : this._vals[s];
+        if (s < 0) return undefined;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return undefined;
+        }
+        return this._vals[s];
+    }
+
+    /** Reap an expired slot in place (decisions/0017): repair the hand (mirrors delete),
+     *  unlink, drop from the index, zero the visited byte, free the slot, and fire
+     *  onEvict LAST via the 0002 guard (cache consistent). */
+    _reap(s) {
+        const evKey = this._keys[s];
+        const evVal = this._vals[s];
+        if (this._hand === s) {
+            let h = this._prev[s];
+            if (h === NIL) h = this._next[s];
+            this._hand = h;
+        }
+        this._detach(s);
+        this._store.delete(evKey);
+        this._vis[s] = 0;
+        this._store.freeSlot(s);
+        this._size--;
+        this._inOnEvict = true;
+        try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+    }
+
+    /** Evict every expired resident entry now (decisions/0017, D17.5). COLD, O(size);
+     *  fires onEvict per victim (0002) and returns the count evicted. */
+    purgeStale() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG);
+        if (this._exp === null) return 0;
+        const now = this._clock();
+        const exp = this._exp;
+        const victims = [];
+        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
+        return victims.length;
     }
 
     /**
@@ -823,8 +1007,12 @@ export class S3Fifo {
 
         this._capacity = capacity;
 
+        // TTL (decisions/0017), validated fail-closed at the door -- identical to LiteLru.
+        this._clock = validateClock(options && options.clock);
+        this._ttl = validateTtl(options && options.ttl);
+
         // Same shared substrate + int-key door as the rest of the family.
-        this._store = this._makeStore(capacity, options && options.keys);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
 
         // Cache the store's columns so the ring relinks stay direct (and so the
         // conservation invariant + torture introspection keep working).
@@ -832,6 +1020,7 @@ export class S3Fifo {
         this._vals = this._store._vals;
         this._next = this._store._next; // toward the tail (older)
         this._prev = this._store._prev; // toward the head (newer)
+        this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
 
         // D13 -- one visited byte per slot (a hit is a single store, no mask/shift),
         // and one queue tag per slot so `_detach` fixes the correct ring. Both fixed
@@ -878,8 +1067,8 @@ export class S3Fifo {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys) {
-        return newStore(capacity, keys);
+    _makeStore(capacity, keys, hasTtl) {
+        return newStore(capacity, keys, hasTtl);
     }
 
     get size() { return this._size; }
@@ -1092,6 +1281,9 @@ export class S3Fifo {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
         if (s < 0) return undefined;
+        // TTL gate (decisions/0017, D17.3): a stale hit is a MISS -- no visited bump,
+        // reaped in place. Only reached when ttl is configured.
+        if (this._exp !== null && this._exp[s] <= this._clock()) { this._reap(s); return undefined; }
         this._vis[s] = 1; // the whole hot path: a single byte store
         return this._vals[s];
     }
@@ -1100,14 +1292,19 @@ export class S3Fifo {
      * Insert or update. An update rewrites the value and sets visited (a write ->
      * matches a hit). A new key at capacity runs one eviction step, then is admitted:
      * to MAIN if it was in ghost (proven-hot on a second sighting), else to SMALL
-     * (probation). New entries start UNVISITED. onEvict fires LAST (decisions/0002).
+     * (probation). New entries start UNVISITED. onEvict fires LAST (decisions/0002). The
+     * optional positional `ttlMs` (decisions/0017, D17.4) overrides the ttl default.
      */
-    put(key, value) {
+    put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        let expiresAt;
+        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                 // update-in-place + mark visited
             this._vals[existing] = value;
+            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
             this._vis[existing] = 1;
             return;
         }
@@ -1131,6 +1328,7 @@ export class S3Fifo {
 
         this._keys[s] = key;
         this._vals[s] = value;
+        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
         this._vis[s] = 0;               // a newcomer starts UNVISITED
         store.set(key, s);
         if (toMain) this._pushMain(s); else this._pushSmall(s);
@@ -1147,13 +1345,56 @@ export class S3Fifo {
         }
     }
 
-    /** True if key is present (RESIDENT). Visited-NEUTRAL; ghost keys are NOT present. */
-    has(key) { return this._store.has(key); }
+    /** True if key is present (RESIDENT). Visited-NEUTRAL; ghost keys are NOT present. A
+     *  stale entry is a MISS and is reaped in place (decisions/0017, D17.3). */
+    has(key) {
+        const s = this._store.get(key);
+        if (s < 0) return false;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return false;
+        }
+        return true;
+    }
 
-    /** Read a value WITHOUT setting visited. undefined if absent (see D7). */
+    /** Read a value WITHOUT setting visited. undefined if absent (see D7). A stale entry
+     *  is a MISS and is reaped in place (decisions/0017, D17.3). */
     peek(key) {
         const s = this._store.get(key);
-        return s < 0 ? undefined : this._vals[s];
+        if (s < 0) return undefined;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return undefined;
+        }
+        return this._vals[s];
+    }
+
+    /** Reap an expired slot in place (decisions/0017): unlink from whichever ring,
+     *  drop from the index, zero the visited byte, free the slot, and fire onEvict LAST
+     *  via the 0002 guard. A reap is NOT an eviction, so it is never ghosted (like delete). */
+    _reap(s) {
+        const evKey = this._keys[s];
+        const evVal = this._vals[s];
+        this._detach(s);
+        this._store.delete(evKey);
+        this._vis[s] = 0;
+        this._store.freeSlot(s);
+        this._size = this._sSize + this._mSize;
+        this._inOnEvict = true;
+        try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+    }
+
+    /** Evict every expired resident entry now (decisions/0017, D17.5). COLD, O(size);
+     *  fires onEvict per victim (0002) and returns the count evicted. */
+    purgeStale() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG);
+        if (this._exp === null) return 0;
+        const now = this._clock();
+        const exp = this._exp;
+        const victims = [];
+        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
+        return victims.length;
     }
 
     /**
@@ -1327,14 +1568,19 @@ export class WTinyLfu {
 
         this._capacity = capacity;
 
+        // TTL (decisions/0017), validated fail-closed at the door -- identical to LiteLru.
+        this._clock = validateClock(options && options.clock);
+        this._ttl = validateTtl(options && options.ttl);
+
         // Same shared substrate + int-key door as the rest of the family.
-        this._store = this._makeStore(capacity, options && options.keys);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
 
         // Cache the store's columns so the list relinks stay direct.
         this._keys = this._store._keys;
         this._vals = this._store._vals;
         this._next = this._store._next; // toward the tail (LRU)
         this._prev = this._store._prev; // toward the head (MRU)
+        this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
 
         // D14 -- one segment tag per slot so `_detach` fixes the correct list.
         // Fixed size, allocated once, never grown.
@@ -1366,8 +1612,8 @@ export class WTinyLfu {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys) {
-        return newStore(capacity, keys);
+    _makeStore(capacity, keys, hasTtl) {
+        return newStore(capacity, keys, hasTtl);
     }
 
     get size() { return this._size; }
@@ -1519,6 +1765,9 @@ export class WTinyLfu {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
         if (s < 0) return undefined;
+        // TTL gate (decisions/0017, D17.3): a stale hit is a MISS -- no sketch bump, no
+        // promotion, reaped in place. Only reached when ttl is configured.
+        if (this._exp !== null && this._exp[s] <= this._clock()) { this._reap(s); return undefined; }
         this._sketchInc(this._hashKey(key, s));
         this._onHit(s);
         return this._vals[s];
@@ -1528,14 +1777,19 @@ export class WTinyLfu {
      * Insert or update. An update rewrites the value, bumps the sketch and promotes
      * (like a hit). A new key enters the WINDOW at MRU; below capacity the window sheds
      * its overflow into probation, at capacity exactly one entry is evicted via the
-     * admission compare (D14.3). onEvict fires LAST (decisions/0002).
+     * admission compare (D14.3). onEvict fires LAST (decisions/0002). The optional
+     * positional `ttlMs` (decisions/0017, D17.4) overrides the instance ttl default.
      */
-    put(key, value) {
+    put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        let expiresAt;
+        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                 // update-in-place + bump + promote
             this._vals[existing] = value;
+            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
             this._sketchInc(this._hashKey(key, existing));
             this._onHit(existing);
             return;
@@ -1580,6 +1834,8 @@ export class WTinyLfu {
             evicted = true;
         }
 
+        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+
         // Record the newcomer's own access AFTER the admission decision, so the decision
         // reads the pre-bump sketch (keeps impl and oracle in lockstep).
         this._sketchInc(this._hashKey(key, s));
@@ -1592,13 +1848,55 @@ export class WTinyLfu {
         }
     }
 
-    /** True if key is present (RESIDENT). Frequency- and recency-NEUTRAL. */
-    has(key) { return this._store.has(key); }
+    /** True if key is present (RESIDENT). Frequency- and recency-NEUTRAL. A stale entry
+     *  is a MISS and is reaped in place (decisions/0017, D17.3). */
+    has(key) {
+        const s = this._store.get(key);
+        if (s < 0) return false;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return false;
+        }
+        return true;
+    }
 
-    /** Read a value WITHOUT bumping frequency or recency. undefined if absent (D7). */
+    /** Read a value WITHOUT bumping frequency or recency. undefined if absent (D7). A
+     *  stale entry is a MISS and is reaped in place (decisions/0017, D17.3). */
     peek(key) {
         const s = this._store.get(key);
-        return s < 0 ? undefined : this._vals[s];
+        if (s < 0) return undefined;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return undefined;
+        }
+        return this._vals[s];
+    }
+
+    /** Reap an expired slot in place (decisions/0017): unlink from its segment, drop from
+     *  the index, free the slot, and fire onEvict LAST via the 0002 guard. The sketch is
+     *  untouched (frequency history persists), same as delete. */
+    _reap(s) {
+        const evKey = this._keys[s];
+        const evVal = this._vals[s];
+        this._detach(s);
+        this._store.delete(evKey);
+        this._store.freeSlot(s);
+        this._size--;
+        this._inOnEvict = true;
+        try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+    }
+
+    /** Evict every expired resident entry now (decisions/0017, D17.5). COLD, O(size);
+     *  fires onEvict per victim (0002) and returns the count evicted. */
+    purgeStale() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG);
+        if (this._exp === null) return 0;
+        const now = this._clock();
+        const exp = this._exp;
+        const victims = [];
+        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
+        return victims.length;
     }
 
     /**

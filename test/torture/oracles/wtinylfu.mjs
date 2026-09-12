@@ -31,19 +31,23 @@
  * SameValueZero key equality (svz) mirrors JS Map/Set, matching the default backing.
  */
 
-import { svz } from './lru.mjs';
+import { svz, oracleExpiry } from './lru.mjs';
 
 const SK_ROWS = 4;
 const SK_SEEDS = [0x9e3779b1, 0x85ebca77, 0xc2b2ae3d, 0x27d4eb2f];
 
 /**
  * @param {number} cap
+ * @param {{ttl?:number, clock?:()=>number}} [opts]  opt-in TTL (decisions/0017)
  * @returns {{get,put,has,peek,delete,size,victim}}
  */
-export function makeWTinyLfuOracle(cap) {
+export function makeWTinyLfuOracle(cap, opts) {
     const windowCap = Math.max(1, Math.round(cap / 100));
     const mainCap = cap - windowCap;
     const protectedCap = Math.round(mainCap * 0.8);
+    const ttl = opts && opts.ttl;
+    const clock = (opts && opts.clock) || (() => 0);
+    const hasTtl = ttl !== undefined;
 
     const window = [];    // window[0] = LRU (eviction end); push = MRU
     const probation = [];
@@ -102,6 +106,14 @@ export function makeWTinyLfuOracle(cap) {
         return null;
     }
 
+    /** Lazy TTL (decisions/0017, D17.3): reap a stale node from its list, mirroring delete
+     *  (sketch untouched, no promotion). Returns true if it reaped. */
+    function reapIfStale(loc) {
+        if (!hasTtl || loc.list[loc.idx].exp > clock()) return false;
+        loc.list.splice(loc.idx, 1);
+        return true;
+    }
+
     /** Promote on a hit, mirroring Lru.js `_onHit`. */
     function promote(loc) {
         const node = loc.list[loc.idx];
@@ -124,22 +136,25 @@ export function makeWTinyLfuOracle(cap) {
         get(k) {
             const loc = find(k);
             if (loc === null) return undefined;
+            if (reapIfStale(loc)) return undefined; // stale = MISS, no bump/promote (D17.3)
             const val = loc.list[loc.idx].val;
             sketchInc(hashKey(k));
             promote(loc);
             return val;
         },
-        put(k, v) {
+        put(k, v, ttlMs) {
+            const exp = hasTtl ? oracleExpiry(clock, ttl, ttlMs) : undefined;
             const loc = find(k);
             if (loc !== null) {           // update + bump + promote
                 loc.list[loc.idx].val = v;
+                loc.list[loc.idx].exp = exp;
                 sketchInc(hashKey(k));
                 promote(loc);
                 return;
             }
             const size = window.length + probation.length + protectedL.length;
             if (size < cap) {
-                window.push({ key: k, val: v });
+                window.push({ key: k, val: v, exp });
                 while (window.length > windowCap) probation.push(window.shift());
             } else {
                 const cand = window.shift(); // window LRU = candidate
@@ -149,12 +164,12 @@ export function makeWTinyLfuOracle(cap) {
                     probation.shift();       // evict the victim (probation LRU)
                 }
                 // else: ties/no-victim -> candidate evicted (already removed from window)
-                window.push({ key: k, val: v });
+                window.push({ key: k, val: v, exp });
             }
             sketchInc(hashKey(k)); // bump the newcomer AFTER the decision
         },
-        has(k) { return find(k) !== null; },
-        peek(k) { const loc = find(k); return loc === null ? undefined : loc.list[loc.idx].val; },
+        has(k) { const loc = find(k); if (loc === null) return false; return !reapIfStale(loc); },
+        peek(k) { const loc = find(k); if (loc === null) return undefined; if (reapIfStale(loc)) return undefined; return loc.list[loc.idx].val; },
         delete(k) {
             let i = findIn(window, k);
             if (i >= 0) { window.splice(i, 1); return true; }

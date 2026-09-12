@@ -77,7 +77,7 @@ LiteMGLRU, meta-policy; distilled into DEBATE items 13-15).
 | 2Q / SLRU | S7 |
 | ARC (flagged -- stresses the fixed-capacity law) | S8 |
 | README + llms.txt + CHANGELOG + shipped benchmark/trace-replay tool | **built + gated (S9)** |
-| zero-GC TTL (opt-in expiry column) -- cross-cutting | S10 |
+| zero-GC TTL (opt-in expiry column) -- cross-cutting | **built + gated (S10)** |
 | zero-GC iteration (keys/entries/values, recency order) -- cross-cutting | S11 |
 | opt-in stats (hit/miss/evict/writes-per-hit) -- cross-cutting | S12 |
 | snapshot / restore (dump/load; SoA columns are the serial form) | later/maybe (DEBATE 11) |
@@ -692,16 +692,51 @@ ASCII-only; grep new files for stray tool-call tags. Add README + llms.txt to
 one per feature as S10-S12 land; the release gate for each minor updates it.
 
 ===============================================================================
-# S10 -- v1.x -- zero-GC TTL (opt-in expiry column) [cross-cutting]
+# S10 -- v1.3.0 -- zero-GC TTL (opt-in expiry column) [cross-cutting]
 ===============================================================================
 ```markdown
-status: planned
+version_target: 1.3.0
+status: built + gated (VERSION stays 1.2.0 until /release 1.3.0)
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0
 depends_on: [S3]
 decisions: [D17]
 ```
+WHAT LANDED (S10, working tree, uncommitted; VERSION still 1.2.0 until /release 1.3.0):
+  - Opt-in TTL across ALL FOUR members on the shared substrate: an optional `_exp`
+    Float64Array (ms expiry), allocated ONLY when `ttl` is configured (null off ->
+    zero extra bytes). expiresAt = clock()+ttlMs; never-expire = Infinity, NEVER 0
+    ("null is not zero" -- a 0 stamp reads as expired). Injectable `clock` option
+    (default Date.now()), validated fail-closed. Lazy check on get/peek/has BEFORE
+    each member's hit policy: a stale touch is a MISS (no promote/visited/sketch
+    bump), evicts in place firing onEvict. Untouched-stale counts toward size until
+    touched or purgeStale()'d; capacity eviction ignores staleness. Positional
+    `put(key,value,ttlMs?)` per-entry override; `purgeStale(): number` cold reclaim.
+    Fail-closed: ttl/ttlMs <=0|NaN|non-number throw, non-function clock throws, ttlMs
+    on a non-ttl instance throws [lite-lru].
+  - THE off-path decision RESOLVED BY MEASUREMENT: option (a) a single monomorphic
+    `this._exp === null` guard per hot method -- KEPT (no constructor-time method
+    specialization needed). ttl-OFF writes-per-hit UNCHANGED (LiteLru 0/5/4, Sieve
+    0/1, S3Fifo 0/1, WTinyLfu window-MRU 0); ttl-ON strict zero-alloc (gc major 0 /
+    maxMs 0.00 / 0.00032 B/op), `_exp.byteLength` stable over 100k churn.
+  - decisions/0017-ttl.md (D17.1..D17.5, incl. the fail-closed purgeStale-under-
+    reentrancy contract); Lru.d.ts (`ttl?`/`clock?`, put arity, purgeStale on
+    LiteCache + all four); oracles x4 extended with per-key expiry + a virtual clock
+    (lazy rule mirrored exactly); harness runDifferential drives the clock; validate
+    `_exp` conservation term; tiers t0/t1/t2/t5/t6/t7/t9 (t9 controls: skip-gate /
+    stale-promotes / growing-_exp, each fails); README + llms.txt TTL sections.
+  - RULING (owner): the qa-found purgeStale-under-onEvict-reentrancy "abort early"
+    is INTENDED fail-closed behavior (0002), not a defect -- continuing past a
+    contract violation would be fail-OPEN; the cache stays structurally consistent
+    and un-reaped stales are reaped lazily. Recorded in D17.5, regression-pinned in
+    test/Ttl.test.js section H. (The over-specified "completes all victims" line in
+    the session brief was the thing that was wrong.)
+  - Gates: npm test 429/429 (+117 TTL boundary cases in test/Ttl.test.js, four
+    members parameterized); test:types (tsc) clean; torture "ok"/exit 0; controls
+    "ok"/exit 0. Reviewer APPROVED (zero-alloc ttl on+off all four, retention on
+    reap, fail-closed validation, the !_inOnEvict has/peek gate leaks nothing, lazy
+    oracle mirror by logic, WTinyLfu two-branch stamp).
 PURPOSE
   The one table-stakes feature vs the incumbents (DEBATE item 11). An opt-in
   per-instance `ttl` adds a `Float64Array` (or Uint32 ms) EXPIRY column to the SoA

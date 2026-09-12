@@ -16,7 +16,9 @@
 import {
     runDifferential, lruPolicy, lruIntPolicy, fifoPolicy,
     sievePolicy, sieveIntPolicy, s3fifoPolicy, s3fifoIntPolicy,
-    wtinylfuPolicy, wtinylfuIntPolicy, SEED, die,
+    wtinylfuPolicy, wtinylfuIntPolicy,
+    lruTtlPolicy, sieveTtlPolicy, s3fifoTtlPolicy, wtinylfuTtlPolicy,
+    SEED, die,
 } from './harness.mjs';
 
 const OPS = 100000;
@@ -26,7 +28,7 @@ function fuzzPolicy(policy, configs) {
     for (let ci = 0; ci < configs.length; ci++) {
         const cfg = configs[ci];
         const seed = (SEED ^ cfg.salt) >>> 0 || 1;
-        const r = runDifferential(policy, { cap: cfg.cap, ops: cfg.ops, seed, keyspace: cfg.keyspace });
+        const r = runDifferential(policy, { cap: cfg.cap, ops: cfg.ops, seed, keyspace: cfg.keyspace, ttl: cfg.ttl });
         if (!r.ok) {
             die('t5 ' + policy.name + ' diverged at op ' + r.i + ' (' + r.why + '): real=' +
                 String(r.real) + ' oracle=' + String(r.oracle) + ' key=' + String(r.key) +
@@ -92,4 +94,19 @@ export function run() {
         { cap: 8, keyspace: 24, ops: OPS, salt: 0x62 },
         { cap: 64, keyspace: 200, ops: OPS, salt: 0x63 },
     ]);
+
+    // The TTL proof (decisions/0017): the runner drives a VIRTUAL CLOCK, advancing it
+    // a few ms per op and passing per-put ttlMs (some Infinity, some the default), so
+    // entries expire mid-stream. Each member's LAZY stale rule (get/has/peek reap on
+    // touch, no promotion; capacity eviction does NOT prefer stale) must match its own
+    // oracle -- same value AND same next victim AND same size after every op. Caps 8/64
+    // exercise both small (probation-empty) and normal splits under expiry churn.
+    const ttlConfigs = [
+        { cap: 8, keyspace: 24, ops: OPS, salt: 0xa1, ttl: 8 },
+        { cap: 64, keyspace: 200, ops: OPS, salt: 0xa2, ttl: 8 },
+    ];
+    fuzzPolicy(lruTtlPolicy, ttlConfigs);
+    fuzzPolicy(sieveTtlPolicy, ttlConfigs);
+    fuzzPolicy(s3fifoTtlPolicy, ttlConfigs);
+    fuzzPolicy(wtinylfuTtlPolicy, ttlConfigs);
 }

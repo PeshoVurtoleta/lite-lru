@@ -146,7 +146,7 @@ export async function settleGc(cycles) {
 export function wrapLru(cache) {
     return {
         get: (k) => cache.get(k),
-        put: (k, v) => cache.put(k, v),
+        put: (k, v, t) => cache.put(k, v, t),
         has: (k) => cache.has(k),
         peek: (k) => cache.peek(k),
         delete: (k) => cache.delete(k),
@@ -187,7 +187,7 @@ export const fifoPolicy = {
 export function wrapSieve(cache) {
     return {
         get: (k) => cache.get(k),
-        put: (k, v) => cache.put(k, v),
+        put: (k, v, t) => cache.put(k, v, t),
         has: (k) => cache.has(k),
         peek: (k) => cache.peek(k),
         delete: (k) => cache.delete(k),
@@ -220,7 +220,7 @@ export const sieveIntPolicy = {
 export function wrapS3Fifo(cache) {
     return {
         get: (k) => cache.get(k),
-        put: (k, v) => cache.put(k, v),
+        put: (k, v, t) => cache.put(k, v, t),
         has: (k) => cache.has(k),
         peek: (k) => cache.peek(k),
         delete: (k) => cache.delete(k),
@@ -253,7 +253,7 @@ export const s3fifoIntPolicy = {
 export function wrapWTinyLfu(cache) {
     return {
         get: (k) => cache.get(k),
-        put: (k, v) => cache.put(k, v),
+        put: (k, v, t) => cache.put(k, v, t),
         has: (k) => cache.has(k),
         peek: (k) => cache.peek(k),
         delete: (k) => cache.delete(k),
@@ -281,6 +281,42 @@ export const wtinylfuIntPolicy = {
 };
 
 /* -------------------------------------------------------------------------- *
+ * TTL policies (decisions/0017). The factories FORWARD a construction-options arg
+ * `o` (the { ttl, clock } the runner injects) to BOTH the real cache and its oracle,
+ * so runDifferential's virtual clock drives them in lockstep. The lazy stale rule
+ * (D17.3) is mirrored inside each oracle exactly, so a stale get/has/peek reaps the
+ * same entry in both -- the differential proves it.
+ * -------------------------------------------------------------------------- */
+
+/** Classic LRU with an opt-in TTL default (decisions/0017). */
+export const lruTtlPolicy = {
+    name: 'lru-ttl',
+    real: (cap, o) => wrapLru(new LiteLru(cap, o)),
+    oracle: (cap, o) => makeLruOracle(cap, o),
+};
+
+/** SIEVE with an opt-in TTL default (decisions/0017). */
+export const sieveTtlPolicy = {
+    name: 'sieve-ttl',
+    real: (cap, o) => wrapSieve(new Sieve(cap, o)),
+    oracle: (cap, o) => makeSieveOracle(cap, o),
+};
+
+/** S3-FIFO with an opt-in TTL default (decisions/0017). */
+export const s3fifoTtlPolicy = {
+    name: 's3fifo-ttl',
+    real: (cap, o) => wrapS3Fifo(new S3Fifo(cap, o)),
+    oracle: (cap, o) => makeS3FifoOracle(cap, o),
+};
+
+/** W-TinyLFU with an opt-in TTL default (decisions/0017). */
+export const wtinylfuTtlPolicy = {
+    name: 'wtinylfu-ttl',
+    real: (cap, o) => wrapWTinyLfu(new WTinyLfu(cap, o)),
+    oracle: (cap, o) => makeWTinyLfuOracle(cap, o),
+};
+
+/* -------------------------------------------------------------------------- *
  * The PARAMETERIZED differential runner (the whole point of S1).
  *
  * Drives a seeded mixed op stream against BOTH the real cache and the brute
@@ -291,11 +327,12 @@ export const wtinylfuIntPolicy = {
 
 const OP_GET = 0, OP_PUT = 1, OP_DELETE = 2, OP_HAS = 3, OP_PEEK = 4;
 
-/** Apply one op to a uniform driver, returning the observable value. */
-function applyOp(d, kind, key, val) {
+/** Apply one op to a uniform driver, returning the observable value. `ttlMs` is only
+ *  ever defined in TTL mode and only for a put (decisions/0017). */
+function applyOp(d, kind, key, val, ttlMs) {
     switch (kind) {
         case OP_GET: return d.get(key);
-        case OP_PUT: d.put(key, val); return undefined;
+        case OP_PUT: d.put(key, val, ttlMs); return undefined;
         case OP_DELETE: return d.delete(key);
         case OP_HAS: return d.has(key);
         default: return d.peek(key); // OP_PEEK
@@ -304,22 +341,41 @@ function applyOp(d, kind, key, val) {
 
 /**
  * @param {{name,real,oracle}} policy
- * @param {{cap:number, ops:number, seed:number, keyspace:number}} opts
+ * @param {{cap:number, ops:number, seed:number, keyspace:number, ttl?:number}} opts
  * @returns {{ok:true} | {ok:false, i, kind, key, why, real, oracle}}
+ *
+ * When `opts.ttl` is set (decisions/0017) the runner drives a VIRTUAL CLOCK shared by
+ * the real cache and the oracle: it advances a few ms per op and passes a per-put
+ * `ttlMs` (sometimes Infinity) so entries actually expire mid-stream and the lazy
+ * stale rule (get/has/peek reap on touch) is differential-checked, victim included.
  */
 export function runDifferential(policy, opts) {
     const prng = makePrng(opts.seed);
-    const real = policy.real(opts.cap);
-    const oracle = policy.oracle(opts.cap);
+    const ttl = opts.ttl;
+    // A virtual clock (a mutable holder both driver factories close over via cfn).
+    const vclock = { now: 0 };
+    const cfn = ttl !== undefined ? () => vclock.now : undefined;
+    const cacheOpts = ttl !== undefined ? { ttl, clock: cfn } : undefined;
+    const real = policy.real(opts.cap, cacheOpts);
+    const oracle = policy.oracle(opts.cap, cacheOpts);
     const ks = opts.keyspace;
 
     for (let i = 0; i < opts.ops; i++) {
+        // Advance the virtual clock BEFORE the op so real + oracle read the same now.
+        if (ttl !== undefined) vclock.now += prng() % 3; // 0/1/2 ms per op
         const kind = prng() % 5;
         const key = prng() % ks;
         const val = prng() >>> 0;
+        // A per-put ttlMs in TTL mode: mostly small (so entries expire), sometimes
+        // Infinity (never), sometimes omitted (the instance default).
+        let ttlMs;
+        if (ttl !== undefined && kind === OP_PUT) {
+            const pick = prng() % 4;
+            ttlMs = pick === 0 ? undefined : pick === 1 ? Infinity : 1 + (prng() % 6);
+        }
 
-        const rv = applyOp(real, kind, key, val);
-        const ov = applyOp(oracle, kind, key, val);
+        const rv = applyOp(real, kind, key, val, ttlMs);
+        const ov = applyOp(oracle, kind, key, val, ttlMs);
         if (!Object.is(rv, ov)) {
             return { ok: false, i, kind, key, why: 'value', real: rv, oracle: ov };
         }
