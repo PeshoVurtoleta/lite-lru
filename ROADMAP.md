@@ -73,7 +73,7 @@ LiteMGLRU, meta-policy; distilled into DEBATE items 13-15).
 | shared keyed-index substrate (was S4, now the keystone) | **built + gated (S3)** |
 | SIEVE | **built + gated (S4)** |
 | S3-FIFO | **built + gated (S5)** |
-| W-TinyLFU | S6 |
+| W-TinyLFU | **built + gated (S6)** |
 | 2Q / SLRU | S7 |
 | ARC (flagged -- stresses the fixed-capacity law) | S8 |
 | README + llms.txt + CHANGELOG + shipped benchmark/trace-replay tool | **built + gated (S9)** |
@@ -540,7 +540,7 @@ DONE WHEN
 ===============================================================================
 ```markdown
 version_target: 1.2.0
-status: planned
+status: built + gated (VERSION stays 1.1.0 until /release 1.2.0)
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0
@@ -548,6 +548,33 @@ leak_cycles: 4096
 decisions: [D14]
 depends_on: [S3, S4, S5]
 ```
+WHAT LANDED (S6, working tree, uncommitted; VERSION still 1.1.0 until /release):
+  - `WTinyLfu` on the substrate: window-LRU + SLRU(probation/protected) threaded
+    through `_next`/`_prev` tagged per slot by a `_seg` Uint8; a fixed 4-row 4-bit
+    Count-Min sketch (`_sk`, 8 counters/Uint32, width pow2>=cap, aged by halving
+    every 10*cap bumps); admission candidate=window tail vs victim=probation tail,
+    admit iff freq(cand)>freq(victim), ties reject. Uniform LiteCache surface,
+    onEvict fire-after + reentrancy guard, keys:'int' strict path. D14.1 object-key
+    hashing = resident slot index (no WeakMap, tracked while resident).
+  - decisions/0014-wtinylfu.md (D14.1..D14.5); Lru.d.ts WTinyLfu<K,V> + dts-drift;
+    test/torture/oracles/wtinylfu.mjs (independent brute); harness/validate + tiers
+    t0/t2/t5/t6/t7/t9 (t9 control = admit-always, diverges + fails); README/llms.txt
+    member sections.
+  - BENCH ROSTER FIX (in-scope correction): benchmark/Bench.mjs shipped only
+    LiteLru+Sieve since S5 -- S3Fifo AND WTinyLfu were missing from the shipped
+    measurement tool. Added both to the MEMBERS roster + import (and updated the
+    Bench.test.js member-count/name assertion 2->4). The shipped tool now measures
+    the whole family.
+  - Gates: npm test 312/312 (incl. test/WTinyLfu.test.js boundary suite + the
+    4-member bench contract); test:types (tsc) clean; torture "ok"/exit 0; controls
+    "ok"/exit 0. Reviewer APPROVED (hot-path zero-alloc incl. sketch inc/aging +
+    object-key path; retention; fail-closed doors; degenerate caps 1/2/3 all
+    verified). Measured (bench, cap 256, ops 200000, seed 0x9e3779b9): zipf hit%
+    WTinyLfu 65.7 (88.3% OPT) vs LiteLru 57.4 (77.2%); loop WTinyLfu 23.5 (94.4%
+    OPT) where LRU/Sieve/S3Fifo all 0.0; scan WTinyLfu 49.9 (99.9% OPT).
+    Writes-per-hit (CountedWTinyLfu): window-MRU 0 / probation->protected interior 9
+    / probation tail 8 -- higher than Sieve/S3Fifo by design (segment relink + a
+    4-counter sketch bump), still zero allocation.
 PURPOSE
   Highly skewed / Zipf popularity + admission control (the Caffeine approach): a
   small window (LRU/FIFO) absorbs bursts, a main SLRU holds the hot set, and a

@@ -12,7 +12,7 @@
  * requirement of the bench itself; it must only stay dependency-free and never
  * mutate global state.
  *
- * WHAT IT REPORTS. For each workload x member (LiteLru, Sieve) on a DETERMINISTIC
+ * WHAT IT REPORTS. For each workload x member (LiteLru, Sieve, S3Fifo, WTinyLfu) on a DETERMINISTIC
  * seeded trace: hit ratio, writes-per-hit (metadata stores on the hit path), ns/op
  * (machine-local wall-clock, an EXAMPLE only), and pctOptimal = memberHits /
  * optHits * 100, where optHits is Belady's OPT -- the clairvoyant offline optimum
@@ -29,7 +29,7 @@
  * @license MIT
  */
 
-import { LiteLru, Sieve, VERSION } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, VERSION } from '../Lru.js';
 
 /* -------------------------------------------------------------------------- *
  * Seeded PRNG -- xorshift32, the same generator the torture harness uses, so a
@@ -323,6 +323,8 @@ function measureTiming(CacheClass, trace, capacity) {
 const MEMBERS = [
     { name: 'LiteLru', ctor: LiteLru },
     { name: 'Sieve', ctor: Sieve },
+    { name: 'S3Fifo', ctor: S3Fifo },
+    { name: 'WTinyLfu', ctor: WTinyLfu },
 ];
 
 /* -------------------------------------------------------------------------- *

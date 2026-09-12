@@ -25,11 +25,12 @@
  */
 
 import { measureOps, checkNoGc, measureAllocs, checkAllocs } from '@zakkster/lite-gc-profiler';
-import { LiteLru, Sieve, S3Fifo } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../../Lru.js';
 import { makeLruOracle, svz } from './oracles/lru.mjs';
 import { makeFifoOracle, makeFifoReal } from './oracles/fifo.mjs';
 import { makeSieveOracle } from './oracles/sieve.mjs';
 import { makeS3FifoOracle } from './oracles/s3fifo.mjs';
+import { makeWTinyLfuOracle } from './oracles/wtinylfu.mjs';
 
 export { validate } from '../validate.mjs';
 
@@ -246,6 +247,39 @@ export const s3fifoIntPolicy = {
     oracle: (cap) => makeS3FifoOracle(cap),
 };
 
+/** Wrap a real WTinyLfu as a uniform driver. victim = the key the next over-capacity
+ *  insert would evict, read via the non-mutating `_peekVictim` (test-only, never a
+ *  hot path) -- the same value `put` would pick. */
+export function wrapWTinyLfu(cache) {
+    return {
+        get: (k) => cache.get(k),
+        put: (k, v) => cache.put(k, v),
+        has: (k) => cache.has(k),
+        peek: (k) => cache.peek(k),
+        delete: (k) => cache.delete(k),
+        size: () => cache.size,
+        victim: () => cache._peekVictim(),
+        raw: cache,
+    };
+}
+
+/** The W-TinyLFU policy (decisions/0014): the frequency-admission member + its own
+ *  independent window+SLRU+sketch oracle. Default backing (Map): arbitrary keys. */
+export const wtinylfuPolicy = {
+    name: 'wtinylfu',
+    real: (cap) => wrapWTinyLfu(new WTinyLfu(cap)),
+    oracle: (cap) => makeWTinyLfuOracle(cap),
+};
+
+/** The W-TinyLFU policy on the INTEGER substrate backing (`keys: 'int'`), driven
+ *  against the SAME wtinylfu oracle: the strict-zero backing must return byte-
+ *  identical values + victims (decisions/0011 + 0014). */
+export const wtinylfuIntPolicy = {
+    name: 'wtinylfu-int',
+    real: (cap) => wrapWTinyLfu(new WTinyLfu(cap, { keys: 'int' })),
+    oracle: (cap) => makeWTinyLfuOracle(cap),
+};
+
 /* -------------------------------------------------------------------------- *
  * The PARAMETERIZED differential runner (the whole point of S1).
  *
@@ -409,3 +443,35 @@ export class CountedS3Fifo extends S3Fifo {
 /** S3-FIFO hit baselines (measured; regression tripwire). Same headline as SIEVE. */
 export const S3FIFO_WRITES_HIT_LINKS = 0; // a hit relinks nothing
 export const S3FIFO_WRITES_HIT_VIS = 1;   // ... it sets exactly one visited byte
+
+/**
+ * A WTinyLfu subclass whose _next/_prev columns are wrapped in counting Proxies --
+ * used ONLY in the T6 W-TinyLFU counter sub-tier, NEVER on a measured zero-alloc path
+ * (a Proxy allocates + traps and would poison the gate). Unlike SIEVE/S3-FIFO, a
+ * W-TinyLFU hit legitimately relinks (recency/promotion) AND bumps the sketch -- the
+ * gate asserts zero-ALLOCATION, not minimal writes. This counter pins the ONE genuine
+ * fast path: a re-hit of the window MRU relinks NOTHING (early return in `_onHit`).
+ */
+export class CountedWTinyLfu extends WTinyLfu {
+    constructor(capacity, options) {
+        super(capacity, options);
+        this._writes = 0; // _next / _prev link stores
+        const self = this;
+        const countStores = (arr) => new Proxy(arr, {
+            set(t, prop, value) {
+                if (typeof prop === 'string' && prop !== 'length' && String(+prop) === prop) {
+                    self._writes++;
+                }
+                t[prop] = value;
+                return true;
+            },
+        });
+        this._next = countStores(this._next);
+        this._prev = countStores(this._prev);
+    }
+    resetWrites() { this._writes = 0; }
+    writes() { return this._writes; }
+}
+
+/** W-TinyLFU window-MRU re-hit baseline (measured): the one 0-relink fast path. */
+export const WTINYLFU_WRITES_WINDOW_MRU_REHIT = 0;

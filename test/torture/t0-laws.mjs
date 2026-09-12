@@ -15,8 +15,8 @@
  * corrupt structure still fails the tier.
  */
 
-import { LiteLru, S3Fifo } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo } from './harness.mjs';
+import { LiteLru, S3Fifo, WTinyLfu } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu } from './harness.mjs';
 
 const CAP = 16;
 const KEYSPACE = 40;
@@ -157,5 +157,64 @@ export function run() {
         check(survivors < N, () => 't0 S2: too many scan keys survived (' + survivors + ') -- eviction not exercised');
         validate(c);
         void wrapS3Fifo(c); // exercise the driver wrapper on a churned cache
+    }
+
+    // --- W-TinyLFU laws (decisions/0014) ----------------------------------------
+    const SEG_WINDOW = 0, SEG_PROBATION = 1, SEG_PROTECTED = 2; // matches Lru.js tags
+
+    // W1: a newcomer is admitted to the WINDOW.
+    {
+        const c = new WTinyLfu(64); // window 1
+        c.put('a', 1);
+        const s = c._store.get('a');
+        check(c._seg[s] === SEG_WINDOW, () => 't0 W1: newcomer did not enter the WINDOW');
+        validate(c);
+    }
+
+    // W2: a HIT on a PROBATION entry PROMOTES it to PROTECTED (deferred SLRU
+    // promotion). Fill past the window so the window overflow lands in probation, then
+    // hit a probation entry and assert it moved.
+    {
+        const c = new WTinyLfu(20); // window 1, main 19, protected 15, probation 4
+        for (let i = 0; i < 20; i++) c.put(i, i); // fill; window sheds overflow to probation
+        // find a probation slot
+        let probeKey = -1;
+        for (let k = 0; k < 20; k++) {
+            const s = c._store.get(k);
+            if (s >= 0 && c._seg[s] === SEG_PROBATION) { probeKey = k; break; }
+        }
+        check(probeKey >= 0, () => 't0 W2: no probation entry to probe (setup invalid)');
+        c.get(probeKey); // hit -> promote to protected
+        const s2 = c._store.get(probeKey);
+        check(c._seg[s2] === SEG_PROTECTED, () => 't0 W2: probation hit did not promote to PROTECTED');
+        validate(c);
+    }
+
+    // W3: frequency admission -- a proven-hot key survives an unbounded flood of
+    // distinct one-hit-wonders. Each cold newcomer enters the window with frequency ~1;
+    // the hot key's sketch frequency keeps climbing, so when a cold candidate is weighed
+    // against a resident it loses, and the hot key is never the evicted victim. A plain
+    // LRU/FIFO on a scan would evict it.
+    {
+        const N = 64; // window 1, protected 50, probation 13
+        const c = new WTinyLfu(N);
+        const HOT = 'hot';
+        c.put(HOT, 1);
+        for (let i = 0; i < 200; i++) c.get(HOT); // build the hot key's frequency
+        for (let i = 0; i < N - 1; i++) c.put('cold' + i, i); // fill to capacity
+        check(c.size === N, () => 't0 W3: wtinylfu not full before the scan');
+        for (let i = 0; i < 6000; i++) {
+            check(c.get(HOT) === 1, () => 't0 W3: hot key lost mid-scan at ' + i);
+            c.put('scan' + i, i); // a unique one-hit-wonder each op -> forces eviction
+            check(c.size === N, () => 't0 W3: wtinylfu drifted from capacity during the scan');
+            if ((i & 255) === 0) validate(c);
+        }
+        check(c.has(HOT), () => 't0 W3: the hot key was evicted by a one-hit-wonder scan (no frequency resistance)');
+        // Non-vacuity: the cold one-hit-wonders DO get evicted (the scan is real).
+        let survivors = 0;
+        for (let i = 0; i < 6000; i++) if (c.has('scan' + i)) survivors++;
+        check(survivors < N, () => 't0 W3: too many scan keys survived (' + survivors + ') -- eviction not exercised');
+        validate(c);
+        void wrapWTinyLfu(c); // exercise the driver wrapper on a churned cache
     }
 }

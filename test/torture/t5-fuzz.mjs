@@ -15,7 +15,8 @@
 
 import {
     runDifferential, lruPolicy, lruIntPolicy, fifoPolicy,
-    sievePolicy, sieveIntPolicy, s3fifoPolicy, s3fifoIntPolicy, SEED, die,
+    sievePolicy, sieveIntPolicy, s3fifoPolicy, s3fifoIntPolicy,
+    wtinylfuPolicy, wtinylfuIntPolicy, SEED, die,
 } from './harness.mjs';
 
 const OPS = 100000;
@@ -69,6 +70,21 @@ export function run() {
     s3Configs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0x7f });
     fuzzPolicy(s3fifoPolicy, s3Configs);
     fuzzPolicy(s3fifoIntPolicy, s3Configs);
+
+    // The W-TinyLFU MEMBER proof (decisions/0014): window + SLRU + count-min sketch on
+    // BOTH backings against its own independent oracle -- same value AND same next
+    // victim AND same size after every op, including the frequency-driven admission
+    // decision and >=1 sketch aging pass (sample = 10*cap). Caps 1..9 stress the
+    // window/protected rounding + the main==0 degenerate edge (D14.4); 64 is a normal
+    // split (window 1 / protected 50 / probation 13) where admission + promotion +
+    // aging all fire.
+    const wConfigs = [];
+    for (let cap = 1; cap <= 9; cap++) {
+        wConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0x90 + cap });
+    }
+    wConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0x9f });
+    fuzzPolicy(wtinylfuPolicy, wConfigs);
+    fuzzPolicy(wtinylfuIntPolicy, wConfigs);
 
     // The SEAM proof: the SAME runner drives a second policy unchanged.
     fuzzPolicy(fifoPolicy, [

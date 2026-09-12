@@ -19,15 +19,16 @@
  *   C8 an S3-FIFO get that GRADUATES on touch  -> diverges from the s3fifo oracle
  */
 
-import { LiteLru, Sieve, S3Fifo } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../../Lru.js';
 import {
-    runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, validate,
+    runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, wrapWTinyLfu, validate,
     lruPolicy, check, die,
 } from './harness.mjs';
 import { makeLruOracle } from './oracles/lru.mjs';
 import { makeFifoOracle } from './oracles/fifo.mjs';
 import { makeSieveOracle } from './oracles/sieve.mjs';
 import { makeS3FifoOracle } from './oracles/s3fifo.mjs';
+import { makeWTinyLfuOracle } from './oracles/wtinylfu.mjs';
 
 const NIL = -1;
 
@@ -129,6 +130,18 @@ class GraduateOnTouchS3Fifo extends S3Fifo {
         }
         return this._vals[s];
     }
+}
+
+/** C9: a W-TinyLFU whose admission ALWAYS admits the candidate (never rejects on a
+ *  frequency tie/loss). The whole point of W-TinyLFU (decisions/0014) is that a cold
+ *  one-hit-wonder must NOT displace a higher-frequency incumbent: admission is gated
+ *  by `freq(candidate) > freq(victim)`. Admitting unconditionally evicts the probation
+ *  victim every time, so the next-eviction victim drifts from the pure-W-TinyLFU
+ *  oracle. (The three lists stay coherent, so this is a semantic divergence, not a
+ *  crash.) _peekVictim uses the SAME overridden `_admit`, so the broken policy is
+ *  self-consistent yet WRONG versus the oracle -- exactly what the gate must catch. */
+class AdmitAlwaysWTinyLfu extends WTinyLfu {
+    _admit(_candSlot, _victimSlot) { return true; } // BUG: never reject
 }
 
 const leak = [];
@@ -254,5 +267,23 @@ export function run() {
         if (r.ok) die('t9 C8: an S3-FIFO get() that graduates on touch did NOT diverge from the s3fifo oracle (no teeth)');
         check(r.why === 'victim' || r.why === 'value' || r.why === 'size',
             () => 't9 C8: divergence reason was ' + r.why + ' (unexpected)');
+    }
+
+    // --- C9: a W-TinyLFU that admits-always -> diverges from the wtinylfu oracle --
+    // The W-TinyLFU headline is frequency admission: a candidate is admitted over the
+    // probation victim ONLY when it is strictly more frequent (ties reject). A policy
+    // that always admits evicts the incumbent victim regardless of frequency, so its
+    // next-eviction victim MUST drift from the pure-W-TinyLFU oracle. Non-vacuity: the
+    // CORRECT WTinyLfu agrees (proven in t5); here the broken one must diverge.
+    {
+        const brokenPolicy = {
+            name: 'wtinylfu-admit-always',
+            real: (cap) => wrapWTinyLfu(new AdmitAlwaysWTinyLfu(cap)),
+            oracle: (cap) => makeWTinyLfuOracle(cap),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 32, ops: 20000, seed: 246810, keyspace: 80 });
+        if (r.ok) die('t9 C9: a W-TinyLFU that admits-always did NOT diverge from the wtinylfu oracle (no teeth)');
+        check(r.why === 'victim' || r.why === 'value' || r.why === 'size',
+            () => 't9 C9: divergence reason was ' + r.why + ' (unexpected)');
     }
 }

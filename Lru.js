@@ -47,14 +47,15 @@
  *     throws; a non-integer key in int mode throws; null is not zero.
  *   - ASCII-only source. Single file. Zero runtime deps.
  *
- * This file also ships `Sieve` (decisions/0012) and `S3Fifo` (decisions/0013) as
- * further named exports: modern eviction-policy family members over the SAME
- * substrate. They are NOT separate files -- single main file + sideEffects:false
- * + named exports already tree-shake away whichever member a caller does not import.
+ * This file also ships `Sieve` (decisions/0012), `S3Fifo` (decisions/0013) and
+ * `WTinyLfu` (decisions/0014) as further named exports: modern eviction-policy
+ * family members over the SAME substrate. They are NOT separate files -- single main
+ * file + sideEffects:false + named exports already tree-shake away whichever member a
+ * caller does not import.
  *
  * Design decisions live in decisions/ (D1..D10 in 0001; the onEvict reentrancy
  * contract in 0002; the substrate D11 in 0011; Sieve/D12 in 0012; S3-FIFO/D13 in
- * 0013) and are summarized in ROADMAP.md.
+ * 0013; W-TinyLFU/D14 in 0014) and are summarized in ROADMAP.md.
  */
 
 /** Shared no-op eviction callback, so a cache without an onEvict handler
@@ -89,12 +90,26 @@ const INT_MAX = 2147483647;
 const Q_SMALL = 0;
 const Q_MAIN = 1;
 
+/** W-TinyLFU (decisions/0014) segment tags: which of the three intrusive LRU lists a
+ *  slot is in (admission WINDOW / SLRU PROBATION / SLRU PROTECTED). Stored one byte
+ *  per slot in `_seg` so `_detach` fixes the RIGHT list's head/tail without a per-slot
+ *  object. A slot is in exactly one list at a time. */
+const SEG_WINDOW = 0;
+const SEG_PROBATION = 1;
+const SEG_PROTECTED = 2;
+
+/** W-TinyLFU count-min sketch shape (decisions/0014, D14.2): 4 rows of 4-bit
+ *  saturating counters packed 8-per-Uint32. One per-row seed spreads a key across the
+ *  rows; `Math.imul` keeps each mix an EXACT 32-bit multiply (zero-alloc). Built once. */
+const SK_ROWS = 4;
+const SK_SEEDS = [0x9e3779b1, 0x85ebca77, 0xc2b2ae3d, 0x27d4eb2f];
+
 /** SameValueZero key comparison (mirrors JS Map/Set): `===` plus NaN matches NaN,
  *  and -0 matches +0. Used only on the COLD S3-FIFO ghost-consume scan for the
  *  default (arbitrary-key) backing, never on a hot path. */
 function sameKey(a, b) { return a === b || (a !== a && b !== b); }
 
-export const VERSION = "1.1.0";
+export const VERSION = "1.2.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -1247,6 +1262,395 @@ export class S3Fifo {
                 return keys[t];
             }
         }
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * WTinyLfu -- the W-TinyLFU admission policy (the Caffeine approach: Einziger et
+ * al., "TinyLFU: A Highly Efficient Cache Admission Policy"), over the SAME
+ * SlotStore substrate (decisions/0014, D14). The fourth named export in this file
+ * (same file-shape ruling as Sieve/S3Fifo: single main file + sideEffects:false +
+ * named exports = the tree-shake moat).
+ *
+ * W-TinyLFU is a small admission WINDOW (an LRU) in front of a segmented main cache
+ * (SLRU: a PROBATION segment + a PROTECTED segment), gated by a frequency sketch:
+ *   - THREE LRU lists threaded intrusively through the shared `_next`/`_prev` columns
+ *     (window / probation / protected), each with its own head=MRU / tail=LRU
+ *     endpoints. `_next` toward the tail (LRU), `_prev` toward the head (MRU). A slot
+ *     is in exactly ONE list; `_seg[slot]` tags which (D14).
+ *   - a fixed count-min sketch `_sk` (D14.2): 4 rows of 4-bit SATURATING counters,
+ *     width = pow2 >= capacity, packed 8-per-Uint32. Aged (halved in place) every
+ *     sampleSize = 10*capacity increments (D14.3). get/put bump it by one; admission
+ *     reads it. Fixed size, allocated once, NEVER grown.
+ *
+ * New keys enter the WINDOW at MRU. On a HIT: a window entry moves to window MRU; a
+ * probation entry is PROMOTED to protected (demoting protected's LRU back to probation
+ * when protected is full); a protected entry moves to protected MRU. At capacity,
+ * adding a newcomer forces the window's LRU out as the admission CANDIDATE, weighed
+ * against the probation LRU VICTIM (D14.3): the candidate is admitted (to probation)
+ * and the victim evicted iff freq(candidate) > freq(victim); ties REJECT (favor the
+ * incumbent), evicting the candidate. A one-hit-wonder never out-frequencies the
+ * proven-hot set -- scan- AND frequency-resistant.
+ *
+ * Sizing (D14.4, frozen in the constructor):
+ *   window    = Math.max(1, Math.round(capacity / 100));
+ *   main      = capacity - window;
+ *   protected = Math.round(main * 0.8);   (probation is the remainder of main)
+ * Degenerate small caps (main == 0, e.g. capacity 1) skip admission entirely and
+ * degenerate to a window-only LRU -- impl and oracle agree on the edge.
+ *
+ * SKETCH HASHING (D14.1): the sketch is indexed by a NUMERIC hash of the key. Primitive
+ * keys (number/string) hash by VALUE, so their frequency is stable across residency.
+ * Object keys have no zero-alloc stable numeric identity (a WeakMap is forbidden by the
+ * zero-GC law), so they hash by their RESIDENT SLOT index -- their frequency is tracked
+ * only WHILE resident. No per-op object or closure is ever allocated on either path.
+ *
+ * Rides the shared `newStore` factory (default Map / opt-in `keys:'int'` strict-zero
+ * backing, the `[lite-lru]` int-key door), the conservation invariant, and the onEvict
+ * fire-after + `_inOnEvict` reentrancy guard (decisions/0002). A HIT does MORE writes
+ * than Sieve/S3Fifo (a segment relink + a sketch increment) BY DESIGN -- the gate
+ * asserts zero-ALLOCATION, not minimal writes.
+ * -------------------------------------------------------------------------- */
+
+export class WTinyLfu {
+    /**
+     * @param {number} capacity  Max entries. Must be an integer >= 1.
+     * @param {{ onEvict?: (key: any, value: any) => void, keys?: 'int' }} [options]
+     */
+    constructor(capacity, options) {
+        // Fail closed (D9), identical to the rest of the family.
+        if (!Number.isInteger(capacity) || capacity < 1) {
+            throw new RangeError(
+                "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
+            );
+        }
+
+        this._capacity = capacity;
+
+        // Same shared substrate + int-key door as the rest of the family.
+        this._store = this._makeStore(capacity, options && options.keys);
+
+        // Cache the store's columns so the list relinks stay direct.
+        this._keys = this._store._keys;
+        this._vals = this._store._vals;
+        this._next = this._store._next; // toward the tail (LRU)
+        this._prev = this._store._prev; // toward the head (MRU)
+
+        // D14 -- one segment tag per slot so `_detach` fixes the correct list.
+        // Fixed size, allocated once, never grown.
+        this._seg = new Uint8Array(capacity);
+
+        // D14.4 -- the window / SLRU split, frozen here. `main == 0` (capacity 1)
+        // degenerates to a window-only LRU (admission is skipped).
+        this._windowCap = Math.max(1, Math.round(capacity / 100));
+        this._mainCap = capacity - this._windowCap;
+        this._protectedCap = Math.round(this._mainCap * 0.8);
+
+        this._wHead = NIL; this._wTail = NIL; this._wSize = 0;   // admission WINDOW (LRU)
+        this._prHead = NIL; this._prTail = NIL; this._prSize = 0; // SLRU PROBATION (LRU)
+        this._ptHead = NIL; this._ptTail = NIL; this._ptSize = 0; // SLRU PROTECTED (LRU)
+        this._size = 0;                                           // _wSize + _prSize + _ptSize
+
+        // D14.2 -- the count-min frequency sketch: 4 rows of 4-bit counters, width a
+        // power of two >= capacity, packed 8-per-Uint32. Fixed size, never grown.
+        let w = 1;
+        while (w < capacity) w <<= 1;
+        this._skWidth = w;
+        this._skMask = w - 1;
+        this._sk = new Uint32Array((SK_ROWS * w + 7) >> 3);
+        this._skSample = 10 * capacity; // D14.3 -- age (halve) after this many bumps
+        this._skSize = 0;
+
+        this._onEvict = (options && options.onEvict) || NOOP;
+        this._inOnEvict = false;
+    }
+
+    /** The store factory, delegating to the shared `newStore` (decisions/0011). */
+    _makeStore(capacity, keys) {
+        return newStore(capacity, keys);
+    }
+
+    get size() { return this._size; }
+    get capacity() { return this._capacity; }
+
+    // --- the frequency sketch (D14.1/D14.2/D14.3) -----------------------------
+
+    /** A numeric hash of the key for the sketch (D14.1). Primitive keys hash by VALUE
+     *  (stable frequency); object keys have no zero-alloc stable identity (no WeakMap),
+     *  so they hash by their RESIDENT SLOT -- bumped only while resident. Zero-alloc. */
+    _hashKey(key, slot) {
+        const t = typeof key;
+        if (t === 'number') return (key | 0) >>> 0;
+        if (t === 'string') {
+            let h = 0;
+            for (let i = 0; i < key.length; i++) h = (Math.imul(h, 31) + key.charCodeAt(i)) | 0;
+            return h >>> 0;
+        }
+        return slot >>> 0; // object/other: bump only while resident (D14.1)
+    }
+
+    /** The sketch column for row `r` of a key hash, masked to the fixed width. */
+    _skCol(h, r) {
+        let x = (h ^ SK_SEEDS[r]) >>> 0;
+        x = Math.imul(x, 0x9e3779b1) >>> 0;
+        x ^= x >>> 16;
+        return x & this._skMask;
+    }
+
+    /** Estimated frequency of a key hash: the MIN over the 4 rows (count-min). */
+    _sketchFreq(h) {
+        const sk = this._sk, width = this._skWidth;
+        let min = 15;
+        for (let r = 0; r < SK_ROWS; r++) {
+            const nib = r * width + this._skCol(h, r);
+            const v = (sk[nib >> 3] >>> ((nib & 7) << 2)) & 15;
+            if (v < min) min = v;
+        }
+        return min;
+    }
+
+    /** Bump a key hash's counters (one per row, saturating at 15) and age the whole
+     *  sketch in place once the sample budget is spent. Zero-alloc. */
+    _sketchInc(h) {
+        const sk = this._sk, width = this._skWidth;
+        for (let r = 0; r < SK_ROWS; r++) {
+            const nib = r * width + this._skCol(h, r);
+            const wi = nib >> 3;
+            const sh = (nib & 7) << 2;
+            const cur = (sk[wi] >>> sh) & 15;
+            if (cur < 15) sk[wi] = ((sk[wi] & ~(15 << sh)) | ((cur + 1) << sh)) >>> 0;
+        }
+        if (++this._skSize >= this._skSample) this._sketchAge();
+    }
+
+    /** Halve every 4-bit counter in place (D14.3). `>>> 1` shifts every nibble down;
+     *  `& 0x77777777` clears the top bit each nibble stole from its neighbour, so the
+     *  counters halve independently. Then halve the sample counter. Zero-alloc. */
+    _sketchAge() {
+        const sk = this._sk;
+        for (let i = 0; i < sk.length; i++) sk[i] = (sk[i] >>> 1) & 0x77777777;
+        this._skSize >>>= 1;
+    }
+
+    // --- intrusive LRU-list helpers (per-segment size accounting) -------------
+
+    /** Unlink slot s from WHICHEVER list it is in (per `_seg[s]`), fixing that list's
+     *  neighbours + head/tail sentinels + size. */
+    _detach(s) {
+        const p = this._prev[s], n = this._next[s], seg = this._seg[s];
+        if (seg === SEG_WINDOW) {
+            if (p !== NIL) this._next[p] = n; else this._wHead = n;
+            if (n !== NIL) this._prev[n] = p; else this._wTail = p;
+            this._wSize--;
+        } else if (seg === SEG_PROBATION) {
+            if (p !== NIL) this._next[p] = n; else this._prHead = n;
+            if (n !== NIL) this._prev[n] = p; else this._prTail = p;
+            this._prSize--;
+        } else {
+            if (p !== NIL) this._next[p] = n; else this._ptHead = n;
+            if (n !== NIL) this._prev[n] = p; else this._ptTail = p;
+            this._ptSize--;
+        }
+    }
+
+    /** Insert slot s at the head (MRU end) of the WINDOW list. */
+    _pushWindow(s) {
+        this._seg[s] = SEG_WINDOW;
+        this._prev[s] = NIL; this._next[s] = this._wHead;
+        if (this._wHead !== NIL) this._prev[this._wHead] = s;
+        this._wHead = s; if (this._wTail === NIL) this._wTail = s;
+        this._wSize++;
+    }
+
+    /** Insert slot s at the head (MRU end) of the PROBATION list. */
+    _pushProbation(s) {
+        this._seg[s] = SEG_PROBATION;
+        this._prev[s] = NIL; this._next[s] = this._prHead;
+        if (this._prHead !== NIL) this._prev[this._prHead] = s;
+        this._prHead = s; if (this._prTail === NIL) this._prTail = s;
+        this._prSize++;
+    }
+
+    /** Insert slot s at the head (MRU end) of the PROTECTED list. */
+    _pushProtected(s) {
+        this._seg[s] = SEG_PROTECTED;
+        this._prev[s] = NIL; this._next[s] = this._ptHead;
+        if (this._ptHead !== NIL) this._prev[this._ptHead] = s;
+        this._ptHead = s; if (this._ptTail === NIL) this._ptTail = s;
+        this._ptSize++;
+    }
+
+    /** On a HIT: window -> window MRU; probation -> PROMOTE to protected (demoting
+     *  protected's LRU back to probation on overflow); protected -> protected MRU. */
+    _onHit(s) {
+        const seg = this._seg[s];
+        if (seg === SEG_WINDOW) {
+            if (this._wHead !== s) { this._detach(s); this._pushWindow(s); }
+        } else if (seg === SEG_PROBATION) {
+            this._detach(s);
+            this._pushProtected(s);
+            if (this._ptSize > this._protectedCap) { // protected full -> demote its LRU
+                const d = this._ptTail;
+                this._detach(d);
+                this._pushProbation(d);
+            }
+        } else { // SEG_PROTECTED
+            if (this._ptHead !== s) { this._detach(s); this._pushProtected(s); }
+        }
+    }
+
+    /** Admission (D14.3): admit the window CANDIDATE over the probation VICTIM iff its
+     *  estimated frequency is strictly greater; ties reject (favor the incumbent). A
+     *  seam a control can override to prove the differential has teeth. */
+    _admit(candSlot, victimSlot) {
+        const fc = this._sketchFreq(this._hashKey(this._keys[candSlot], candSlot));
+        const fv = this._sketchFreq(this._hashKey(this._keys[victimSlot], victimSlot));
+        return fc > fv;
+    }
+
+    // --- public API (all zero-alloc on the hot path) --------------------------
+
+    /**
+     * Look up a key AND record a frequency bump + recency promotion. @returns the
+     * value, or undefined if absent (see D7). A HIT bumps the sketch and relinks the
+     * entry within its segment (or promotes probation -> protected).
+     */
+    get(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        this._sketchInc(this._hashKey(key, s));
+        this._onHit(s);
+        return this._vals[s];
+    }
+
+    /**
+     * Insert or update. An update rewrites the value, bumps the sketch and promotes
+     * (like a hit). A new key enters the WINDOW at MRU; below capacity the window sheds
+     * its overflow into probation, at capacity exactly one entry is evicted via the
+     * admission compare (D14.3). onEvict fires LAST (decisions/0002).
+     */
+    put(key, value) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const existing = store.get(key);
+        if (existing >= 0) {                 // update-in-place + bump + promote
+            this._vals[existing] = value;
+            this._sketchInc(this._hashKey(key, existing));
+            this._onHit(existing);
+            return;
+        }
+
+        let s, evKey, evVal, evicted = false;
+        if (this._size < this._capacity) {
+            // Below capacity: no eviction. Admit to the window, then shed any window
+            // overflow into probation (main is below its target, so nothing evicts).
+            s = store.allocSlot();
+            this._keys[s] = key; this._vals[s] = value;
+            store.set(key, s);
+            this._pushWindow(s);
+            this._size++;
+            while (this._wSize > this._windowCap) {
+                const v = this._wTail;      // window LRU
+                this._detach(v);
+                this._pushProbation(v);
+            }
+        } else {
+            // At capacity: a newcomer joins the window, forcing the window LRU out as
+            // the admission CANDIDATE. Exactly one entry is evicted (candidate or the
+            // probation victim), and its slot is reused in place for the newcomer (D6).
+            const cand = this._wTail;       // window LRU (window is non-empty at capacity)
+            this._detach(cand);             // out of the window, floating
+            const victim = this._prTail;    // probation LRU (NIL when probation is empty)
+            let loser;
+            if (victim !== NIL && this._admit(cand, victim)) {
+                this._pushProbation(cand);  // candidate admitted to probation MRU
+                loser = victim;
+                this._detach(loser);
+            } else {
+                loser = cand;               // rejected (or no victim): evict the candidate
+            }
+            evKey = this._keys[loser];
+            evVal = this._vals[loser];
+            store.delete(evKey);
+            s = loser;                      // reuse the evicted slot in place (D6)
+            this._keys[s] = key; this._vals[s] = value;
+            store.set(key, s);
+            this._pushWindow(s);
+            evicted = true;
+        }
+
+        // Record the newcomer's own access AFTER the admission decision, so the decision
+        // reads the pre-bump sketch (keeps impl and oracle in lockstep).
+        this._sketchInc(this._hashKey(key, s));
+
+        // Fire onEvict LAST, cache fully consistent (decisions/0002).
+        if (evicted) {
+            this._inOnEvict = true;
+            try { this._onEvict(evKey, evVal); }
+            finally { this._inOnEvict = false; }
+        }
+    }
+
+    /** True if key is present (RESIDENT). Frequency- and recency-NEUTRAL. */
+    has(key) { return this._store.has(key); }
+
+    /** Read a value WITHOUT bumping frequency or recency. undefined if absent (D7). */
+    peek(key) {
+        const s = this._store.get(key);
+        return s < 0 ? undefined : this._vals[s];
+    }
+
+    /**
+     * Remove a key. Returns true if it was present. Frees the slot and repairs the
+     * list it was in. The sketch is untouched (frequency history persists).
+     */
+    delete(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const s = store.get(key);
+        if (s < 0) return false;
+        this._detach(s);
+        store.delete(key);
+        store.freeSlot(s);
+        this._size--;
+        return true;
+    }
+
+    /** Empty the cache. Rebuilds the free list, empties all three lists, and zeroes
+     *  the frequency sketch. Allocates nothing. O(capacity). */
+    clear() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store.reset();
+        this._wHead = NIL; this._wTail = NIL; this._wSize = 0;
+        this._prHead = NIL; this._prTail = NIL; this._prSize = 0;
+        this._ptHead = NIL; this._ptTail = NIL; this._ptSize = 0;
+        this._size = 0;
+        this._sk.fill(0);
+        this._skSize = 0;
+    }
+
+    // --- test/debug only (never call on a hot path) ---------------------------
+
+    /** Free-stack length, delegated to the store (conservation invariant). */
+    _freeListLength() {
+        return this._store.freeListLength();
+    }
+
+    /**
+     * The key the NEXT over-capacity insert would evict, computed WITHOUT mutating any
+     * counter, link, size or the sketch. Below capacity a new key does not evict, so it
+     * returns undefined. At capacity it replays the exact admission compare (candidate
+     * = window LRU, victim = probation LRU) that `put` runs -- so it can never drift
+     * from the real eviction. TEST-ONLY (drives the torture differential).
+     */
+    _peekVictim() {
+        if (this._size < this._capacity || this._size === 0) return undefined;
+        const cand = this._wTail;
+        if (cand === NIL) return undefined; // defensive: window is non-empty at capacity
+        const victim = this._prTail;
+        if (victim === NIL) return this._keys[cand];
+        return this._admit(cand, victim) ? this._keys[victim] : this._keys[cand];
     }
 }
 

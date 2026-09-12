@@ -38,6 +38,17 @@ const NIL = -1;
  * @returns {Array<{name:string, head:number, tail:number, doubly:boolean}>}
  */
 export function activeListsOf(cache) {
+    // A W-TinyLFU member (decisions/0014) threads THREE doubly-linked LRU lists through
+    // the shared _next/_prev columns (detected by its `_wHead` WINDOW endpoint): the
+    // admission WINDOW, the SLRU PROBATION and the SLRU PROTECTED segments. The SAME
+    // checker sums over all three descriptors.
+    if (cache._wHead !== undefined) {
+        return [
+            { name: 'wtinylfu-window', head: cache._wHead, tail: cache._wTail, doubly: true },
+            { name: 'wtinylfu-probation', head: cache._prHead, tail: cache._prTail, doubly: true },
+            { name: 'wtinylfu-protected', head: cache._ptHead, tail: cache._ptTail, doubly: true },
+        ];
+    }
     // An S3-FIFO member (decisions/0013) threads TWO doubly-linked rings through the
     // shared _next/_prev columns (detected by its `_sHead` SMALL-ring endpoint):
     // SMALL (probation) and MAIN. The SAME checker sums over both descriptors.
@@ -149,6 +160,35 @@ export function validate(cache, lists) {
             throw new Error(
                 '[validate] s3fifo sSize(' + cache._sSize + ') + mSize(' + cache._mSize +
                 ') != size(' + size + ')');
+        }
+    }
+
+    // --- term 8 (W-TinyLFU members, decisions/0014): segments + sketch ----------
+    // A no-op unless the member exposes `_wHead`. For a WTinyLfu: the three segment
+    // sizes sum to size, protected never exceeds its cap, every `_seg` byte is a valid
+    // tag, and the sketch buffer is the fixed construction-time size (never grown). The
+    // three-list population is already summed by term 3/4 via activeListsOf above.
+    if (cache._wHead !== undefined) {
+        if (cache._wSize + cache._prSize + cache._ptSize !== size) {
+            throw new Error(
+                '[validate] wtinylfu wSize(' + cache._wSize + ') + prSize(' + cache._prSize +
+                ') + ptSize(' + cache._ptSize + ') != size(' + size + ')');
+        }
+        if (cache._ptSize > cache._protectedCap) {
+            throw new Error(
+                '[validate] wtinylfu protectedSize(' + cache._ptSize + ') > protectedCap(' +
+                cache._protectedCap + ')');
+        }
+        for (let i = 0; i < cap; i++) {
+            if (cache._seg[i] > 2) {
+                throw new Error('[validate] wtinylfu _seg[' + i + '] = ' + cache._seg[i] + ' > 2');
+            }
+        }
+        const expectSkBytes = (((4 * cache._skWidth + 7) >> 3)) * 4;
+        if (cache._sk.buffer.byteLength !== expectSkBytes) {
+            throw new Error(
+                '[validate] wtinylfu sketch buffer(' + cache._sk.buffer.byteLength +
+                ') != fixed size(' + expectSkBytes + ')');
         }
     }
 

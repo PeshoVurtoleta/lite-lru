@@ -31,12 +31,13 @@
  * rejects the window; T9 exercises the same alloc lane in-process.
  */
 
-import { LiteLru, Sieve, S3Fifo } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, BREAK, check, die,
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
     CountedSieve, SIEVE_WRITES_HIT_LINKS, SIEVE_WRITES_HIT_VIS,
     CountedS3Fifo, S3FIFO_WRITES_HIT_LINKS, S3FIFO_WRITES_HIT_VIS,
+    CountedWTinyLfu, WTINYLFU_WRITES_WINDOW_MRU_REHIT,
 } from './harness.mjs';
 
 const CAP = 4096;      // power of 2 so the hot body masks its key with & MASK
@@ -314,4 +315,103 @@ export async function run() {
     }
     check(S3FIFO_WRITES_HIT_LINKS < LRU_WRITES_INTERIOR_REHIT && S3FIFO_WRITES_HIT_LINKS < LRU_WRITES_TAIL_REHIT,
         () => 't6 Gate S3FIFO: the S3-FIFO hit (' + S3FIFO_WRITES_HIT_LINKS + ' links) is not cheaper than the LRU relink');
+
+    // --- Gate WTINYLFU: the W-TinyLFU member -- STRICT zero-alloc incl. the sketch --
+    // (decisions/0014) The int-backed WTinyLfu churns NEW, strictly-increasing integer
+    // keys from an EMPTY cache. Every op after warm-up admits a fresh key to the window
+    // and evicts one entry via the admission compare, AND bumps the count-min sketch
+    // (aging every 10*cap = 40960 bumps -> multiple aging passes across the window),
+    // exercising the open-addressed store index idxSet/backshift AND the packed sketch
+    // every iteration. NO pre-fill caveat: strict zero-alloc, and _seg / _sk / _next /
+    // _prev / _ixSlot / _ixKey never grow.
+    const wcache = new WTinyLfu(CAP, { keys: 'int' });
+    const wNextBytes = wcache._next.buffer.byteLength;
+    const wPrevBytes = wcache._prev.buffer.byteLength;
+    const wSegBytes = wcache._seg.buffer.byteLength;
+    const wSkBytes = wcache._sk.buffer.byteLength;
+    const wIxSlotBytes = wcache._store._ixSlot.buffer.byteLength;
+    const wIxKeyBytes = wcache._store._ixKey.buffer.byteLength;
+    // The fixed sketch size is load-bearing (D14.2): 4 rows of 4-bit counters,
+    // width = pow2 >= cap, packed 8-per-Uint32 -> ((4*width + 7) >> 3) * 4 bytes.
+    const wSkExpect = (((4 * wcache._skWidth + 7) >> 3)) * 4;
+    check(wSkBytes === wSkExpect,
+        () => 't6 Gate WTINYLFU: sketch buffer ' + wSkBytes + ' != fixed size ' + wSkExpect);
+    let wk = 0;
+    const wHot = () => {
+        wcache.put(wk, wk & 0xffff); // fresh, strictly-increasing int key; SMI value
+        wk++;
+    };
+    const gw = runOpsGate(wHot, { ops: OPS, warmup: WARMUP });
+    check(wcache._next.buffer.byteLength === wNextBytes,
+        () => 't6 Gate WTINYLFU: _next.buffer grew ' + wNextBytes + ' -> ' + wcache._next.buffer.byteLength);
+    check(wcache._prev.buffer.byteLength === wPrevBytes,
+        () => 't6 Gate WTINYLFU: _prev.buffer grew ' + wPrevBytes + ' -> ' + wcache._prev.buffer.byteLength);
+    check(wcache._seg.buffer.byteLength === wSegBytes,
+        () => 't6 Gate WTINYLFU: _seg.buffer grew ' + wSegBytes + ' -> ' + wcache._seg.buffer.byteLength);
+    check(wcache._sk.buffer.byteLength === wSkBytes,
+        () => 't6 Gate WTINYLFU: _sk.buffer grew ' + wSkBytes + ' -> ' + wcache._sk.buffer.byteLength);
+    check(wcache._store._ixSlot.buffer.byteLength === wIxSlotBytes,
+        () => 't6 Gate WTINYLFU: _ixSlot.buffer grew ' + wIxSlotBytes + ' -> ' + wcache._store._ixSlot.buffer.byteLength);
+    check(wcache._store._ixKey.buffer.byteLength === wIxKeyBytes,
+        () => 't6 Gate WTINYLFU: _ixKey.buffer grew ' + wIxKeyBytes + ' -> ' + wcache._store._ixKey.buffer.byteLength);
+    check(wcache.size === CAP, () => 't6 Gate WTINYLFU: churn did not stay at capacity (size ' + wcache.size + ')');
+    if (!gw.report.ok) {
+        const g = gw.summary.gc;
+        die('t6 Gate WTINYLFU (int churn) ops gate rejected -- verdict=' + gw.report.verdict +
+            ' source=' + gw.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gwa = runAllocsGate(wHot, { iterations: 50000, batches: 8 });
+    if (!gwa.ok) {
+        die('t6 Gate WTINYLFU (int churn) retained-alloc gate rejected -- verdict=' + gwa.report.verdict +
+            ' settled=' + gwa.result.settled + ' bytesPerCall=' + gwa.bytesPerCall);
+    }
+
+    // OBJECT-KEY path (D14.1): a large mixed get/put run over a FIXED set of OBJECT
+    // keys on a PRE-FILLED at-capacity cache. Object keys hash by their RESIDENT SLOT
+    // (no WeakMap), so the sketch bump + segment relinks stay strictly zero-alloc, and
+    // the run crosses the aging threshold many times. No key is added/removed, so the
+    // Map backing never resizes (the same isolation the get/put gates above use).
+    const ocache = new WTinyLfu(CAP);
+    const objKeys = new Array(CAP);
+    for (let i = 0; i < CAP; i++) { objKeys[i] = { id: i }; ocache.put(objKeys[i], i * 3 + 1); }
+    check(ocache.size === CAP, () => 't6 Gate WTINYLFU: object pre-fill did not reach capacity');
+    const oSkBytes = ocache._sk.buffer.byteLength;
+    const oNextBytes = ocache._next.buffer.byteLength;
+    const osink = new Int32Array(1);
+    // 1e6 mixed ops incl. sketch increments + many aging passes (sample = 10*CAP), all
+    // on object keys -- the assertion 1 shape (maxMajor 0, maxPauseMs 4, no buffer growth).
+    const objHot = (i) => {
+        const k = objKeys[i & MASK];
+        if ((i & 1) === 0) ocache.put(k, i); else osink[0] += ocache.get(k) | 0;
+    };
+    const go = runOpsGate(objHot, { ops: 1000000, warmup: WARMUP });
+    check(ocache._sk.buffer.byteLength === oSkBytes,
+        () => 't6 Gate WTINYLFU: object-key _sk.buffer grew ' + oSkBytes + ' -> ' + ocache._sk.buffer.byteLength);
+    check(ocache._next.buffer.byteLength === oNextBytes,
+        () => 't6 Gate WTINYLFU: object-key _next.buffer grew ' + oNextBytes + ' -> ' + ocache._next.buffer.byteLength);
+    check(ocache.size === CAP, () => 't6 Gate WTINYLFU: object-key run drifted from capacity (' + ocache.size + ')');
+    if (!go.report.ok) {
+        const g = go.summary.gc;
+        die('t6 Gate WTINYLFU (object-key mixed) ops gate rejected -- verdict=' + go.report.verdict +
+            ' source=' + go.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const goa = runAllocsGate(objHot, { iterations: 50000, batches: 8 });
+    if (!goa.ok) {
+        die('t6 Gate WTINYLFU (object-key mixed) retained-alloc gate rejected -- verdict=' + goa.report.verdict +
+            ' settled=' + goa.result.settled + ' bytesPerCall=' + goa.bytesPerCall);
+    }
+
+    // The ONE genuine fast path, MEASURED: a re-hit of the WINDOW MRU relinks NOTHING
+    // (early return in `_onHit`). Unlike SIEVE/S3-FIFO a W-TinyLFU hit generally DOES
+    // relink (recency/promotion) and bump the sketch -- that is fine; the gate asserts
+    // zero-ALLOCATION, not minimal writes (decisions/0014).
+    {
+        const cw = new CountedWTinyLfu(8);
+        for (let i = 0; i < 8; i++) cw.put(i, i); // key 7 is the window MRU
+        cw.resetWrites();
+        cw.get(cw._keys[cw._wHead]); // re-hit the window MRU
+        check(cw.writes() === WTINYLFU_WRITES_WINDOW_MRU_REHIT,
+            () => 't6 Gate WTINYLFU: window-MRU re-hit relinked ' + cw.writes() +
+                ' cells, expected ' + WTINYLFU_WRITES_WINDOW_MRU_REHIT);
+    }
 }

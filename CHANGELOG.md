@@ -7,6 +7,79 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.2.0] - 2026-09-13
+
+### Added
+
+- **`WTinyLfu`** -- the frequency-admission member (W-TinyLFU, Einziger et al.; the
+  Caffeine approach) on the same substrate: a small admission WINDOW (an LRU,
+  `window = max(1, round(capacity/100))`) in front of a segmented main cache (SLRU:
+  a probation segment + a protected segment `= round(mainCap * 0.8)`), gated by a
+  fixed 4-row 4-bit saturating Count-Min frequency sketch. A hit bumps the sketch
+  and relinks within its segment (a probation hit is promoted to protected,
+  demoting protected's LRU tail on overflow). At capacity the window's LRU tail is
+  the candidate and the probation LRU tail is the victim; the candidate is admitted
+  to main (evicting the victim) iff its estimated frequency is strictly greater,
+  ties reject (favor the incumbent). The sketch is aged (every counter halved in
+  place) every `10 * capacity` bumps. Same `LiteCache<K,V>` surface, `onEvict`
+  fire-after + reentrancy guard, and `keys: 'int'` strict-zero backing as the other
+  members. Completes the headline trio (SIEVE / S3-FIFO / W-TinyLFU).
+- **`decisions/0014-wtinylfu.md`** -- records D14: the key-to-sketch hashing
+  (numeric hash by value for primitives, by resident slot index for object keys --
+  no `WeakMap`, frequency tracked only while resident); the counter width and fixed
+  dimensions (4 rows of 4-bit counters packed 8-per-`Uint32`, width a power of two
+  `>= capacity`, sized once and never grown); the aging budget; the window/main and
+  protected/probation splits and the degenerate small-capacity edges
+  (`capacity == 1` -> `mainCap == 0`, admission skipped); and the deferred
+  doorkeeper.
+- **`test/torture/oracles/wtinylfu.mjs`** -- an independent brute-force reference
+  (window + SLRU + sketch + aging + admission; shares no code with `Lru.js`),
+  driving the differential.
+- **Torture coverage for `WTinyLfu`** -- `wtinylfuPolicy` + `wtinylfuIntPolicy`
+  registered across tiers `t0`/`t2`/`t5`/`t6`/`t7`, plus a `t9` admit-always
+  control proven to diverge. `validate()` extended to sum the window + probation +
+  protected segments (reciprocity each) and hold the fixed sketch `byteLength`.
+- **`test/WTinyLfu.test.js`** -- the `node:test` boundary suite for the member
+  (admission accept/reject + ties, window->probation->protected promotion and
+  protected-overflow demotion, scan/one-hit-wonder resistance, `has`/`peek`
+  neutrality, delete + segment repair, the small/degenerate capacities, fail-closed
+  capacity, the unknown-`keys` and `keys: 'int'` doors, `onEvict` fire-after +
+  reentrancy, D7).
+
+### Changed
+
+- Test suite grows to **312** `node:test` cases (from 228). `README.md`, `llms.txt`,
+  and `Lru.d.ts` (the `WTinyLfu<K,V>` declaration + dts-drift coverage) updated for
+  the fourth member.
+- **`benchmark/Bench.mjs` now rosters all four members** (`LiteLru`, `Sieve`,
+  `S3Fifo`, `WTinyLfu`). The `Bench.test.js` member-count/name contract moved from
+  2 to 4.
+
+### Fixed
+
+- **Shipped bench omitted members.** `benchmark/Bench.mjs` measured only `LiteLru`
+  and `Sieve` -- `S3Fifo` (shipped in 1.1.0) and `WTinyLfu` were absent from the
+  "measure your policy" tool. Both added so the shipped bench measures the whole
+  family.
+
+### Gated numbers
+
+- Writes per hit (`WTinyLfu`, via `CountedWTinyLfu`): window-MRU rehit 0 link
+  writes; a probation->protected promoting hit 9 (interior) / 8 (probation tail)
+  link writes, plus a 4-counter sketch bump. Higher than `Sieve`/`S3Fifo` by design
+  (a segment relink + the sketch bump per hit) -- still zero allocation.
+- Zero-GC (int backing, including the sketch increment and one bulk aging pass):
+  `maxMajor` 0, `maxPauseMs` 4, retained `maxBytesPerCall` 1, `arrayBuffers` growth
+  0; the `_sk` / `_seg` buffer `byteLength` is invariant under 1e6 ops (int and
+  object-key backings).
+- Differential: 100000 ops per config across capacities 1..9 (including the
+  `mainCap == 0` degenerate edge) and 64, on both backings, with zero divergence in
+  value / size / eviction victim / admission decision against the brute oracle.
+- Bench (`capacity 256`, `ops 200000`, `seed 0x9e3779b9`): zipf hit ratio
+  `WTinyLfu` 65.7% (88.3% of Belady OPT) vs `LiteLru` 57.4% (77.2%); loop
+  `WTinyLfu` 23.5% (94.4% of OPT) where `LiteLru` / `Sieve` / `S3Fifo` are 0.0%;
+  scan `WTinyLfu` 49.9% (99.9% of OPT). ns/op is machine-local and not a claim.
+
 ## [1.1.0] - 2026-09-12
 
 ### Added

@@ -11,7 +11,7 @@
  * the payload refs). The census is the teeth for that.
  */
 
-import { LiteLru, S3Fifo } from '../../Lru.js';
+import { LiteLru, S3Fifo, WTinyLfu } from '../../Lru.js';
 import { createLeakTracker } from '@zakkster/lite-leak';
 import { check, validate, censusOk, settleGc } from './harness.mjs';
 
@@ -101,5 +101,38 @@ export async function run() {
         check(s3refs.length > 0, () => 't7 s3fifo: census sample was empty (nothing to prove)');
         check(censusOk(s3refs),
             () => 't7 s3fifo: an evicted value is still live -- the ghost is retaining values (leak)');
+    }
+
+    // --- W-TinyLFU soak: fill + clear cycles, conservation + value-retention census
+    // (decisions/0014) Build each cycle PAST capacity (eviction + slot reuse across all
+    // three segments + the sketch bumping/aging), assert conservation mid-life, clear,
+    // assert conservation + size 0 + the tracker released, and prove the evicted/cleared
+    // VALUE objects are collectible. The sketch retains only PRIMITIVE counts, never a
+    // key or value ref -- a WeakMap-free design (D14.1), so nothing pins a value here.
+    {
+        const wrefs = [];
+        const wtracker = createLeakTracker({ name: 'wtinylfu-soak' });
+        for (let cyc = 0; cyc < 1024; cyc++) {
+            const cache = new WTinyLfu(CAP);
+            const h = wtracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
+            for (let i = 0; i < CAP * 3; i++) {
+                const val = { c: cyc, i }; // fresh object; most get evicted
+                cache.put(i, val);
+                if ((i & 3) === 0) cache.get(i); // exercise promotion + sketch bumps
+                if ((cyc & 63) === 0 && (i & 7) === 0) wrefs.push(new WeakRef(val));
+            }
+            check(cache.size === CAP, () => 't7 wtinylfu: not full mid-life (size ' + cache.size + ')');
+            validate(cache); // conservation mid-life (all three segments + sketch)
+            cache.clear();
+            check(cache.size === 0, () => 't7 wtinylfu: size != 0 after clear (cycle ' + cyc + ')');
+            check(cache._skSize === 0, () => 't7 wtinylfu: sketch not reset after clear (cycle ' + cyc + ')');
+            validate(cache);
+            wtracker.untrack(h);
+        }
+        check(wtracker.size() === 0, () => 't7 wtinylfu: leak tracker size ' + wtracker.size() + ' != 0');
+        await settleGc(6);
+        check(wrefs.length > 0, () => 't7 wtinylfu: census sample was empty (nothing to prove)');
+        check(censusOk(wrefs),
+            () => 't7 wtinylfu: an evicted/cleared value is still live -- a retention leak');
     }
 }

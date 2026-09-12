@@ -9,7 +9,7 @@
  * stops happening (tsc flags an unused directive). Test-only; not in files[].
  * ASCII-only.
  */
-import LiteLru, { VERSION, Sieve, S3Fifo } from "../../Lru.js";
+import LiteLru, { VERSION, Sieve, S3Fifo, WTinyLfu } from "../../Lru.js";
 import type { LiteCache, LiteCacheOptions } from "../../Lru.js";
 
 // A type-equality check with teeth (identity holds only for exact-equal types).
@@ -149,3 +149,41 @@ new S3Fifo<number, number>(10, { keys: "fifo" });
 
 // @ts-expect-error -- size is readonly on S3Fifo.
 s3.size = 5;
+
+// ---- WTinyLfu: the fourth family member SATISFIES the SAME LiteCache surface --
+// (decisions/0014) The one-line policy swap: `new WTinyLfu(n)` type-checks into the
+// SAME `LiteCache` binding as `new LiteLru(n)` / `new Sieve(n)` / `new S3Fifo(n)`.
+const wt = new WTinyLfu<string, number>(10);
+const wtGot = wt.get("a");
+expectTrue<Equal<typeof wtGot, number | undefined>>();
+expectTrue<Equal<ReturnType<typeof wt.has>, boolean>>();
+expectTrue<Equal<ReturnType<typeof wt.delete>, boolean>>();
+expectTrue<Equal<typeof wt.size, number>>();
+expectTrue<Equal<typeof wt.capacity, number>>();
+
+const wtIface: LiteCache<string, number> = new WTinyLfu<string, number>(10);
+wtIface.put("k", 1);
+const wtIfaceGot = wtIface.get("k");
+expectTrue<Equal<typeof wtIfaceGot, number | undefined>>();
+
+// keys:'int' opt-in backing applies identically to WTinyLfu.
+new WTinyLfu<number, number>(10, { keys: "int" });
+
+// onEvict params are typed from <K, V> on WTinyLfu too.
+new WTinyLfu<string, number>(10, {
+  onEvict: (k, v) => {
+    const _k: string = k;
+    const _v: number = v;
+    void _k;
+    void _v;
+  },
+});
+
+// @ts-expect-error -- V is number; a string value is rejected on WTinyLfu too.
+wt.put("a", "not-a-number");
+
+// @ts-expect-error -- 'lfu' is not a valid keys backing (only 'int').
+new WTinyLfu<number, number>(10, { keys: "lfu" });
+
+// @ts-expect-error -- size is readonly on WTinyLfu.
+wt.size = 5;

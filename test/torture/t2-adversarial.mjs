@@ -9,8 +9,8 @@
  *   E single-capacity cache: every put evicts; head===tail always.
  */
 
-import { LiteLru, Sieve, S3Fifo } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu } from './harness.mjs';
 
 export function run() {
     // --- A: re-hit the MRU N times (the head-re-hit fast path) -------------------
@@ -181,5 +181,49 @@ export function run() {
         let survivors = 0;
         for (let i = 0; i < 8000; i++) if (c.has('scan' + i)) survivors++;
         check(survivors < N, () => 't2 H: too many scan keys survived (' + survivors + ') -- eviction not exercised');
+    }
+
+    // --- I: W-TinyLFU degenerate caps + proven-hot-set survival ------------------
+    // (decisions/0014) Two adversarial angles. First the degenerate small caps where
+    // main==0 (cap 1) or probation==0 (cap 2/3): every put churns, head/tail stay
+    // coherent, conservation holds. Then a proven-hot SET survives a distinct one-hit
+    // flood -- frequency admission keeps the whole hot set resident (stronger than one
+    // key), with a non-vacuity check that the cold keys really are evicted.
+    {
+        for (const cap of [1, 2, 3]) {
+            const c = new WTinyLfu(cap);
+            for (let i = 0; i < 500; i++) {
+                c.put(i, i);
+                check(c.size === Math.min(cap, i + 1), () => 't2 I: cap-' + cap + ' size drift at ' + i);
+                check(c.get(i) === i, () => 't2 I: cap-' + cap + ' just-inserted key missing');
+                validate(c);
+            }
+            c.clear();
+            check(c.size === 0, () => 't2 I: cap-' + cap + ' not empty after clear');
+            validate(c);
+        }
+
+        const N = 64;   // window 1, protected 50, probation 13
+        const HOT = 8;  // a hot working set of 8 keys
+        const c = new WTinyLfu(N);
+        for (let h = 0; h < HOT; h++) { c.put('hot' + h, h); for (let r = 0; r < 40; r++) c.get('hot' + h); }
+        for (let i = 0; i < N - HOT; i++) c.put('cold' + i, i); // fill to capacity
+        check(c.size === N, () => 't2 I: wtinylfu not full before the scan');
+        for (let i = 0; i < 8000; i++) {
+            for (let h = 0; h < HOT; h++) {
+                check(c.get('hot' + h) === h, () => 't2 I: hot key ' + h + ' lost mid-scan at ' + i);
+            }
+            c.put('scan' + i, i); // a unique one-hit-wonder each op -> forces eviction
+            check(c.size === N, () => 't2 I: wtinylfu drifted from capacity during the scan');
+            if ((i & 511) === 0) validate(c);
+        }
+        for (let h = 0; h < HOT; h++) {
+            check(c.has('hot' + h), () => 't2 I: hot key ' + h + ' was evicted by the scan (no frequency resistance)');
+        }
+        validate(c);
+        let survivors = 0;
+        for (let i = 0; i < 8000; i++) if (c.has('scan' + i)) survivors++;
+        check(survivors < N, () => 't2 I: too many scan keys survived (' + survivors + ') -- eviction not exercised');
+        void wrapWTinyLfu(c);
     }
 }

@@ -106,6 +106,11 @@ function s3fifoImplementsLiteCache(dtsText) {
   return /class S3Fifo<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
 }
 
+/** True if the d.ts declares `class WTinyLfu<...> implements LiteCache<...>`. */
+function wtinylfuImplementsLiteCache(dtsText) {
+  return /class WTinyLfu<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
+}
+
 /** True if BOTH sources declare a `Sieve` class (the second named export). */
 function jsDeclaresSieve(jsText) {
   return /export class Sieve\b/.test(jsText);
@@ -120,6 +125,14 @@ function jsDeclaresS3Fifo(jsText) {
 }
 function dtsDeclaresS3Fifo(dtsText) {
   return /export class S3Fifo\b/.test(dtsText);
+}
+
+/** True if BOTH sources declare a `WTinyLfu` class (the fourth named export). */
+function jsDeclaresWTinyLfu(jsText) {
+  return /export class WTinyLfu\b/.test(jsText);
+}
+function dtsDeclaresWTinyLfu(dtsText) {
+  return /export class WTinyLfu\b/.test(dtsText);
 }
 
 /** Symmetric-difference report between two sets: [] when equal. */
@@ -192,6 +205,23 @@ test('(e) S3Fifo surface: S3Fifo is a named export in BOTH sources, members agre
   assert.ok(s3fifoImplementsLiteCache(DTS), 'class S3Fifo must `implements LiteCache<...>`');
 });
 
+test('(f) WTinyLfu surface: WTinyLfu is a named export in BOTH sources, members agree, implements LiteCache', () => {
+  assert.ok(jsDeclaresWTinyLfu(JS), 'Lru.js must `export class WTinyLfu` (the fourth named export)');
+  assert.ok(dtsDeclaresWTinyLfu(DTS), 'Lru.d.ts must `export class WTinyLfu`');
+  const js = classMembers(JS, 'WTinyLfu');
+  const dts = classMembers(DTS, 'WTinyLfu');
+  const diffs = setDiff(js, dts, 'Lru.js', 'Lru.d.ts');
+  assert.deepEqual(diffs, [], diffs.join('; '));
+  // The full public surface -- identical inventory to LiteLru/Sieve/S3Fifo (moat-pillar 1).
+  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'size', 'capacity']) {
+    assert.ok(js.has(nm), 'Lru.js class WTinyLfu is missing public member ' + nm);
+    assert.ok(dts.has(nm), 'Lru.d.ts class WTinyLfu is missing member ' + nm);
+  }
+  assert.equal(js.size, 8, 'expected exactly 8 public members in WTinyLfu (Lru.js), saw ' + js.size);
+  assert.equal(dts.size, 8, 'expected exactly 8 members in WTinyLfu (Lru.d.ts), saw ' + dts.size);
+  assert.ok(wtinylfuImplementsLiteCache(DTS), 'class WTinyLfu must `implements LiteCache<...>`');
+});
+
 // --- teeth: each check must reject a mutated COPY (non-vacuity) --------------
 
 test('control: unmutated text reports zero diffs / all-present (vacuity)', () => {
@@ -200,10 +230,12 @@ test('control: unmutated text reports zero diffs / all-present (vacuity)', () =>
   assert.deepEqual(setDiff(classMembers(JS, 'LiteLru'), classMembers(DTS, 'LiteLru'), 'a', 'b'), []);
   assert.deepEqual(setDiff(classMembers(JS, 'Sieve'), classMembers(DTS, 'Sieve'), 'a', 'b'), []);
   assert.deepEqual(setDiff(classMembers(JS, 'S3Fifo'), classMembers(DTS, 'S3Fifo'), 'a', 'b'), []);
+  assert.deepEqual(setDiff(classMembers(JS, 'WTinyLfu'), classMembers(DTS, 'WTinyLfu'), 'a', 'b'), []);
   assert.ok(hasLiteCacheInterface(DTS));
   assert.ok(liteLruImplementsLiteCache(DTS));
   assert.ok(sieveImplementsLiteCache(DTS));
   assert.ok(s3fifoImplementsLiteCache(DTS));
+  assert.ok(wtinylfuImplementsLiteCache(DTS));
 });
 
 test('control: desyncing the package.json version makes version parity fail', () => {

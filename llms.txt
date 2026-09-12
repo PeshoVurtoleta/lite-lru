@@ -2,14 +2,15 @@
 
 Zero-dependency, zero-GC cache FAMILY for JavaScript under one uniform
 LiteCache<K,V> surface. A classic LRU reference member (LiteLru), the modern SIEVE
-headline (Sieve), and the admission-controlled S3-FIFO member (S3Fifo) expose the
+headline (Sieve), the admission-controlled S3-FIFO member (S3Fifo), and the
+frequency-admission W-TinyLFU member (WTinyLfu) expose the
 SAME get/put/has/peek/delete/clear API, so the eviction policy is a one-line
 constructor swap. Single-file ESM, zero runtime
 dependencies, node:test only. Ships a runnable + importable benchmark tool
 (Bench.mjs) with Belady OPT so a caller measures which policy fits their trace
 instead of guessing.
 
-## Status: 1.1.0 - S3-FIFO joins the family: LiteLru + Sieve + S3Fifo under one interface, on the shared substrate, with the shipped bench + Belady OPT tool
+## Status: 1.2.0 - W-TinyLFU completes the headline trio: LiteLru + Sieve + S3Fifo + WTinyLfu under one interface, on the shared substrate, with the shipped bench + Belady OPT tool
 
 The family is the identity from v1.0.0: classic LRU is the reference member +
 differential oracle + honest floor, SIEVE is the headline, and the shipped
@@ -26,11 +27,11 @@ that substrate (decisions/0012). S9 (this session) adds the docs, the shipped
 bench + Belady OPT tool, and the OPT torture gate -- with ZERO change to Lru.js /
 Lru.d.ts (the three version sites move together, only at /release).
 
-## Members (decisions/0001, 0012, 0013)
+## Members (decisions/0001, 0012, 0013, 0014)
 
 All classes implement LiteCache<K,V>; the recency/lazy-promotion/admission
-difference is INTERNAL, so new LiteLru(n) swaps for new Sieve(n) or new S3Fifo(n)
-and stays type-checked.
+difference is INTERNAL, so new LiteLru(n) swaps for new Sieve(n), new S3Fifo(n) or
+new WTinyLfu(n) and stays type-checked.
 
 - LiteLru: classic Least-Recently-Used. get/put promote to most-recently-used;
   at capacity a new key evicts the LRU tail and reuses its slot in place. A hit
@@ -52,13 +53,32 @@ and stays type-checked.
   is evicted and its key remembered in ghost; otherwise the MAIN oldest gets one
   second chance or is evicted (MAIN evictions are NOT ghosted). has/peek are
   visited-neutral; the ghost holds KEYS only, never values. Strongly scan-resistant.
+- WTinyLfu: W-TinyLFU (Einziger et al., "TinyLFU"; the Caffeine approach). A small
+  admission WINDOW (an LRU, ~1% of capacity) in front of a segmented main cache
+  (SLRU: a PROBATION segment + a PROTECTED segment), all three lists threaded
+  through the shared _next/_prev columns (tagged per slot by _seg), gated by a
+  fixed Count-Min sketch (4 rows of 4-bit saturating counters packed 8-per-Uint32,
+  width pow2 >= capacity, aged by halving every counter in place every 10*capacity
+  bumps). get/put bump the sketch and promote within the segment (a probation hit
+  is PROMOTED to protected). At capacity the window's LRU is the admission
+  CANDIDATE, weighed against the probation LRU VICTIM: admit the candidate (evict
+  the victim) iff freq(cand) > freq(victim); ties reject (favor the incumbent). A
+  hit does MORE work than SIEVE/S3-FIFO (a segment relink + a 4-counter bump) BY
+  DESIGN -- still zero allocation. Scan- AND frequency-resistant; the best fit for
+  skewed (Zipf) traffic, often closest to Belady OPT. Sizing: window =
+  max(1,round(cap/100)); main = cap-window; protected = round(main*0.8); the
+  degenerate main==0 edge (capacity 1) is a window-only LRU. Sketch hashing: number/
+  string keys hash by VALUE; object keys hash by RESIDENT SLOT (no WeakMap, bumped
+  only while resident -- decisions/0014). has/peek are frequency- and recency-neutral.
 
 ## Uniform surface (LiteCache<K,V>)
 
-- new LiteLru(capacity, options?) / new Sieve(capacity, options?)
+- new LiteLru(capacity, options?) / new Sieve(capacity, options?) /
+  new S3Fifo(capacity, options?) / new WTinyLfu(capacity, options?)
   - capacity: integer >= 1, else a [lite-lru]-tagged RangeError at the door.
 - get(key) -> V | undefined. Applies the member's hit policy (LiteLru promotes to
-  MRU; Sieve and S3Fifo set the visited bit).
+  MRU; Sieve and S3Fifo set the visited bit; WTinyLfu bumps the frequency sketch
+  and promotes within its segment).
 - put(key, value) -> void. Insert or update; at capacity evicts the member's
   victim first (firing onEvict). Amortized O(1) default / O(1) with keys:'int'.
 - has(key) -> boolean. Presence test; NEVER changes recency / visited state.
@@ -122,14 +142,15 @@ drops LiteLru's body from the bundle (and vice versa). The shared substrate is
 INTERNAL, not an export; there is NO subpath-per-policy. Bench.mjs is a separate
 runnable tool, not a second implementation.
 
-## API (1.1.0)
+## API (1.2.0)
 
 Named exports from @zakkster/lite-lru:
 
 - LiteLru: the classic LRU member (also the default export).
 - Sieve: the SIEVE member.
 - S3Fifo: the S3-FIFO member.
-- VERSION: '1.1.0'
+- WTinyLfu: the W-TinyLFU member.
+- VERSION: '1.2.0'
 
 Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
@@ -138,8 +159,8 @@ Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
 ## Testing
 
-- npm test        -- 228 node:test cases (all three members, recency/SIEVE/S3-FIFO
-  laws, degenerate keys/values, dts drift, family surface).
+- npm test        -- 312 node:test cases (all four members, recency/SIEVE/S3-FIFO/
+  W-TinyLFU laws, degenerate keys/values, dts drift, family surface).
 - npm run test:types -- tsc: the LiteCache<K,V> surface + the one-line-swap check.
 - npm run torture -- @zakkster/lite-leak + lite-gc-profiler, --expose-gc: prints
   "ok"; tiers t0/t1/t2/t5/t6/t7/t8/t9 (t8 = the Belady OPT gate).

@@ -199,6 +199,51 @@ export class S3Fifo<K = unknown, V = unknown> implements LiteCache<K, V> {
   get capacity(): number;
 }
 
+/**
+ * A fixed-capacity W-TinyLFU cache with O(1) amortized get/put/has/peek/delete over a
+ * small admission WINDOW (an LRU) in front of a segmented main cache (SLRU: a
+ * PROBATION segment + a PROTECTED segment), gated by a fixed count-min frequency
+ * sketch (decisions/0014). The frequency-admission member of the family and an
+ * implementation of `LiteCache`.
+ *
+ * W-TinyLFU (the Caffeine approach) admits by ESTIMATED FREQUENCY: new keys enter the
+ * window; `get` and `put(update)` bump the sketch and promote the entry within its
+ * segment (a probation hit is promoted to protected). At capacity the window's LRU
+ * becomes the admission candidate, weighed against the probation LRU victim -- the
+ * candidate is admitted (and the victim evicted) iff it is estimated MORE frequent;
+ * ties reject (favor the incumbent). A one-hit-wonder never out-frequencies the
+ * proven-hot set -- scan- and frequency-resistant, and often closer to Belady OPT than
+ * LRU on skewed (Zipf) traffic. `has` and `peek` are frequency- and recency-neutral.
+ * Same `LiteCache` surface as `LiteLru`, so `new LiteLru(n)` swaps for
+ * `new WTinyLfu(n)` and stays type-checked -- the policy difference is INTERNAL, never
+ * in the surface.
+ *
+ * See `LiteCache` for the D7 undefined-value contract and `LiteCacheOptions.onEvict`
+ * for the reentrancy contract -- both hold here. The optional `keys: 'int'` backing
+ * (decisions/0011) applies identically: 32-bit signed integer keys, strict zero-GC
+ * (including the fixed packed sketch). Object keys hash into the sketch by their
+ * resident slot (no WeakMap; frequency is tracked only while resident -- decisions/0014).
+ *
+ * @typeParam K key type (any value; SameValueZero equality via the internal Map)
+ * @typeParam V value type
+ */
+export class WTinyLfu<K = unknown, V = unknown> implements LiteCache<K, V> {
+  /**
+   * @param capacity max entries; must be an integer >= 1 (else throws RangeError,
+   *                 fail-closed -- null is not zero).
+   * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
+   */
+  constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  get(key: K): V | undefined;
+  put(key: K, value: V): void;
+  has(key: K): boolean;
+  peek(key: K): V | undefined;
+  delete(key: K): boolean;
+  clear(): void;
+  get size(): number;
+  get capacity(): number;
+}
+
 /** The package version (kept in lock-step with package.json + Lru.js). */
 export const VERSION: string;
 
