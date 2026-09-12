@@ -38,10 +38,19 @@ const NIL = -1;
  * @returns {Array<{name:string, head:number, tail:number, doubly:boolean}>}
  */
 export function activeListsOf(cache) {
+    // An S3-FIFO member (decisions/0013) threads TWO doubly-linked rings through the
+    // shared _next/_prev columns (detected by its `_sHead` SMALL-ring endpoint):
+    // SMALL (probation) and MAIN. The SAME checker sums over both descriptors.
+    if (cache._sHead !== undefined) {
+        return [
+            { name: 's3fifo-small', head: cache._sHead, tail: cache._sTail, doubly: true },
+            { name: 's3fifo-main', head: cache._mHead, tail: cache._mTail, doubly: true },
+        ];
+    }
     // A SIEVE member (decisions/0012) exposes _head/_tail on a single doubly-linked
-    // FIFO ring (detected by its `_vis` visited column). Classic LRU exposes the
-    // same shape as a recency DLL. Both are ONE doubly-linked list -> one descriptor.
-    if (cache._vis !== undefined) {
+    // FIFO ring (detected by its moving `_hand`). Classic LRU exposes the same shape
+    // as a recency DLL. Both are ONE doubly-linked list -> one descriptor.
+    if (cache._hand !== undefined) {
         return [{ name: 'sieve-fifo', head: cache._head, tail: cache._tail, doubly: true }];
     }
     return [{ name: 'recency', head: cache._head, tail: cache._tail, doubly: true }];
@@ -122,11 +131,32 @@ export function validate(cache, lists) {
         }
     });
 
-    // --- term 6 (SIEVE members, decisions/0012): hand + visited-column ----------
-    // A no-op for LiteLru (no `_vis`). For a Sieve: the hand is in range or NIL,
+    // --- term 6 (S3-FIFO members, decisions/0013): visited range + ghost bound --
+    // A no-op for LiteLru/Sieve. For an S3Fifo: every visited byte is 0 or 1, and the
+    // ghost never exceeds its bound (ghostCount <= ghostCap). The two-ring population
+    // is already summed by term 3/4 via activeListsOf above.
+    if (cache._sHead !== undefined) {
+        for (let i = 0; i < cap; i++) {
+            if (cache._vis[i] > 1) {
+                throw new Error('[validate] s3fifo _vis[' + i + '] = ' + cache._vis[i] + ' > 1');
+            }
+        }
+        if (cache._gLen > cache._ghostCap) {
+            throw new Error(
+                '[validate] s3fifo ghostCount(' + cache._gLen + ') > ghostCap(' + cache._ghostCap + ')');
+        }
+        if (cache._sSize + cache._mSize !== size) {
+            throw new Error(
+                '[validate] s3fifo sSize(' + cache._sSize + ') + mSize(' + cache._mSize +
+                ') != size(' + size + ')');
+        }
+    }
+
+    // --- term 7 (SIEVE members, decisions/0012): hand + visited-column ----------
+    // A no-op for LiteLru (no `_hand`). For a Sieve: the hand is in range or NIL,
     // every visited byte is 0 or 1, an empty ring's hand is NIL, and a set hand
     // points at a slot that is actually in the ring (never dangling -- fail closed).
-    if (cache._vis !== undefined) {
+    if (cache._hand !== undefined) {
         const hand = cache._hand;
         if (hand !== NIL && (hand < 0 || hand >= cap)) {
             throw new Error('[validate] sieve hand ' + hand + ' out of range [0,' + cap + ')');

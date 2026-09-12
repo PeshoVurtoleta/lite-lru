@@ -9,7 +9,7 @@
  *   E single-capacity cache: every put evicts; head===tail always.
  */
 
-import { LiteLru, Sieve } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo } from '../../Lru.js';
 import { makePrng, SEED, check, validate, wrapLru } from './harness.mjs';
 
 export function run() {
@@ -151,5 +151,35 @@ export function run() {
         let scanSurvivors = 0;
         for (let i = 0; i < 5000; i++) if (c.has('scan' + i)) scanSurvivors++;
         check(scanSurvivors < N, () => 't2 G: too many scan keys survived (' + scanSurvivors + ') -- eviction not exercised');
+    }
+
+    // --- H: S3-FIFO scan flood -- a proven-hot SET survives distinct one-hit keys -
+    // (decisions/0013) S3-FIFO admits newcomers to SMALL (probation); a distinct
+    // one-hit-wonder each op enters SMALL unvisited and sweeps straight out. A hot
+    // set kept visited graduates to MAIN and keeps earning second chances, so the
+    // whole hot set survives an unbounded scan. Stronger than t2 G: a SET, not one key.
+    {
+        const N = 64;      // smallCap 6, mainCap 58, ghostCap 58
+        const HOT = 8;     // a hot working set of 8 keys
+        const c = new S3Fifo(N);
+        for (let h = 0; h < HOT; h++) c.put('hot' + h, h);
+        for (let i = 0; i < N - HOT; i++) c.put('cold' + i, i); // fill to capacity
+        check(c.size === N, () => 't2 H: s3fifo not full before the scan');
+        for (let i = 0; i < 8000; i++) {
+            for (let h = 0; h < HOT; h++) {
+                check(c.get('hot' + h) === h, () => 't2 H: hot key ' + h + ' lost mid-scan at ' + i);
+            }
+            c.put('scan' + i, i); // a unique one-hit-wonder each op -> forces eviction
+            check(c.size === N, () => 't2 H: s3fifo drifted from capacity during the scan');
+            if ((i & 511) === 0) validate(c);
+        }
+        for (let h = 0; h < HOT; h++) {
+            check(c.has('hot' + h), () => 't2 H: hot key ' + h + ' was evicted by the scan (no scan resistance)');
+        }
+        validate(c);
+        // Non-vacuity: the cold one-hit-wonders DO get evicted (the scan is real).
+        let survivors = 0;
+        for (let i = 0; i < 8000; i++) if (c.has('scan' + i)) survivors++;
+        check(survivors < N, () => 't2 H: too many scan keys survived (' + survivors + ') -- eviction not exercised');
     }
 }

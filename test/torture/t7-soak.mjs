@@ -11,7 +11,7 @@
  * the payload refs). The census is the teeth for that.
  */
 
-import { LiteLru } from '../../Lru.js';
+import { LiteLru, S3Fifo } from '../../Lru.js';
 import { createLeakTracker } from '@zakkster/lite-leak';
 import { check, validate, censusOk, settleGc } from './harness.mjs';
 
@@ -68,4 +68,38 @@ export async function run() {
     check(heapEnd < heapFirst + 64 * 1024 * 1024,
         () => 't7: heap grew from ' + heapFirst + ' to ' + heapEnd + ' across churn (retention trend)');
     void heapLast;
+
+    // --- S3-FIFO soak: churn + conservation + the GHOST-retains-no-values census -
+    // (decisions/0013) The unique S3-FIFO hazard: the ghost outlives the entry it
+    // fingerprints. It must retain only KEYS (bounded to ghostCap), NEVER values -- a
+    // ghost that pinned value objects would be a retention leak the size() witness
+    // cannot see. Push distinct integer keys so every eviction records a fresh ghost
+    // key, sample the evicted VALUE objects, and prove they are collectible after
+    // teardown even though their keys may still sit in the ghost.
+    {
+        const s3refs = [];
+        const s3tracker = createLeakTracker({ name: 's3fifo-soak' });
+        for (let cyc = 0; cyc < 1024; cyc++) {
+            const cache = new S3Fifo(CAP, { keys: 'int' });
+            const h = s3tracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
+            for (let i = 0; i < CAP * 3; i++) {
+                const val = { c: cyc, i }; // fresh object; most get evicted (key -> ghost)
+                cache.put(cyc * 100000 + i, val); // distinct int keys => real ghost churn
+                if ((cyc & 63) === 0 && (i & 7) === 0) s3refs.push(new WeakRef(val));
+            }
+            check(cache.size === CAP, () => 't7 s3fifo: not full mid-life (size ' + cache.size + ')');
+            check(cache._gLen <= cache._ghostCap, () => 't7 s3fifo: ghost exceeded bound (' + cache._gLen + ')');
+            validate(cache); // conservation mid-life (both rings + ghost bound)
+            cache.clear();
+            check(cache.size === 0, () => 't7 s3fifo: size != 0 after clear (cycle ' + cyc + ')');
+            check(cache._gLen === 0, () => 't7 s3fifo: ghost not empty after clear (cycle ' + cyc + ')');
+            validate(cache);
+            s3tracker.untrack(h);
+        }
+        check(s3tracker.size() === 0, () => 't7 s3fifo: leak tracker size ' + s3tracker.size() + ' != 0');
+        await settleGc(6);
+        check(s3refs.length > 0, () => 't7 s3fifo: census sample was empty (nothing to prove)');
+        check(censusOk(s3refs),
+            () => 't7 s3fifo: an evicted value is still live -- the ghost is retaining values (leak)');
+    }
 }

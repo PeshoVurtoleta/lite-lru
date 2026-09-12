@@ -25,10 +25,11 @@
  */
 
 import { measureOps, checkNoGc, measureAllocs, checkAllocs } from '@zakkster/lite-gc-profiler';
-import { LiteLru, Sieve } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo } from '../../Lru.js';
 import { makeLruOracle, svz } from './oracles/lru.mjs';
 import { makeFifoOracle, makeFifoReal } from './oracles/fifo.mjs';
 import { makeSieveOracle } from './oracles/sieve.mjs';
+import { makeS3FifoOracle } from './oracles/s3fifo.mjs';
 
 export { validate } from '../validate.mjs';
 
@@ -212,6 +213,39 @@ export const sieveIntPolicy = {
     oracle: (cap) => makeSieveOracle(cap),
 };
 
+/** Wrap a real S3Fifo as a uniform driver. victim = the key the next over-capacity
+ *  insert would evict, read via the non-mutating `_peekVictim` (test-only, never a
+ *  hot path) -- the same value `_evict` would pick. */
+export function wrapS3Fifo(cache) {
+    return {
+        get: (k) => cache.get(k),
+        put: (k, v) => cache.put(k, v),
+        has: (k) => cache.has(k),
+        peek: (k) => cache.peek(k),
+        delete: (k) => cache.delete(k),
+        size: () => cache.size,
+        victim: () => cache._peekVictim(),
+        raw: cache,
+    };
+}
+
+/** The S3-FIFO policy (decisions/0013): the admission-controlled member + its own
+ *  independent three-structure oracle. Default backing (Map): arbitrary keys. */
+export const s3fifoPolicy = {
+    name: 's3fifo',
+    real: (cap) => wrapS3Fifo(new S3Fifo(cap)),
+    oracle: (cap) => makeS3FifoOracle(cap),
+};
+
+/** The S3-FIFO policy on the INTEGER substrate backing (`keys: 'int'`), driven
+ *  against the SAME s3fifo oracle: the strict-zero backing (including the int ghost
+ *  ring + membership table) must return byte-identical values + victims. */
+export const s3fifoIntPolicy = {
+    name: 's3fifo-int',
+    real: (cap) => wrapS3Fifo(new S3Fifo(cap, { keys: 'int' })),
+    oracle: (cap) => makeS3FifoOracle(cap),
+};
+
 /* -------------------------------------------------------------------------- *
  * The PARAMETERIZED differential runner (the whole point of S1).
  *
@@ -339,3 +373,39 @@ export class CountedSieve extends Sieve {
 /** SIEVE hit baselines (measured; regression tripwire). The headline. */
 export const SIEVE_WRITES_HIT_LINKS = 0; // a hit relinks nothing
 export const SIEVE_WRITES_HIT_VIS = 1;   // ... it sets exactly one visited byte
+
+/**
+ * An S3Fifo subclass whose _next/_prev AND _vis columns are wrapped in counting
+ * Proxies -- used ONLY in the T6 S3-FIFO counter sub-tier, NEVER on a measured
+ * zero-alloc path (a Proxy allocates + traps and would poison the gate). S3-FIFO
+ * shares SIEVE's 1-bit hit: a HIT relinks NOTHING (0 _next/_prev stores in EITHER
+ * ring) and sets exactly ONE visited byte. The Proxy writes through to the same
+ * underlying buffer the store reads, so alloc/free stay consistent (as in CountedLru).
+ */
+export class CountedS3Fifo extends S3Fifo {
+    constructor(capacity, options) {
+        super(capacity, options);
+        this._writes = 0;    // _next / _prev link stores
+        this._visWrites = 0; // _vis stores
+        const self = this;
+        const countStores = (arr, isVis) => new Proxy(arr, {
+            set(t, prop, value) {
+                if (typeof prop === 'string' && prop !== 'length' && String(+prop) === prop) {
+                    if (isVis) self._visWrites++; else self._writes++;
+                }
+                t[prop] = value;
+                return true;
+            },
+        });
+        this._next = countStores(this._next, false);
+        this._prev = countStores(this._prev, false);
+        this._vis = countStores(this._vis, true);
+    }
+    resetWrites() { this._writes = 0; this._visWrites = 0; }
+    writes() { return this._writes; }
+    visWrites() { return this._visWrites; }
+}
+
+/** S3-FIFO hit baselines (measured; regression tripwire). Same headline as SIEVE. */
+export const S3FIFO_WRITES_HIT_LINKS = 0; // a hit relinks nothing
+export const S3FIFO_WRITES_HIT_VIS = 1;   // ... it sets exactly one visited byte

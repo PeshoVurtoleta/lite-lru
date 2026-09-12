@@ -9,10 +9,11 @@
  *
  * FAMILY CONTRACT (ROADMAP moat-pillar 1). `LiteCache<K, V>` is the uniform
  * surface EVERY member of the family implements. `LiteLru` is the reference
- * member; future members (`Sieve`, `S3Fifo`, `WTinyLfu`, ...) will each be a
+ * member; further members (`Sieve`, `S3Fifo`, ...) are each a
  * `class X<K, V> implements LiteCache<K, V>`, so a caller can swap
- * `new LiteLru(n)` for `new Sieve(n)` and stay type-checked -- the policy
- * difference (recency / admission / frequency) is INTERNAL, never in the surface.
+ * `new LiteLru(n)` for `new Sieve(n)` or `new S3Fifo(n)` and stay type-checked --
+ * the policy difference (recency / admission / frequency) is INTERNAL, never in the
+ * surface.
  *
  * @license MIT
  */
@@ -141,6 +142,47 @@ export class LiteLru<K = unknown, V = unknown> implements LiteCache<K, V> {
  * @typeParam V value type
  */
 export class Sieve<K = unknown, V = unknown> implements LiteCache<K, V> {
+  /**
+   * @param capacity max entries; must be an integer >= 1 (else throws RangeError,
+   *                 fail-closed -- null is not zero).
+   * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
+   */
+  constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  get(key: K): V | undefined;
+  put(key: K, value: V): void;
+  has(key: K): boolean;
+  peek(key: K): V | undefined;
+  delete(key: K): boolean;
+  clear(): void;
+  get size(): number;
+  get capacity(): number;
+}
+
+/**
+ * A fixed-capacity S3-FIFO cache with O(1) amortized get/put/has/peek/delete over
+ * two preallocated intrusive FIFO rings plus a bounded keys-only ghost queue
+ * (decisions/0013). The admission-controlled member of the family and an
+ * implementation of `LiteCache`.
+ *
+ * S3-FIFO (Yang et al., SOSP'23) is quick-demotion + lazy-promotion: newcomers
+ * enter a small probation FIFO; `get` and `put(update)` set a per-entry VISITED bit
+ * and do NOTHING structural (zero relinks -- the headline). At capacity the small
+ * queue's oldest entry either GRADUATES to the main FIFO (if proven, i.e. visited)
+ * or is evicted with its key remembered in a ghost queue; a key seen again while in
+ * ghost is admitted straight to main. A distinct one-hit-wonder never displaces the
+ * proven-hot set -- scan-resistant. `has` and `peek` are visited-neutral. Same
+ * `LiteCache` surface as `LiteLru`, so `new LiteLru(n)` swaps for `new S3Fifo(n)`
+ * and stays type-checked -- the policy difference is INTERNAL, never in the surface.
+ *
+ * See `LiteCache` for the D7 undefined-value contract and `LiteCacheOptions.onEvict`
+ * for the reentrancy contract -- both hold here. The optional `keys: 'int'` backing
+ * (decisions/0011) applies identically: 32-bit signed integer keys, strict zero-GC
+ * (including the int ghost ring + membership table).
+ *
+ * @typeParam K key type (any value; SameValueZero equality via the internal Map)
+ * @typeParam V value type
+ */
+export class S3Fifo<K = unknown, V = unknown> implements LiteCache<K, V> {
   /**
    * @param capacity max entries; must be an integer >= 1 (else throws RangeError,
    *                 fail-closed -- null is not zero).

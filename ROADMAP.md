@@ -72,7 +72,7 @@ LiteMGLRU, meta-policy; distilled into DEBATE items 13-15).
 | `Lru.d.ts` + family interface | S2 |
 | shared keyed-index substrate (was S4, now the keystone) | **built + gated (S3)** |
 | SIEVE | **built + gated (S4)** |
-| S3-FIFO | S5 |
+| S3-FIFO | **built + gated (S5)** |
 | W-TinyLFU | S6 |
 | 2Q / SLRU | S7 |
 | ARC (flagged -- stresses the fixed-capacity law) | S8 |
@@ -502,7 +502,7 @@ DONE WHEN
 ===============================================================================
 ```markdown
 version_target: 1.1.0
-status: planned
+status: built + gated (VERSION stays 1.0.0 until /release 1.1.0)
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0

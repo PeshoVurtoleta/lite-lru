@@ -15,8 +15,8 @@
  * corrupt structure still fails the tier.
  */
 
-import { LiteLru } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru } from './harness.mjs';
+import { LiteLru, S3Fifo } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo } from './harness.mjs';
 
 const CAP = 16;
 const KEYSPACE = 40;
@@ -108,5 +108,54 @@ export function run() {
         check(c.has('e'), () => 't0 L4: newcomer "e" is absent after insert');
         check(c.size === 4, () => 't0 L4: size ' + c.size + ' != capacity 4 after evicting insert');
         validate(c);
+    }
+
+    // --- S3-FIFO laws (decisions/0013) ------------------------------------------
+    const Q_MAIN = 1; // matches Lru.js's S3-FIFO queue tag for the MAIN ring
+
+    // S1: prove-then-graduate. A SMALL entry that is VISITED (proven) when the
+    // eviction sweep reaches it GRADUATES to MAIN rather than being evicted; the next
+    // (unproven) SMALL entry is the one that leaves (to ghost).
+    {
+        const c = new S3Fifo(20); // smallCap 2, mainCap 18, ghostCap 18
+        for (let i = 0; i < 20; i++) c.put(i, i); // all admitted to SMALL, at capacity
+        check(c._keys[c._sTail] === 0, () => 't0 S1: key 0 is not the SMALL tail (oldest)');
+        c.get(0); // PROVE key 0 (the oldest SMALL entry)
+        c.put(100, 100); // eviction: SMALL tail 0 is visited -> graduate; 1 is the victim
+        check(c.has(0), () => 't0 S1: proven SMALL entry 0 was evicted instead of graduating');
+        const s0 = c._store.get(0);
+        check(c._q[s0] === Q_MAIN, () => 't0 S1: proven entry 0 did not graduate into MAIN');
+        check(!c.has(1), () => 't0 S1: the unproven SMALL tail 1 was not the victim');
+        check(c.has(100), () => 't0 S1: the newcomer 100 is absent');
+        check(c.size === 20, () => 't0 S1: size drifted from capacity (' + c.size + ')');
+        validate(c);
+    }
+
+    // S2: scan resistance. A repeatedly-accessed HOT key graduates to MAIN and keeps
+    // earning second chances, so an unbounded flood of distinct one-hit-wonder keys
+    // (which enter SMALL unvisited and sweep straight out) never displaces it. A plain
+    // FIFO -- and classic LRU on a scan -- would evict it.
+    {
+        const N = 32; // smallCap 3, mainCap 29
+        const c = new S3Fifo(N);
+        const HOT = 'hot';
+        c.put(HOT, 1);
+        for (let i = 0; i < N - 1; i++) c.put('cold' + i, i); // fill to capacity
+        check(c.size === N, () => 't0 S2: s3fifo not full before the scan');
+        for (let i = 0; i < 5000; i++) {
+            check(c.get(HOT) === 1, () => 't0 S2: hot key lost mid-scan at ' + i);
+            c.put('scan' + i, i); // a unique one-hit-wonder each op -> forces eviction
+            check(c.size === N, () => 't0 S2: s3fifo drifted from capacity during the scan');
+            if ((i & 255) === 0) validate(c);
+        }
+        check(c.has(HOT), () => 't0 S2: the hot key was evicted by a one-hit-wonder scan (no scan resistance)');
+        const sHot = c._store.get(HOT);
+        check(c._q[sHot] === Q_MAIN, () => 't0 S2: the proven hot key never graduated to MAIN');
+        // Non-vacuity: the cold one-hit-wonders DO get evicted (the scan is real).
+        let survivors = 0;
+        for (let i = 0; i < 5000; i++) if (c.has('scan' + i)) survivors++;
+        check(survivors < N, () => 't0 S2: too many scan keys survived (' + survivors + ') -- eviction not exercised');
+        validate(c);
+        void wrapS3Fifo(c); // exercise the driver wrapper on a churned cache
     }
 }

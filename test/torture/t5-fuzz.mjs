@@ -15,7 +15,7 @@
 
 import {
     runDifferential, lruPolicy, lruIntPolicy, fifoPolicy,
-    sievePolicy, sieveIntPolicy, SEED, die,
+    sievePolicy, sieveIntPolicy, s3fifoPolicy, s3fifoIntPolicy, SEED, die,
 } from './harness.mjs';
 
 const OPS = 100000;
@@ -55,6 +55,20 @@ export function run() {
     // every op. The int backing rides the SAME strict-zero substrate.
     fuzzPolicy(sievePolicy, lruConfigs);
     fuzzPolicy(sieveIntPolicy, lruConfigs);
+
+    // The S3-FIFO MEMBER proof (decisions/0013): admission control on BOTH backings
+    // against its own independent three-structure oracle -- same value AND same next
+    // victim AND same size after every op. The int backing also exercises the
+    // strict-zero ghost ring + membership table. Caps 1..9 stress the small-cap
+    // rounding + the mainCap==0 / ghostCap==0 degenerate edges (D13); 64 is a normal
+    // split (smallCap 6 / mainCap 58) where graduation + ghost admission both fire.
+    const s3Configs = [];
+    for (let cap = 1; cap <= 9; cap++) {
+        s3Configs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0x70 + cap });
+    }
+    s3Configs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0x7f });
+    fuzzPolicy(s3fifoPolicy, s3Configs);
+    fuzzPolicy(s3fifoIntPolicy, s3Configs);
 
     // The SEAM proof: the SAME runner drives a second policy unchanged.
     fuzzPolicy(fifoPolicy, [

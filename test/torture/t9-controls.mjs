@@ -16,16 +16,18 @@
  *   C5 a broken SECOND policy (FIFO)           -> the runner catches it (the seam)
  *   C6 a growing int index buffer             -> validate()'s stability check fails
  *   C7 a SIEVE get that PROMOTES on hit        -> diverges from the sieve oracle
+ *   C8 an S3-FIFO get that GRADUATES on touch  -> diverges from the s3fifo oracle
  */
 
-import { LiteLru, Sieve } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo } from '../../Lru.js';
 import {
-    runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, validate,
+    runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, validate,
     lruPolicy, check, die,
 } from './harness.mjs';
 import { makeLruOracle } from './oracles/lru.mjs';
 import { makeFifoOracle } from './oracles/fifo.mjs';
 import { makeSieveOracle } from './oracles/sieve.mjs';
+import { makeS3FifoOracle } from './oracles/s3fifo.mjs';
 
 const NIL = -1;
 
@@ -104,6 +106,27 @@ class PromotingSieve extends Sieve {
         // BUG: promote to the head like LRU -> the FIFO order (and the victim) drift.
         this._detach(s);
         this._pushFront(s);
+        return this._vals[s];
+    }
+}
+
+/** C8: an S3-FIFO get that GRADUATES a SMALL entry to MAIN on first touch instead of
+ *  at eviction time. The whole point of S3-FIFO (decisions/0013) is that promotion is
+ *  DEFERRED to the eviction sweep: a hit sets the visited bit and moves nothing.
+ *  Graduating eagerly changes the SMALL/MAIN populations, so the next-eviction victim
+ *  drifts from the pure-S3-FIFO oracle. (The rings stay coherent, so this is a
+ *  semantic divergence, not a crash.) */
+class GraduateOnTouchS3Fifo extends S3Fifo {
+    get(key) {
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        this._vis[s] = 1;
+        // BUG: graduate to MAIN immediately (Q_SMALL === 0) instead of at eviction.
+        if (this._q[s] === 0) {
+            this._detach(s);
+            this._pushMain(s);
+            this._size = this._sSize + this._mSize;
+        }
         return this._vals[s];
     }
 }
@@ -213,5 +236,23 @@ export function run() {
         if (r.ok) die('t9 C7: a SIEVE get() that promotes on hit did NOT diverge from the sieve oracle (no teeth)');
         check(r.why === 'victim',
             () => 't9 C7: expected the promoting-get divergence to be a victim mismatch, got ' + r.why);
+    }
+
+    // --- C8: an S3-FIFO get that graduates-on-touch -> diverges from the oracle ---
+    // The S3-FIFO headline is deferred promotion: a hit sets the visited bit and
+    // moves nothing; graduation happens only during the eviction sweep. A get that
+    // graduates a SMALL entry to MAIN eagerly changes the queue populations, so its
+    // next-eviction victim MUST drift from the pure-S3-FIFO oracle. Non-vacuity: the
+    // CORRECT S3Fifo agrees (proven in t5); here the broken one must diverge.
+    {
+        const brokenPolicy = {
+            name: 's3fifo-graduate-on-touch',
+            real: (cap) => wrapS3Fifo(new GraduateOnTouchS3Fifo(cap)),
+            oracle: (cap) => makeS3FifoOracle(cap),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 32, ops: 20000, seed: 131313, keyspace: 80 });
+        if (r.ok) die('t9 C8: an S3-FIFO get() that graduates on touch did NOT diverge from the s3fifo oracle (no teeth)');
+        check(r.why === 'victim' || r.why === 'value' || r.why === 'size',
+            () => 't9 C8: divergence reason was ' + r.why + ' (unexpected)');
     }
 }

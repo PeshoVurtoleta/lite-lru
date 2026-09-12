@@ -7,6 +7,62 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.1.0] - 2026-09-12
+
+### Added
+
+- **`S3Fifo`** -- the S3-FIFO member (Yang et al., SOSP'23) on the same substrate:
+  quick-demotion + lazy-promotion over a SMALL probation FIFO
+  (`smallCap = max(1, floor(capacity/10))`), a MAIN FIFO
+  (`mainCap = capacity - smallCap`), and a bounded keys-only GHOST queue
+  (`ghostCap = mainCap`), all sized once at construction. A hit sets the visited
+  byte and relinks nothing (0 link writes + exactly 1 visited-byte store, same as
+  `Sieve`). A newcomer enters SMALL unvisited; a key seen in the ghost enters MAIN.
+  At capacity one eviction step: the SMALL oldest graduates to MAIN if visited,
+  else is evicted and its key remembered in the ghost; otherwise the MAIN oldest
+  gets one second chance or is evicted (MAIN evictions are not ghosted). Same
+  `LiteCache<K,V>` surface, `onEvict` fire-after + reentrancy guard, and
+  `keys: 'int'` strict-zero backing as the other members.
+- **`decisions/0013-s3fifo.md`** -- records D13: the small/main split and the
+  `capacity == 1` degenerate edge (`mainCap == 0`, `ghostCap == 0`); the ghost
+  representation (a strict-zero-alloc open-addressed Int32 table + FIFO ring on the
+  `keys: 'int'` backing; an amortized `Set` + ring on the default `Map` backing),
+  which retains bounded KEYS only, never values; and the unchanged uniform surface
+  and policy law.
+- **`test/torture/oracles/s3fifo.mjs`** -- an independent brute-force three-structure
+  S3-FIFO oracle (shares no code with `Lru.js`), driving the differential.
+- **Torture coverage for `S3Fifo`** -- `s3fifoPolicy` + `s3fifoIntPolicy` registered
+  across tiers `t0`/`t2`/`t5`/`t6`/`t7`, plus a `t9` graduate-on-first-touch control
+  proven to diverge. `validate()` extended to sum the SMALL + MAIN rings (reciprocity
+  each) and bound the ghost (`ghostCount <= ghostCap`).
+- **`test/S3Fifo.test.js`** -- 67 `node:test` boundary cases (admission to SMALL,
+  ghost-routes-to-MAIN, prove-then-graduate, scan resistance, `has`/`peek`
+  visited-neutrality, delete + queue repair, `capacity == 1` and small caps,
+  fail-closed capacity, `onEvict` fire-after + reentrancy, D7, the `keys: 'int'`
+  door).
+
+### Changed
+
+- Test suite grows to **228** `node:test` cases (from 160). `README.md`, `llms.txt`,
+  and `Lru.d.ts` (the `S3Fifo<K,V>` declaration + dts-drift coverage) updated for
+  the third member. `package.json` `description` unchanged (already family-accurate).
+
+### Fixed
+
+- **Missing fail-closed door test** -- the `newStore` "unknown `keys` value" branch
+  (throws a `[lite-lru]`-tagged `TypeError` with a did-you-mean hint) had no test
+  for any member; added 10 parameterized cases.
+
+### Gated numbers
+
+- Writes per hit: `S3Fifo` = 0 link writes + exactly 1 visited byte, measured at the
+  head / interior / tail of SMALL (matches `Sieve`; the strongest zero-GC posture).
+- Zero-GC (int backing, including the ghost ring + membership table): `maxMajor` 0,
+  `maxPauseMs` 4, retained `maxBytesPerCall` 1, `arrayBuffers` growth 0.
+- Differential: 100000 ops per config across capacities 1..9 (including the
+  `mainCap == 0` / `ghostCap == 0` degenerate edge) and 64, on both backings, with
+  zero divergence in value / size / eviction victim against the brute oracle.
+
 ## [1.0.0] - 2026-09-12
 
 ### Added

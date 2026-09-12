@@ -1,14 +1,15 @@
 # @zakkster/lite-lru
 
 Zero-dependency, zero-GC cache FAMILY for JavaScript under one uniform
-LiteCache<K,V> surface. A classic LRU reference member (LiteLru) and the modern
-SIEVE headline (Sieve) expose the SAME get/put/has/peek/delete/clear API, so the
-eviction policy is a one-line constructor swap. Single-file ESM, zero runtime
+LiteCache<K,V> surface. A classic LRU reference member (LiteLru), the modern SIEVE
+headline (Sieve), and the admission-controlled S3-FIFO member (S3Fifo) expose the
+SAME get/put/has/peek/delete/clear API, so the eviction policy is a one-line
+constructor swap. Single-file ESM, zero runtime
 dependencies, node:test only. Ships a runnable + importable benchmark tool
 (Bench.mjs) with Belady OPT so a caller measures which policy fits their trace
 instead of guessing.
 
-## Status: 1.0.0 - the release: a cache family (LiteLru + Sieve) under one interface, on the shared substrate, with the shipped bench + Belady OPT tool
+## Status: 1.1.0 - S3-FIFO joins the family: LiteLru + Sieve + S3Fifo under one interface, on the shared substrate, with the shipped bench + Belady OPT tool
 
 The family is the identity from v1.0.0: classic LRU is the reference member +
 differential oracle + honest floor, SIEVE is the headline, and the shipped
@@ -25,10 +26,11 @@ that substrate (decisions/0012). S9 (this session) adds the docs, the shipped
 bench + Belady OPT tool, and the OPT torture gate -- with ZERO change to Lru.js /
 Lru.d.ts (the three version sites move together, only at /release).
 
-## Members (decisions/0001, 0012)
+## Members (decisions/0001, 0012, 0013)
 
-Both classes implement LiteCache<K,V>; the recency/lazy-promotion difference is
-INTERNAL, so new LiteLru(n) swaps for new Sieve(n) and stays type-checked.
+All classes implement LiteCache<K,V>; the recency/lazy-promotion/admission
+difference is INTERNAL, so new LiteLru(n) swaps for new Sieve(n) or new S3Fifo(n)
+and stays type-checked.
 
 - LiteLru: classic Least-Recently-Used. get/put promote to most-recently-used;
   at capacity a new key evicts the LRU tail and reuses its slot in place. A hit
@@ -41,13 +43,22 @@ INTERNAL, so new LiteLru(n) swaps for new Sieve(n) and stays type-checked.
   headline). At capacity the hand sweeps FIFO order, grants each visited entry a
   single second chance, and evicts the first unvisited entry in place. has/peek
   are visited-neutral. Scan-resistant where LRU is not.
+- S3Fifo: S3-FIFO (Yang et al., SOSP'23). Quick-demotion + lazy-promotion over a
+  SMALL probation FIFO (~10% of capacity), a MAIN FIFO, and a bounded keys-only
+  GHOST queue. A hit sets the visited byte and does NOTHING structural (same 0
+  link writes, 1 visited-byte store as SIEVE). Newcomers enter SMALL unvisited,
+  unless the key is in ghost (a second sighting) -> straight to MAIN. At capacity
+  one eviction step: the SMALL oldest graduates to MAIN if proven (visited), else
+  is evicted and its key remembered in ghost; otherwise the MAIN oldest gets one
+  second chance or is evicted (MAIN evictions are NOT ghosted). has/peek are
+  visited-neutral; the ghost holds KEYS only, never values. Strongly scan-resistant.
 
 ## Uniform surface (LiteCache<K,V>)
 
 - new LiteLru(capacity, options?) / new Sieve(capacity, options?)
   - capacity: integer >= 1, else a [lite-lru]-tagged RangeError at the door.
 - get(key) -> V | undefined. Applies the member's hit policy (LiteLru promotes to
-  MRU; Sieve sets the visited bit).
+  MRU; Sieve and S3Fifo set the visited bit).
 - put(key, value) -> void. Insert or update; at capacity evicts the member's
   victim first (firing onEvict). Amortized O(1) default / O(1) with keys:'int'.
 - has(key) -> boolean. Presence test; NEVER changes recency / visited state.
@@ -72,7 +83,7 @@ INTERNAL, so new LiteLru(n) swaps for new Sieve(n) and stays type-checked.
 
 ## Invariants (suite CLAUDE.md + ROADMAP)
 
-- Zero allocation on every hot path (get/put/delete/has/peek), for BOTH members.
+- Zero allocation on every hot path (get/put/delete/has/peek), for ALL members.
   The slot/list layer is STRICTLY zero-alloc; the keys:'int' index is strictly
   zero-alloc too; the default Map index is amortized (stated, not hidden).
 - Fail closed: an invalid capacity throws (RangeError), an unknown keys value
@@ -111,13 +122,14 @@ drops LiteLru's body from the bundle (and vice versa). The shared substrate is
 INTERNAL, not an export; there is NO subpath-per-policy. Bench.mjs is a separate
 runnable tool, not a second implementation.
 
-## API (1.0.0)
+## API (1.1.0)
 
 Named exports from @zakkster/lite-lru:
 
 - LiteLru: the classic LRU member (also the default export).
 - Sieve: the SIEVE member.
-- VERSION: '1.0.0'
+- S3Fifo: the S3-FIFO member.
+- VERSION: '1.1.0'
 
 Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
@@ -126,8 +138,8 @@ Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
 ## Testing
 
-- npm test        -- 143 node:test cases (both members, recency/SIEVE laws,
-  degenerate keys/values, dts drift, family surface).
+- npm test        -- 228 node:test cases (all three members, recency/SIEVE/S3-FIFO
+  laws, degenerate keys/values, dts drift, family surface).
 - npm run test:types -- tsc: the LiteCache<K,V> surface + the one-line-swap check.
 - npm run torture -- @zakkster/lite-leak + lite-gc-profiler, --expose-gc: prints
   "ok"; tiers t0/t1/t2/t5/t6/t7/t8/t9 (t8 = the Belady OPT gate).

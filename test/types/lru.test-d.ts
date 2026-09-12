@@ -9,7 +9,7 @@
  * stops happening (tsc flags an unused directive). Test-only; not in files[].
  * ASCII-only.
  */
-import LiteLru, { VERSION, Sieve } from "../../Lru.js";
+import LiteLru, { VERSION, Sieve, S3Fifo } from "../../Lru.js";
 import type { LiteCache, LiteCacheOptions } from "../../Lru.js";
 
 // A type-equality check with teeth (identity holds only for exact-equal types).
@@ -111,3 +111,41 @@ new Sieve<number, number>(10, { keys: "lru" });
 
 // @ts-expect-error -- size is readonly on Sieve.
 sv.size = 5;
+
+// ---- S3Fifo: the third family member SATISFIES the SAME LiteCache surface -----
+// (decisions/0013) The one-line policy swap: `new S3Fifo(n)` type-checks into the
+// SAME `LiteCache` binding as `new LiteLru(n)` / `new Sieve(n)`.
+const s3 = new S3Fifo<string, number>(10);
+const s3Got = s3.get("a");
+expectTrue<Equal<typeof s3Got, number | undefined>>();
+expectTrue<Equal<ReturnType<typeof s3.has>, boolean>>();
+expectTrue<Equal<ReturnType<typeof s3.delete>, boolean>>();
+expectTrue<Equal<typeof s3.size, number>>();
+expectTrue<Equal<typeof s3.capacity, number>>();
+
+const s3Iface: LiteCache<string, number> = new S3Fifo<string, number>(10);
+s3Iface.put("k", 1);
+const s3IfaceGot = s3Iface.get("k");
+expectTrue<Equal<typeof s3IfaceGot, number | undefined>>();
+
+// keys:'int' opt-in backing applies identically to S3Fifo.
+new S3Fifo<number, number>(10, { keys: "int" });
+
+// onEvict params are typed from <K, V> on S3Fifo too.
+new S3Fifo<string, number>(10, {
+  onEvict: (k, v) => {
+    const _k: string = k;
+    const _v: number = v;
+    void _k;
+    void _v;
+  },
+});
+
+// @ts-expect-error -- V is number; a string value is rejected on S3Fifo too.
+s3.put("a", "not-a-number");
+
+// @ts-expect-error -- 'fifo' is not a valid keys backing (only 'int').
+new S3Fifo<number, number>(10, { keys: "fifo" });
+
+// @ts-expect-error -- size is readonly on S3Fifo.
+s3.size = 5;

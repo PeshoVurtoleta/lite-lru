@@ -31,11 +31,12 @@
  * rejects the window; T9 exercises the same alloc lane in-process.
  */
 
-import { LiteLru, Sieve } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, BREAK, check, die,
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
     CountedSieve, SIEVE_WRITES_HIT_LINKS, SIEVE_WRITES_HIT_VIS,
+    CountedS3Fifo, S3FIFO_WRITES_HIT_LINKS, S3FIFO_WRITES_HIT_VIS,
 } from './harness.mjs';
 
 const CAP = 4096;      // power of 2 so the hot body masks its key with & MASK
@@ -240,4 +241,77 @@ export async function run() {
     // than classic LRU's interior/tail relink.
     check(SIEVE_WRITES_HIT_LINKS < LRU_WRITES_INTERIOR_REHIT && SIEVE_WRITES_HIT_LINKS < LRU_WRITES_TAIL_REHIT,
         () => 't6 Gate SIEVE: the SIEVE hit (' + SIEVE_WRITES_HIT_LINKS + ' links) is not cheaper than the LRU relink');
+
+    // --- Gate S3FIFO: the S3-FIFO member -- STRICT zero-alloc + the 1-bit headline -
+    // (decisions/0013) The int-backed S3Fifo churns NEW, strictly-increasing integer
+    // keys from an EMPTY cache. Fresh keys are never in ghost, so after warm-up every
+    // op admits to SMALL and evicts the unvisited SMALL tail (recording its key in the
+    // int ghost ring + membership table) -- exercising the open-addressed store index
+    // idxSet/backshift AND the strict-zero ghost every iteration. NO pre-fill caveat:
+    // strict zero-alloc, and _vis / _q / _next / _ixSlot / _ixKey / the ghost buffers
+    // never grow.
+    const tcache = new S3Fifo(CAP, { keys: 'int' });
+    const tNextBytes = tcache._next.buffer.byteLength;
+    const tPrevBytes = tcache._prev.buffer.byteLength;
+    const tVisBytes = tcache._vis.buffer.byteLength;
+    const tQBytes = tcache._q.buffer.byteLength;
+    const tIxSlotBytes = tcache._store._ixSlot.buffer.byteLength;
+    const tIxKeyBytes = tcache._store._ixKey.buffer.byteLength;
+    const tgRingBytes = tcache._gRing.buffer.byteLength;
+    const tgixKeyBytes = tcache._gixKey.buffer.byteLength;
+    const tgixStateBytes = tcache._gixState.buffer.byteLength;
+    let tk = 0;
+    const s3Hot = () => {
+        tcache.put(tk, tk & 0xffff); // fresh, strictly-increasing int key; SMI value
+        tk++;
+    };
+    const gt = runOpsGate(s3Hot, { ops: OPS, warmup: WARMUP });
+    check(tcache._next.buffer.byteLength === tNextBytes,
+        () => 't6 Gate S3FIFO: _next.buffer grew ' + tNextBytes + ' -> ' + tcache._next.buffer.byteLength);
+    check(tcache._prev.buffer.byteLength === tPrevBytes,
+        () => 't6 Gate S3FIFO: _prev.buffer grew ' + tPrevBytes + ' -> ' + tcache._prev.buffer.byteLength);
+    check(tcache._vis.buffer.byteLength === tVisBytes,
+        () => 't6 Gate S3FIFO: _vis.buffer grew ' + tVisBytes + ' -> ' + tcache._vis.buffer.byteLength);
+    check(tcache._q.buffer.byteLength === tQBytes,
+        () => 't6 Gate S3FIFO: _q.buffer grew ' + tQBytes + ' -> ' + tcache._q.buffer.byteLength);
+    check(tcache._store._ixSlot.buffer.byteLength === tIxSlotBytes,
+        () => 't6 Gate S3FIFO: _ixSlot.buffer grew ' + tIxSlotBytes + ' -> ' + tcache._store._ixSlot.buffer.byteLength);
+    check(tcache._store._ixKey.buffer.byteLength === tIxKeyBytes,
+        () => 't6 Gate S3FIFO: _ixKey.buffer grew ' + tIxKeyBytes + ' -> ' + tcache._store._ixKey.buffer.byteLength);
+    check(tcache._gRing.buffer.byteLength === tgRingBytes,
+        () => 't6 Gate S3FIFO: ghost _gRing grew ' + tgRingBytes + ' -> ' + tcache._gRing.buffer.byteLength);
+    check(tcache._gixKey.buffer.byteLength === tgixKeyBytes,
+        () => 't6 Gate S3FIFO: ghost _gixKey grew ' + tgixKeyBytes + ' -> ' + tcache._gixKey.buffer.byteLength);
+    check(tcache._gixState.buffer.byteLength === tgixStateBytes,
+        () => 't6 Gate S3FIFO: ghost _gixState grew ' + tgixStateBytes + ' -> ' + tcache._gixState.buffer.byteLength);
+    check(tcache.size === CAP, () => 't6 Gate S3FIFO: churn did not stay at capacity (size ' + tcache.size + ')');
+    check(tcache._gLen <= tcache._ghostCap, () => 't6 Gate S3FIFO: ghost exceeded its bound (' + tcache._gLen + ')');
+    if (!gt.report.ok) {
+        const g = gt.summary.gc;
+        die('t6 Gate S3FIFO (int churn) ops gate rejected -- verdict=' + gt.report.verdict +
+            ' source=' + gt.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gta = runAllocsGate(s3Hot, { iterations: 50000, batches: 8 });
+    if (!gta.ok) {
+        die('t6 Gate S3FIFO (int churn) retained-alloc gate rejected -- verdict=' + gta.report.verdict +
+            ' settled=' + gta.result.settled + ' bytesPerCall=' + gta.bytesPerCall);
+    }
+
+    // The 1-bit hit headline, MEASURED: an S3-FIFO hit relinks NOTHING (0 _next/_prev
+    // stores) and sets exactly ONE visited byte, whether the entry sits at the head,
+    // an interior slot or the tail of SMALL. Same as SIEVE, strictly cheaper than the
+    // classic-LRU relink.
+    const P = 8; // all admitted to SMALL (fresh keys, none in ghost)
+    for (const probe of [P - 1, 4, 0]) { // insertion order: head, interior, tail of SMALL
+        const cs = new CountedS3Fifo(P);
+        for (let i = 0; i < P; i++) cs.put(i, i);
+        cs.resetWrites();
+        cs.get(probe); // a hit
+        check(cs.writes() === S3FIFO_WRITES_HIT_LINKS,
+            () => 't6 Gate S3FIFO: hit at ' + probe + ' relinked ' + cs.writes() + ' cells, expected ' + S3FIFO_WRITES_HIT_LINKS);
+        check(cs.visWrites() === S3FIFO_WRITES_HIT_VIS,
+            () => 't6 Gate S3FIFO: hit at ' + probe + ' wrote ' + cs.visWrites() + ' visited bytes, expected ' + S3FIFO_WRITES_HIT_VIS);
+    }
+    check(S3FIFO_WRITES_HIT_LINKS < LRU_WRITES_INTERIOR_REHIT && S3FIFO_WRITES_HIT_LINKS < LRU_WRITES_TAIL_REHIT,
+        () => 't6 Gate S3FIFO: the S3-FIFO hit (' + S3FIFO_WRITES_HIT_LINKS + ' links) is not cheaper than the LRU relink');
 }

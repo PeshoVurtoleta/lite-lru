@@ -101,12 +101,25 @@ function sieveImplementsLiteCache(dtsText) {
   return /class Sieve<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
 }
 
+/** True if the d.ts declares `class S3Fifo<...> implements LiteCache<...>`. */
+function s3fifoImplementsLiteCache(dtsText) {
+  return /class S3Fifo<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
+}
+
 /** True if BOTH sources declare a `Sieve` class (the second named export). */
 function jsDeclaresSieve(jsText) {
   return /export class Sieve\b/.test(jsText);
 }
 function dtsDeclaresSieve(dtsText) {
   return /export class Sieve\b/.test(dtsText);
+}
+
+/** True if BOTH sources declare an `S3Fifo` class (the third named export). */
+function jsDeclaresS3Fifo(jsText) {
+  return /export class S3Fifo\b/.test(jsText);
+}
+function dtsDeclaresS3Fifo(dtsText) {
+  return /export class S3Fifo\b/.test(dtsText);
 }
 
 /** Symmetric-difference report between two sets: [] when equal. */
@@ -162,6 +175,23 @@ test('(d) Sieve surface: Sieve is a named export in BOTH sources, members agree,
   assert.ok(sieveImplementsLiteCache(DTS), 'class Sieve must `implements LiteCache<...>`');
 });
 
+test('(e) S3Fifo surface: S3Fifo is a named export in BOTH sources, members agree, implements LiteCache', () => {
+  assert.ok(jsDeclaresS3Fifo(JS), 'Lru.js must `export class S3Fifo` (the third named export)');
+  assert.ok(dtsDeclaresS3Fifo(DTS), 'Lru.d.ts must `export class S3Fifo`');
+  const js = classMembers(JS, 'S3Fifo');
+  const dts = classMembers(DTS, 'S3Fifo');
+  const diffs = setDiff(js, dts, 'Lru.js', 'Lru.d.ts');
+  assert.deepEqual(diffs, [], diffs.join('; '));
+  // The full public surface -- identical inventory to LiteLru/Sieve (moat-pillar 1).
+  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'size', 'capacity']) {
+    assert.ok(js.has(nm), 'Lru.js class S3Fifo is missing public member ' + nm);
+    assert.ok(dts.has(nm), 'Lru.d.ts class S3Fifo is missing member ' + nm);
+  }
+  assert.equal(js.size, 8, 'expected exactly 8 public members in S3Fifo (Lru.js), saw ' + js.size);
+  assert.equal(dts.size, 8, 'expected exactly 8 members in S3Fifo (Lru.d.ts), saw ' + dts.size);
+  assert.ok(s3fifoImplementsLiteCache(DTS), 'class S3Fifo must `implements LiteCache<...>`');
+});
+
 // --- teeth: each check must reject a mutated COPY (non-vacuity) --------------
 
 test('control: unmutated text reports zero diffs / all-present (vacuity)', () => {
@@ -169,9 +199,11 @@ test('control: unmutated text reports zero diffs / all-present (vacuity)', () =>
   assert.ok(dtsDeclaresVersion(DTS));
   assert.deepEqual(setDiff(classMembers(JS, 'LiteLru'), classMembers(DTS, 'LiteLru'), 'a', 'b'), []);
   assert.deepEqual(setDiff(classMembers(JS, 'Sieve'), classMembers(DTS, 'Sieve'), 'a', 'b'), []);
+  assert.deepEqual(setDiff(classMembers(JS, 'S3Fifo'), classMembers(DTS, 'S3Fifo'), 'a', 'b'), []);
   assert.ok(hasLiteCacheInterface(DTS));
   assert.ok(liteLruImplementsLiteCache(DTS));
   assert.ok(sieveImplementsLiteCache(DTS));
+  assert.ok(s3fifoImplementsLiteCache(DTS));
 });
 
 test('control: desyncing the package.json version makes version parity fail', () => {

@@ -20,11 +20,12 @@ npm install @zakkster/lite-lru
 ```
 
 ```js
-import { LiteLru, Sieve } from '@zakkster/lite-lru';
+import { LiteLru, Sieve, S3Fifo } from '@zakkster/lite-lru';
 
 // Same surface, different eviction policy. Swap the constructor, nothing else.
 const cache = new LiteLru(3);            // classic recency (the reference member)
 // const cache = new Sieve(3);           // <- modern lazy-promotion FIFO (the headline)
+// const cache = new S3Fifo(3);          // <- admission-controlled FIFO + ghost queue
 
 cache.put('a', 1);
 cache.put('b', 2);
@@ -51,7 +52,7 @@ One `LiteCache<K,V>` surface, `get`/`put`/`has`/`peek`/`delete`/`clear`, all O(1
 
 - [Why this exists](#why-this-exists)
 - [What you get](#what-you-get)
-- [LRU vs SIEVE -- which member, and when](#lru-vs-sieve----which-member-and-when)
+- [LRU vs SIEVE vs S3-FIFO -- which member, and when](#lru-vs-sieve-vs-s3-fifo----which-member-and-when)
 - [API reference](#api-reference)
   - [The members](#the-members)
   - [Construction options](#construction-options)
@@ -72,7 +73,7 @@ One `LiteCache<K,V>` surface, `get`/`put`/`has`/`peek`/`delete`/`clear`, all O(1
 
 Two problems no small cache library solves at once:
 
-1. **The policy is the caller's, not the library's.** LRU is the right answer for genuinely unpredictable, recency-skewed, chronically-at-capacity workloads -- the case it was designed for. It is the WRONG answer for a scan (a sequential sweep larger than the cache evicts its own future), and it is overhead for a cache sized at or above its working set (recency order is consulted only on eviction; if you never evict, every move-to-front is wasted work). `lite-lru` treats the policy as a swappable choice: `LiteLru` for recency, `Sieve` for one-hit-wonder-heavy web/CDN traffic, more members to come -- all `class X implements LiteCache<K,V>`, so `new LiteLru(n)` swaps for `new Sieve(n)` and nothing else in your code changes.
+1. **The policy is the caller's, not the library's.** LRU is the right answer for genuinely unpredictable, recency-skewed, chronically-at-capacity workloads -- the case it was designed for. It is the WRONG answer for a scan (a sequential sweep larger than the cache evicts its own future), and it is overhead for a cache sized at or above its working set (recency order is consulted only on eviction; if you never evict, every move-to-front is wasted work). `lite-lru` treats the policy as a swappable choice: `LiteLru` for recency, `Sieve` for one-hit-wonder-heavy web/CDN traffic, `S3Fifo` for skewed traffic with a heavy one-hit-wonder tail, more members to come -- all `class X implements LiteCache<K,V>`, so `new LiteLru(n)` swaps for `new Sieve(n)` or `new S3Fifo(n)` and nothing else in your code changes.
 
 2. **"Which policy?" is folklore, not measurement.** Neither incumbent can tell you how close you are to the theoretical best. `lite-lru` ships the measurement tool the family is built around: it replays a trace against every member AND against Belady's OPT -- the clairvoyant offline optimum that evicts the entry whose next use is farthest away -- and reports each policy's hit ratio as a **percentage of optimal**. "SIEVE hit 66.8%" is ambiguous; "SIEVE hit 66.8%, which is 89.8% of the offline optimum on this trace" is actionable.
 
@@ -84,19 +85,20 @@ The honest competitive read: `lru-cache` is already typed-array-backed and featu
 
 - **`LiteLru`** -- the classic Least-Recently-Used reference member: a `Map` (or a typed-array index for integer keys) fused with an intrusive, preallocated doubly-linked list. `get` and `put` promote to most-recently-used; at capacity a new key evicts the LRU tail. The honest floor every other member is measured against.
 - **`Sieve`** -- the modern headline (Zhang et al., NSDI'24, "SIEVE is simpler than LRU"): a lazy-promotion FIFO ring with one visited bit per entry and a single moving hand. A hit sets the bit and does **nothing structural** -- zero relinks -- where classic LRU rewrites a small constant number of links. At capacity the hand sweeps FIFO order, grants each visited entry one second chance, and evicts the first unvisited entry in place.
-- **One `LiteCache<K,V>` surface** -- both members expose exactly `get` / `put` / `has` / `peek` / `delete` / `clear`, plus `size` and `capacity`. The recency/lazy-promotion difference is INTERNAL. Types ship in [`Lru.d.ts`](./Lru.d.ts); the interface is the type-checked contract that makes the one-line swap safe.
+- **`S3Fifo`** -- the admission-controlled member (Yang et al., SOSP'23, "FIFO queues are all you need for cache eviction"): quick-demotion + lazy-promotion over a small probation FIFO, a main FIFO, and a bounded keys-only ghost queue. A hit sets a visited bit and does **nothing structural** (zero relinks). Newcomers enter the small queue; a proven entry graduates to main, an unproven one is evicted with its key remembered in the ghost, and a key seen again while in the ghost is admitted straight to main. Scan-resistant, and often closer to Belady OPT than LRU on skewed/web traffic.
+- **One `LiteCache<K,V>` surface** -- all three members expose exactly `get` / `put` / `has` / `peek` / `delete` / `clear`, plus `size` and `capacity`. The recency/lazy-promotion/admission difference is INTERNAL. Types ship in [`Lru.d.ts`](./Lru.d.ts); the interface is the type-checked contract that makes the one-line swap safe.
 - **`Bench.mjs`** -- a runnable ESM tool AND an importable module: `runBench(opts)` and `beladyOpt(trace, capacity)`. Feed it a trace, get per-policy hit ratio, writes-per-hit, machine-local ns/op, and percentage of Belady OPT.
 - **A `keys: 'int'` backing** -- opt in and the keyed index becomes an open-addressed typed-array table for STRICT zero allocation (even the index never allocates), with a fail-closed door for 32-bit signed integer keys.
 - **A zero-GC `onEvict` hook** -- fired once per eviction with the evicted `(key, value)`, e.g. to return the value to a pool.
 
 ---
 
-## LRU vs SIEVE -- which member, and when
+## LRU vs SIEVE vs S3-FIFO -- which member, and when
 
 <details>
 <summary>What each member does on a hit and at eviction, and the workload it is for.</summary>
 
-Both members share the exact same surface and the same hit/miss semantics. They differ only in what happens on the hot path and how the victim is chosen.
+All three members share the exact same surface and the same hit/miss semantics. They differ only in what happens on the hot path and how the victim is chosen.
 
 ### `LiteLru` -- classic recency
 
@@ -110,6 +112,12 @@ The cost is unconditional: every hit relinks the list. Re-hitting the entry that
 
 Because a hit does nothing structural and a fresh key enters unvisited, a burst of distinct one-hit-wonder keys sweeps straight back out without displacing the proven-hot set -- SIEVE is scan-resistant where LRU is not, at a fraction of the per-hit writes. It matches or beats LRU on real web/CDN traces. Reach for it on one-hit-wonder-heavy or skewed traffic, and anywhere per-hit GC pressure matters (realtime, game loops).
 
+### `S3Fifo` -- admission-controlled FIFO
+
+`get(key)` sets a single visited byte and returns -- no relink (the same 1-bit hit as SIEVE). New keys enter a small probation FIFO (~10% of capacity) unvisited, UNLESS the key is currently in a bounded keys-only ghost queue of recently-evicted keys -- a second sighting -- in which case it is admitted straight to the main FIFO. At capacity one eviction step runs: the small queue's oldest entry either graduates to main (if it was proven, i.e. visited) or is evicted with its key recorded in the ghost; otherwise the main queue's oldest entry gets one second chance or is evicted. `has` and `peek` are visited-neutral.
+
+The ghost is what sets S3-FIFO apart: a one-hit-wonder is demoted out of the small queue almost immediately (quick demotion), while a key that proves itself -- either by being visited or by reappearing while still in the ghost -- reaches the long-lived main queue (lazy promotion). This makes S3-FIFO strongly scan-resistant and, on skewed and web/CDN traffic, frequently closer to Belady OPT than either LRU or SIEVE. Reach for it when your working set is skewed with a heavy one-hit-wonder tail.
+
 Pick with the [bench tool](#measure--trust), not by intuition -- the whole point of the family is that this is a measurable choice on YOUR trace.
 
 </details>
@@ -120,11 +128,12 @@ Pick with the [bench tool](#measure--trust), not by intuition -- the whole point
 
 ### The members
 
-Both classes implement `LiteCache<K,V>`. Every method is O(1) (amortized on the default `Map` backing; see [construction options](#construction-options)).
+All three classes implement `LiteCache<K,V>`. Every method is O(1) (amortized on the default `Map` backing; see [construction options](#construction-options)).
 
 ```ts
 new LiteLru<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
 new Sieve<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
+new S3Fifo<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
 
 cache.get(key: K): V | undefined      // returns the value AND applies the member's hit policy
 cache.put(key: K, value: V): void     // insert/update; at capacity, evicts the member's victim first
@@ -177,9 +186,9 @@ Run directly, it prints a table; imported, it returns structured results and pri
 
 | Constant  | Value     | Meaning                                                       |
 | --------- | --------- | ------------------------------------------------------------ |
-| `VERSION` | `'1.0.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
+| `VERSION` | `'1.1.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
 
-Both members and `VERSION` are named exports; `LiteLru` is also the default export.
+All three members and `VERSION` are named exports; `LiteLru` is also the default export.
 
 ---
 
@@ -240,7 +249,7 @@ An LRU has a hard capacity ceiling by definition, so all `capacity` slots are pr
 | keyed index, default `Map`         | amortized (the Map's internal resize can allocate) |
 | construction                       | once (all slots + columns, then reused) |
 
-`SIEVE` adds one fixed `Uint8Array` visited column, one byte per slot, allocated once and never grown -- a hit is a single unconditional byte store, no mask or shift.
+`SIEVE` adds one fixed `Uint8Array` visited column, one byte per slot, allocated once and never grown -- a hit is a single unconditional byte store, no mask or shift. `S3Fifo` adds two fixed byte columns (a visited column and a queue tag naming which of its two rings a slot is in) plus a bounded keys-only ghost queue -- on the `keys: 'int'` backing the ghost is a fixed open-addressed membership table + a power-of-two typed-array ring, all sized once and never grown (strict zero-alloc, proven by t6 Gate S3FIFO); on the default backing the ghost is a `Set` + array ring (amortized, the same caveat as the default `Map` index). The ghost stores KEYS only, never values -- proven by a WeakRef census in the soak tier.
 
 The torture harness (`@zakkster/lite-leak` + `@zakkster/lite-gc-profiler`, under `--expose-gc`) commits the zero-GC posture as GATED numbers -- a regression fails as loudly as a leak:
 
@@ -257,8 +266,9 @@ The literature sells SIEVE on scalability, but that is a multi-core systems argu
 | --------- | ------------------- | ------------ | -------- | ---------------- |
 | `LiteLru` | **0** link writes   | **5** link writes | **4** link writes | intrusive-list relinks |
 | `Sieve`   | **0** link writes   | **0** link writes | **0** link writes | exactly **1** visited byte |
+| `S3Fifo`  | **0** link writes   | **0** link writes | **0** link writes | exactly **1** visited byte |
 
-A `CountedLru` / `CountedSieve` proxy tallies every index store in the torture gate, so these counts are a regression tripwire, not a claim. This is a real but minor corroborator -- it matters most for GC-pause-sensitive realtime and game loops -- and it is never framed as "lock-free" or as a cross-library throughput win.
+A `CountedLru` / `CountedSieve` / `CountedS3Fifo` proxy tallies every index store in the torture gate, so these counts are a regression tripwire, not a claim. This is a real but minor corroborator -- it matters most for GC-pause-sensitive realtime and game loops -- and it is never framed as "lock-free" or as a cross-library throughput win.
 
 </details>
 
@@ -294,7 +304,7 @@ Hit % and % of OPT are deterministic (seeded trace, deterministic policies); `ns
 
 - **Classic LRU is the reference member, not the headline.** LRU pays its relink cost unconditionally (every hit) but earns its benefit conditionally (only at an eviction, only if recency predicts reuse). On a cache sized at or above its working set, or on a predictable pattern, that benefit goes to zero while the cost remains -- so LRU is the honest floor and the differential oracle, and lazy-promotion policies like SIEVE are the members. The bench + OPT let you discover which regime you are in.
 - **One file, named exports -- NOT a subpath per policy.** A single `Lru.js` exports every member; `sideEffects: false` + ESM named imports mean `import { Sieve }` drops `LiteLru`'s body from your bundle. The shared substrate is internal, never a second package. `Bench.mjs` is a separate runnable tool, deliberately NOT a `bin` and NOT a second implementation.
-- **A shared substrate, chosen once at construction.** The keyed index, the SoA slot columns, and the free stack are factored into an internal `SlotStore` both members compose. The backing (default `Map`, or the `keys: 'int'` typed-array index) is chosen once so each hot path is monomorphic -- no per-op branch on backing type.
+- **A shared substrate, chosen once at construction.** The keyed index, the SoA slot columns, and the free stack are factored into an internal `SlotStore` all members compose. The backing (default `Map`, or the `keys: 'int'` typed-array index) is chosen once so each hot path is monomorphic -- no per-op branch on backing type.
 - **Integer keys get a strict-zero-alloc index with no tombstones.** `keys: 'int'` is open-addressed with linear probing and backward-shift deletion, a fixed table (load factor <= 0.75) sized once at construction, never resized. A Fibonacci hash mix (`Math.imul(key, 0x9e3779b1)`) keeps sequential keys from clustering. The accepted domain is validated at the door.
 - **`onEvict` fires LAST and fails closed.** Firing after the cache is fully consistent, plus a reentrancy guard that rejects mutation from within the callback, prevents evict -> put -> evict recursion and mid-surgery corruption. `has`/`peek` stay open inside the callback.
 - **Belady OPT lives strictly offline.** OPT is clairvoyant -- it peers into the future of the trace -- so it can never be a production policy and lives only in `Bench.mjs`. Its practical heap implementation is differential-tested against a brute-force O(N*C) OPT in the torture gate, because every "% of optimal" figure depends on it being exactly right.
@@ -307,7 +317,7 @@ Hit % and % of OPT are deterministic (seeded trace, deterministic policies); `ns
 **143 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
 
 ```bash
-npm test               # 143 node:test cases (both members, laws, boundary, dts drift)
+npm test               # 218 node:test cases (all members, laws, boundary, dts drift)
 npm run test:types     # tsc: the LiteCache<K,V> surface + one-line-swap type-check
 npm run torture        # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + gated numbers
 npm run torture:controls  # the deliberately-broken variants -- every gate must fail
@@ -315,7 +325,7 @@ npm run bench          # per-policy hit ratio + % of Belady OPT + writes/hit
 npm run verify         # test + test:types + torture + controls, the publish gate
 ```
 
-The torture suite runs tiers strictly sequentially: `t0` recency/policy laws, `t1` degenerate keys/values (the D7 undefined-value case included), `t2` adversarial sequences + the conservation invariant, `t5` differential fuzz of both members (on the default AND `keys: 'int'` backings) against independent brute-force oracles, `t6` the zero-alloc gate + the writes-per-hit counter, `t7` a ~4096-cycle soak with a WeakRef reachability census, `t8` the Belady OPT gate (the shipped `beladyOpt` differential-tested against a brute-force OPT, plus the optimality bound `optHits >= memberHits` for both members on every trace), and `t9` the controls -- each gate driven by a deliberately-broken variant that MUST fail, so no gate is decorative. `test/` and `decisions/` never enter the tarball (`npm pack --dry-run` proves it). No gate output is a FAIL.
+The torture suite runs tiers strictly sequentially: `t0` recency/policy laws, `t1` degenerate keys/values (the D7 undefined-value case included), `t2` adversarial sequences + the conservation invariant, `t5` differential fuzz of all members (on the default AND `keys: 'int'` backings) against independent brute-force oracles, `t6` the zero-alloc gate + the writes-per-hit counter, `t7` a ~4096-cycle soak with a WeakRef reachability census, `t8` the Belady OPT gate (the shipped `beladyOpt` differential-tested against a brute-force OPT, plus the optimality bound `optHits >= memberHits` for both members on every trace), and `t9` the controls -- each gate driven by a deliberately-broken variant that MUST fail, so no gate is decorative. `test/` and `decisions/` never enter the tarball (`npm pack --dry-run` proves it). No gate output is a FAIL.
 
 ---
 

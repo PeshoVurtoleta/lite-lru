@@ -47,14 +47,14 @@
  *     throws; a non-integer key in int mode throws; null is not zero.
  *   - ASCII-only source. Single file. Zero runtime deps.
  *
- * This file also ships `Sieve` as a SECOND named export (decisions/0012): the
- * first modern eviction-policy family member, a lazy-promotion FIFO ring over the
- * SAME substrate. It is NOT a separate file -- single main file + sideEffects:false
+ * This file also ships `Sieve` (decisions/0012) and `S3Fifo` (decisions/0013) as
+ * further named exports: modern eviction-policy family members over the SAME
+ * substrate. They are NOT separate files -- single main file + sideEffects:false
  * + named exports already tree-shake away whichever member a caller does not import.
  *
  * Design decisions live in decisions/ (D1..D10 in 0001; the onEvict reentrancy
- * contract in 0002; the substrate D11 in 0011; Sieve/D12 in 0012) and are
- * summarized in ROADMAP.md.
+ * contract in 0002; the substrate D11 in 0011; Sieve/D12 in 0012; S3-FIFO/D13 in
+ * 0013) and are summarized in ROADMAP.md.
  */
 
 /** Shared no-op eviction callback, so a cache without an onEvict handler
@@ -83,7 +83,18 @@ const INT_KEY_MSG =
 const INT_MIN = -2147483648;
 const INT_MAX = 2147483647;
 
-export const VERSION = "1.0.0";
+/** S3-FIFO (decisions/0013) queue tags: which of the two intrusive rings a slot is
+ *  in. Stored one byte per slot in `_q` so `_detach` can fix the RIGHT ring's
+ *  head/tail without a per-slot object. A slot is in exactly one ring at a time. */
+const Q_SMALL = 0;
+const Q_MAIN = 1;
+
+/** SameValueZero key comparison (mirrors JS Map/Set): `===` plus NaN matches NaN,
+ *  and -0 matches +0. Used only on the COLD S3-FIFO ghost-consume scan for the
+ *  default (arbitrary-key) backing, never on a hot path. */
+function sameKey(a, b) { return a === b || (a !== a && b !== b); }
+
+export const VERSION = "1.1.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -740,6 +751,501 @@ export class Sieve {
             if (this._vis[o] === 0) return this._keys[o];
             o = this._prev[o] !== NIL ? this._prev[o] : this._tail;
             if (o === start) return this._keys[start]; // all visited -> start is the victim
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * S3Fifo -- the S3-FIFO admission policy (Yang et al., SOSP'23), 1-bit visited
+ * variant, over the SAME SlotStore substrate (decisions/0013, D13). The third
+ * named export in this file (same file-shape ruling as Sieve: single main file +
+ * sideEffects:false + named exports = the tree-shake moat).
+ *
+ * S3-FIFO is THREE FIFO structures with a per-entry visited bit:
+ *   - SMALL (probation) ring + MAIN ring, both threaded intrusively through the
+ *     shared `_next`/`_prev` columns (two separate rings, each with its own
+ *     head/tail). `_next` toward the tail (older), `_prev` toward the head (newer).
+ *     A slot is in exactly ONE ring (or free); `_q[slot]` tags which (D13).
+ *   - `_vis` Uint8Array: one visited byte per slot (a hit is a single store, the
+ *     Sieve headline -- see decisions/0012's Uint8Array-over-bitpack ruling).
+ *   - GHOST: a keys-only, bounded FIFO of recently small-evicted keys. NEVER stores
+ *     values (retention hygiene, D13). Its job is admission: a key seen again while
+ *     still in ghost is deemed hot and enters MAIN directly, skipping probation.
+ *
+ * Sizing (D13, frozen in the constructor):
+ *   smallCap = max(1, floor(capacity/10));  mainCap = capacity - smallCap;
+ *   ghostCap = mainCap.
+ * Capacity 1 (smallCap 1, mainCap 0, ghostCap 0) degenerates to a 1-bit
+ * second-chance FIFO over SMALL: a visited single entry graduates into a
+ * zero-capacity MAIN and is evicted from there in the same eviction step, so it can
+ * never retain more than one key -- impl and oracle agree on this edge (D13).
+ *
+ * Hot paths (get / put-update / has / peek): a resident hit sets `_vis[s]=1` and
+ * MOVES NOTHING (0 relinks -- the headline). has/peek are visited-NEUTRAL. All
+ * strictly zero-alloc; the int-key ghost is strict-zero too (typed-array ring +
+ * open-addressed membership table, sized once). The default (Map) backing's ghost
+ * is a Set + array ring: honestly AMORTIZED (a Set resize can allocate), the SAME
+ * caveat D3/D11 already state for the Map keyed index.
+ *
+ * Rides the shared `newStore` factory: default Map backing, opt-in `keys:'int'`
+ * strict-zero backing, the same `[lite-lru]`-tagged int-key door, the shared
+ * conservation invariant, and the onEvict fire-after + `_inOnEvict` reentrancy
+ * guard (decisions/0002).
+ * -------------------------------------------------------------------------- */
+
+export class S3Fifo {
+    /**
+     * @param {number} capacity  Max entries. Must be an integer >= 1.
+     * @param {{ onEvict?: (key: any, value: any) => void, keys?: 'int' }} [options]
+     */
+    constructor(capacity, options) {
+        // Fail closed (D9), identical to LiteLru/Sieve.
+        if (!Number.isInteger(capacity) || capacity < 1) {
+            throw new RangeError(
+                "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
+            );
+        }
+
+        this._capacity = capacity;
+
+        // Same shared substrate + int-key door as the rest of the family.
+        this._store = this._makeStore(capacity, options && options.keys);
+
+        // Cache the store's columns so the ring relinks stay direct (and so the
+        // conservation invariant + torture introspection keep working).
+        this._keys = this._store._keys;
+        this._vals = this._store._vals;
+        this._next = this._store._next; // toward the tail (older)
+        this._prev = this._store._prev; // toward the head (newer)
+
+        // D13 -- one visited byte per slot (a hit is a single store, no mask/shift),
+        // and one queue tag per slot so `_detach` fixes the correct ring. Both fixed
+        // size, allocated once, never grown.
+        this._vis = new Uint8Array(capacity);
+        this._q = new Uint8Array(capacity);
+
+        // D13 -- the SMALL/MAIN split. smallCap is at least 1; mainCap/ghostCap are 0
+        // only at capacity 1 (the degenerate second-chance-FIFO edge, documented above).
+        this._smallCap = Math.max(1, Math.floor(capacity / 10));
+        this._mainCap = capacity - this._smallCap;
+        this._ghostCap = this._mainCap;
+
+        this._sHead = NIL; this._sTail = NIL; this._sSize = 0; // SMALL ring
+        this._mHead = NIL; this._mTail = NIL; this._mSize = 0; // MAIN ring
+        this._size = 0;                                        // _sSize + _mSize
+
+        // Ghost backing (D13): int -> strict-zero open-addressed membership table +
+        // a pow2 Int32 FIFO ring (masked indices). default -> a Set membership +
+        // arbitrary-key array ring (amortized: a Set resize can allocate).
+        this._ghostInt = (options && options.keys) === 'int';
+        if (this._ghostCap > 0) {
+            if (this._ghostInt) {
+                const need = Math.ceil(this._ghostCap / 0.75);
+                let gs = 1;
+                while (gs < need) gs <<= 1;
+                this._gixMask = gs - 1;
+                this._gixKey = new Int32Array(gs);
+                this._gixState = new Uint8Array(gs); // 0 = empty, 1 = occupied
+                let rs = 1;
+                while (rs < this._ghostCap) rs <<= 1; // pow2 ring so indices mask
+                this._gRingMask = rs - 1;
+                this._gRing = new Int32Array(rs);
+            } else {
+                this._gSet = new Set();                     // key -> nothing (membership)
+                this._gRingArr = new Array(this._ghostCap).fill(undefined); // FIFO order
+            }
+        }
+        this._gHead = 0; // ring index of the OLDEST ghost key
+        this._gLen = 0;  // live ghost entries (0 .. ghostCap)
+
+        this._onEvict = (options && options.onEvict) || NOOP;
+        this._inOnEvict = false;
+    }
+
+    /** The store factory, delegating to the shared `newStore` (decisions/0011). */
+    _makeStore(capacity, keys) {
+        return newStore(capacity, keys);
+    }
+
+    get size() { return this._size; }
+    get capacity() { return this._capacity; }
+
+    // --- intrusive ring helpers (size accounting lives here) ------------------
+
+    /** Unlink slot s from WHICHEVER ring it is in (per `_q[s]`), fixing that ring's
+     *  neighbours + head/tail sentinels + size. */
+    _detach(s) {
+        const p = this._prev[s];
+        const n = this._next[s];
+        if (this._q[s] === Q_SMALL) {
+            if (p !== NIL) this._next[p] = n; else this._sHead = n;
+            if (n !== NIL) this._prev[n] = p; else this._sTail = p;
+            this._sSize--;
+        } else {
+            if (p !== NIL) this._next[p] = n; else this._mHead = n;
+            if (n !== NIL) this._prev[n] = p; else this._mTail = p;
+            this._mSize--;
+        }
+    }
+
+    /** Insert slot s at the head (newest end) of the SMALL ring. */
+    _pushSmall(s) {
+        this._q[s] = Q_SMALL;
+        this._prev[s] = NIL;
+        this._next[s] = this._sHead;
+        if (this._sHead !== NIL) this._prev[this._sHead] = s;
+        this._sHead = s;
+        if (this._sTail === NIL) this._sTail = s;
+        this._sSize++;
+    }
+
+    /** Insert slot s at the head (newest end) of the MAIN ring. */
+    _pushMain(s) {
+        this._q[s] = Q_MAIN;
+        this._prev[s] = NIL;
+        this._next[s] = this._mHead;
+        if (this._mHead !== NIL) this._prev[this._mHead] = s;
+        this._mHead = s;
+        if (this._mTail === NIL) this._mTail = s;
+        this._mSize++;
+    }
+
+    // --- ghost helpers (keys only, bounded; int path strictly zero-alloc) -----
+
+    /** True if key is a recently-evicted-from-small ghost key (admission -> MAIN). */
+    _ghostHas(key) {
+        if (this._ghostCap === 0) return false;
+        if (this._ghostInt) {
+            const st = this._gixState, ks = this._gixKey, mask = this._gixMask;
+            let b = hashInt(key, mask);
+            for (;;) {
+                if (st[b] === 0) return false;
+                if (ks[b] === key) return true;
+                b = (b + 1) & mask;
+            }
+        }
+        return this._gSet.has(key);
+    }
+
+    /** Record a small-evicted key in the ghost FIFO, evicting the oldest ghost key
+     *  first when full. Zero-alloc on the int path. */
+    _ghostAdd(key) {
+        const cap = this._ghostCap;
+        if (cap === 0) return;
+        if (this._gLen === cap) {
+            // bounded: drop the oldest ghost key (both membership and ring slot).
+            if (this._ghostInt) {
+                this._ghostMemDel(this._gRing[this._gHead]);
+                this._gHead = (this._gHead + 1) & this._gRingMask;
+            } else {
+                const old = this._gRingArr[this._gHead];
+                this._gSet.delete(old);
+                this._gRingArr[this._gHead] = undefined; // drop the key ref
+                this._gHead = (this._gHead + 1) % cap;
+            }
+            this._gLen--;
+        }
+        if (this._ghostInt) {
+            const pos = (this._gHead + this._gLen) & this._gRingMask;
+            this._gRing[pos] = key;
+            this._ghostMemAdd(key);
+        } else {
+            const pos = (this._gHead + this._gLen) % cap;
+            this._gRingArr[pos] = key;
+            this._gSet.add(key);
+        }
+        this._gLen++;
+    }
+
+    /** Remove a key from the ghost (it has just been re-admitted into MAIN). The
+     *  ring shift is COLD -- only when admitting a key that was in ghost, never on
+     *  the sequential-key hot path. */
+    _ghostConsume(key) {
+        const cap = this._ghostCap;
+        if (cap === 0) return;
+        if (this._ghostInt) {
+            const mask = this._gRingMask;
+            let idx = -1;
+            for (let i = 0; i < this._gLen; i++) {
+                if (this._gRing[(this._gHead + i) & mask] === key) { idx = i; break; }
+            }
+            if (idx >= 0) {
+                for (let i = idx; i < this._gLen - 1; i++) {
+                    this._gRing[(this._gHead + i) & mask] = this._gRing[(this._gHead + i + 1) & mask];
+                }
+                this._gLen--;
+            }
+            this._ghostMemDel(key);
+        } else {
+            let idx = -1;
+            for (let i = 0; i < this._gLen; i++) {
+                if (sameKey(this._gRingArr[(this._gHead + i) % cap], key)) { idx = i; break; }
+            }
+            if (idx >= 0) {
+                for (let i = idx; i < this._gLen - 1; i++) {
+                    this._gRingArr[(this._gHead + i) % cap] = this._gRingArr[(this._gHead + i + 1) % cap];
+                }
+                this._gRingArr[(this._gHead + this._gLen - 1) % cap] = undefined;
+                this._gLen--;
+            }
+            this._gSet.delete(key);
+        }
+    }
+
+    /** Int ghost membership insert (open-addressed, no-op if already present). */
+    _ghostMemAdd(key) {
+        const st = this._gixState, ks = this._gixKey, mask = this._gixMask;
+        let b = hashInt(key, mask);
+        for (;;) {
+            if (st[b] === 0) { st[b] = 1; ks[b] = key; return; }
+            if (ks[b] === key) return;
+            b = (b + 1) & mask;
+        }
+    }
+
+    /** Int ghost membership delete (backward-shift, no tombstones -- mirrors
+     *  IntSlotStore.delete over a state byte instead of a slot sentinel). */
+    _ghostMemDel(key) {
+        const st = this._gixState, ks = this._gixKey, mask = this._gixMask;
+        let b = hashInt(key, mask);
+        for (;;) {
+            if (st[b] === 0) return;
+            if (ks[b] === key) break;
+            b = (b + 1) & mask;
+        }
+        let i = b, j = b;
+        for (;;) {
+            j = (j + 1) & mask;
+            if (st[j] === 0) break;
+            const k = hashInt(ks[j], mask);
+            const inRange = (j > i) ? (i < k && k <= j) : (i < k || k <= j);
+            if (inRange) continue;
+            st[i] = 1; ks[i] = ks[j];
+            i = j;
+        }
+        st[i] = 0;
+    }
+
+    // --- the eviction sweep (D13) ---------------------------------------------
+
+    /**
+     * Free exactly ONE slot and return it for reuse. Graduations (visited SMALL ->
+     * MAIN) and second chances (visited MAIN -> MAIN head) free no slot, so the loop
+     * keeps stepping until a slot is actually evicted. Only ever called at capacity,
+     * where SMALL is non-empty whenever `_sSize >= smallCap` and MAIN is non-empty
+     * whenever `_sSize < smallCap` -- so neither branch reads an empty ring here.
+     */
+    _evict() {
+        const vis = this._vis;
+        for (;;) {
+            if (this._sSize >= this._smallCap) {
+                const t = this._sTail; // SMALL oldest
+                if (vis[t] === 1) {    // proven -> graduate to MAIN (may exceed mainCap;
+                    vis[t] = 0;        // a later step reclaims it -- D13)
+                    this._detach(t);
+                    this._pushMain(t);
+                    continue;
+                }
+                const k = this._keys[t]; // unproven -> evict in place, remember in ghost
+                this._detach(t);
+                this._store.delete(k);
+                this._ghostAdd(k);
+                return t;
+            }
+            const t = this._mTail; // MAIN oldest
+            if (vis[t] === 1) {    // second chance -> clear + reinsert at MAIN head
+                vis[t] = 0;
+                this._detach(t);
+                this._pushMain(t);
+                continue;
+            }
+            const k = this._keys[t]; // evict in place (MAIN evictions are NOT ghosted)
+            this._detach(t);
+            this._store.delete(k);
+            return t;
+        }
+    }
+
+    // --- public API (all zero-alloc on the hot path) --------------------------
+
+    /**
+     * Look up a key AND mark it visited. Like Sieve this does NOTHING structural --
+     * one `_vis` store, no relink, no queue move (the headline). @returns the value,
+     * or undefined if absent (see D7).
+     */
+    get(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        this._vis[s] = 1; // the whole hot path: a single byte store
+        return this._vals[s];
+    }
+
+    /**
+     * Insert or update. An update rewrites the value and sets visited (a write ->
+     * matches a hit). A new key at capacity runs one eviction step, then is admitted:
+     * to MAIN if it was in ghost (proven-hot on a second sighting), else to SMALL
+     * (probation). New entries start UNVISITED. onEvict fires LAST (decisions/0002).
+     */
+    put(key, value) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const existing = store.get(key);
+        if (existing >= 0) {                 // update-in-place + mark visited
+            this._vals[existing] = value;
+            this._vis[existing] = 1;
+            return;
+        }
+
+        // Admission decision uses the ghost state AT ARRIVAL (before this eviction's
+        // own ghost write), so an eviction that happens to bump this key from ghost
+        // cannot flip the decision -- keeps impl and oracle in lockstep (D13).
+        const toMain = this._ghostHas(key);
+        if (toMain) this._ghostConsume(key);
+
+        let s, evKey, evVal;
+        let evicted = false;
+        if (this._size === this._capacity) {
+            s = this._evict();          // frees exactly one slot (reused in place, D6)
+            evKey = this._keys[s];
+            evVal = this._vals[s];
+            evicted = true;
+        } else {
+            s = store.allocSlot();
+        }
+
+        this._keys[s] = key;
+        this._vals[s] = value;
+        this._vis[s] = 0;               // a newcomer starts UNVISITED
+        store.set(key, s);
+        if (toMain) this._pushMain(s); else this._pushSmall(s);
+        this._size = this._sSize + this._mSize;
+
+        // Fire onEvict LAST, cache fully consistent (decisions/0002).
+        if (evicted) {
+            this._inOnEvict = true;
+            try {
+                this._onEvict(evKey, evVal);
+            } finally {
+                this._inOnEvict = false;
+            }
+        }
+    }
+
+    /** True if key is present (RESIDENT). Visited-NEUTRAL; ghost keys are NOT present. */
+    has(key) { return this._store.has(key); }
+
+    /** Read a value WITHOUT setting visited. undefined if absent (see D7). */
+    peek(key) {
+        const s = this._store.get(key);
+        return s < 0 ? undefined : this._vals[s];
+    }
+
+    /**
+     * Remove a key. Returns true if it was present. Frees the slot, zeroes its
+     * visited byte, repairs the ring it was in. An explicit delete is NOT an
+     * eviction, so it is never recorded in ghost.
+     */
+    delete(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const s = store.get(key);
+        if (s < 0) return false;
+        this._detach(s);
+        store.delete(key);
+        this._vis[s] = 0;
+        store.freeSlot(s);
+        this._size = this._sSize + this._mSize;
+        return true;
+    }
+
+    /** Empty the cache. Rebuilds the free list, zeroes visited, empties both rings
+     *  and the ghost. Allocates nothing. O(capacity). */
+    clear() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store.reset();
+        this._vis.fill(0);
+        this._sHead = NIL; this._sTail = NIL; this._sSize = 0;
+        this._mHead = NIL; this._mTail = NIL; this._mSize = 0;
+        this._size = 0;
+        if (this._ghostCap > 0) {
+            if (this._ghostInt) this._gixState.fill(0);
+            else { this._gSet.clear(); this._gRingArr.fill(undefined); }
+        }
+        this._gHead = 0;
+        this._gLen = 0;
+    }
+
+    // --- test/debug only (never call on a hot path) ---------------------------
+
+    /** Free-stack length, delegated to the store (conservation invariant). */
+    _freeListLength() {
+        return this._store.freeListLength();
+    }
+
+    /**
+     * The key the NEXT over-capacity insert would evict, computed WITHOUT mutating
+     * any bit, link, size or ghost. It replays the exact `_evict` sweep on CLONES of
+     * the four mutable columns + ring endpoints, so it can never drift from the real
+     * eviction (same code shape). This is TEST-ONLY (drives the torture differential)
+     * and NOT a hot path, so the clones are allowed. It also covers the below-capacity
+     * "main empty" case (a Sieve-like second chance within SMALL) that `_evict` itself
+     * never reaches, since `_evict` runs only at capacity.
+     *
+     * GUARD (reviewer nit, S5): this method is wired SOLELY through the differential
+     * harness's `victim()` twin (test/torture/harness.mjs `wrapS3Fifo`) and the
+     * boundary suite's oracle cross-check -- never from `get`/`put`/`has`/`peek`/
+     * `delete`/`clear`/`_evict`. It MAY allocate (it slices four ring columns on
+     * every call) precisely because it is never a measured or hot path; keep it that
+     * way -- if a future change ever calls `_peekVictim` from inside `_evict` or any
+     * public method, the t6 zero-alloc gates (decisions/0013, D3/D11) must catch it.
+     */
+    _peekVictim() {
+        if (this._size === 0) return undefined;
+        const next = this._next.slice();
+        const prev = this._prev.slice();
+        const q = this._q.slice();
+        const vis = this._vis.slice();
+        const keys = this._keys;
+        const smallCap = this._smallCap;
+        let sHead = this._sHead, sTail = this._sTail, sSize = this._sSize;
+        let mHead = this._mHead, mTail = this._mTail, mSize = this._mSize;
+        const detach = (s) => {
+            const p = prev[s], n = next[s];
+            if (q[s] === Q_SMALL) {
+                if (p !== NIL) next[p] = n; else sHead = n;
+                if (n !== NIL) prev[n] = p; else sTail = p;
+                sSize--;
+            } else {
+                if (p !== NIL) next[p] = n; else mHead = n;
+                if (n !== NIL) prev[n] = p; else mTail = p;
+                mSize--;
+            }
+        };
+        const pushSmall = (s) => {
+            q[s] = Q_SMALL; prev[s] = NIL; next[s] = sHead;
+            if (sHead !== NIL) prev[sHead] = s;
+            sHead = s; if (sTail === NIL) sTail = s; sSize++;
+        };
+        const pushMain = (s) => {
+            q[s] = Q_MAIN; prev[s] = NIL; next[s] = mHead;
+            if (mHead !== NIL) prev[mHead] = s;
+            mHead = s; if (mTail === NIL) mTail = s; mSize++;
+        };
+        for (;;) {
+            if (sSize >= smallCap) {
+                const t = sTail;
+                if (vis[t] === 1) { vis[t] = 0; detach(t); pushMain(t); continue; }
+                return keys[t];
+            } else if (mSize > 0) {
+                const t = mTail;
+                if (vis[t] === 1) { vis[t] = 0; detach(t); pushMain(t); continue; }
+                return keys[t];
+            } else {
+                const t = sTail; // main empty (only reachable below capacity)
+                if (vis[t] === 1) { vis[t] = 0; detach(t); pushSmall(t); continue; }
+                return keys[t];
+            }
         }
     }
 }
