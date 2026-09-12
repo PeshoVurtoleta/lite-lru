@@ -27,6 +27,18 @@ is the combination this suite is uniquely positioned to ship:
    zero-alloc gate**, so every member is trustworthy equally and a caller
    benchmarks them on their OWN trace with the same harness.
 
+**Against the incumbents (DEBATE item 10).** `lru-cache` (isaacs) is ALREADY
+typed-array-backed (Map + preallocated Uint link columns + free list) and
+feature-maximal (TTL, size-aware, async fetch, dispose) -- so "we are the zero-GC
+LRU" is FALSE against it and must never be the pitch. `quick-lru` is tiny but a
+single naive Map-swap policy. The moat is what neither can copy: (1) a FAMILY of
+policies behind one swappable interface, (2) tree-shake to ONE sub-KB policy
+(`import { Sieve }`) for edge/serverless/browser/game budgets, and (3) the shared
+harness SHIPPED as a user-facing tool -- replay YOUR trace, get hit-ratio +
+writes-per-hit + alloc per policy. That measurement tool is the KILLER feature and
+the README lead; the "fewer writes per hit" edge is a real but MINOR corroborator,
+never "lock-free" (item 2).
+
 Two structural consequences follow, and they reorder the whole plan:
 
 - **Classic LRU is demoted from headline to reference member + differential
@@ -42,10 +54,13 @@ Open questions and the points where I diverge from the originating analysis are 
 `DEBATE.md` item 1 (does the family REPLACE or EXTEND the v1.0.0 plan) is now
 RESOLVED = REPLACE (B), confirmed at S1 -- everything below is on the live path.
 
-**State.** v0.1.0 ships the classic core: `Lru.js` (Map + intrusive preallocated
-DLL), `package.json`, `LICENSE`, `decisions/0001-structure.md`. Core semantics are
-smoke-verified. Everything else -- the node:test suite, the torture harness, the
-substrate, every modern strategy, the docs -- is ahead.
+**State.** Committed: the classic core `Lru.js` (Map + intrusive preallocated DLL,
+onEvict reentrancy-hardened 0002), the S1 node:test + torture harness + parameterized
+oracle, and (staged) the S2 `Lru.d.ts` + `LiteCache<K,V>` interface + dts-drift gate
++ tsc type-test. VERSION still 0.1.0 (moves at /release). Ahead: the substrate (S3),
+every modern strategy (S4-S8), the cross-cutting features (S10-S12), and the docs +
+shipped bench tool (S9). Deep research reference: `RESEARCH.md` (Belady OPT,
+LiteMGLRU, meta-policy; distilled into DEBATE items 13-15).
 
 | Piece | State |
 | --- | --- |
@@ -61,8 +76,15 @@ substrate, every modern strategy, the docs -- is ahead.
 | W-TinyLFU | S6 |
 | 2Q / SLRU | S7 |
 | ARC (flagged -- stresses the fixed-capacity law) | S8 |
-| README + llms.txt + CHANGELOG | S9 (parallel from S2) |
-| CLOCK, LRU-K, LIRS/ClockPro, LFU, size-aware | `DEBATE.md` (deferred) |
+| README + llms.txt + CHANGELOG + shipped benchmark/trace-replay tool | S9 (parallel from S2) |
+| zero-GC TTL (opt-in expiry column) -- cross-cutting | S10 |
+| zero-GC iteration (keys/entries/values, recency order) -- cross-cutting | S11 |
+| opt-in stats (hit/miss/evict/writes-per-hit) -- cross-cutting | S12 |
+| snapshot / restore (dump/load; SoA columns are the serial form) | later/maybe (DEBATE 11) |
+| LRU-K, LIRS/ClockPro, LFU, MQ/CAR | `DEBATE.md` item 4 (deferred) |
+| CLOCK/ClockPro (out of family), async fetch (-> `lite-lru-fetch`), size-aware (-> `lite-cache-budget`) | `DEBATE.md` items 6/8/11 (out of core) |
+| Belady OPT reference (offline harness normalization) | S9 bench tool (DEBATE 13) |
+| LiteMGLRU (userspace Multi-Gen LRU) + self-measuring meta-policy | v2 research (DEBATE 14, RESEARCH.md) |
 
 ---
 
@@ -134,10 +156,15 @@ with SIEVE), **LRU-K** (K timestamps/key, dominated by SIEVE/S3-FIFO here),
 **LFU/Heap-LFU** (O(log n) hot path; W-TinyLFU captures frequency at O(1)),
 **size/cost-aware** (a different capacity model -- a v2 track, not a member).
 
-**Release framing.** v1.0.0 = classic + substrate + harness + **SIEVE** (a
-differentiated, shippable family, not a bare LRU). Each further member is an
-additive minor -> v1.x. ARC and the deferred set only land on a real request or a
-trace that justifies them.
+**Release framing.** v1.0.0 = classic + substrate + **SIEVE** + the **shipped
+benchmark/trace-replay tool** + docs (a differentiated, measurable family, not a
+bare LRU). Each further member is an additive minor -> v1.x. The cross-cutting
+FEATURE axis (DEBATE item 11) -- zero-GC TTL (S10), zero-GC iteration (S11),
+opt-in stats (S12) -- lands as v1.x minors AFTER the substrate so every member
+inherits it; TTL is table-stakes and should land early in the v1.x train. ARC and
+the deferred set only land on a real request or a trace that justifies them.
+async-fetch, size-aware, and CLOCK are out of the core (separate packages /
+on-demand -- DEBATE items 6/8/11).
 
 ---
 
@@ -247,19 +274,23 @@ grows. If a control passes, the gate is decorative.
 ## 5. Session order
 
 ```
-S0 (done) --> S1 --> S2 --> S3 (substrate/keystone) --> S4 (SIEVE) --> S5 --> S6
-                      \--> S9 (docs, parallel)                 |         |     |
+S0 (done) --> S1 (done) --> S2 --> S3 (substrate/keystone) --> S4 (SIEVE) --> S5 --> S6
+                            \--> S9 (docs + shipped bench tool, parallel)  |    |     |
                                                           [v1.0.0 gate here: S4]
 S7 (2Q/SLRU) and S8 (ARC) are additive minors after S6.
+Cross-cutting FEATURE axis (after S3, inherited by all members): S10 TTL, S11
+zero-GC iteration, S12 stats -- v1.x minors; TTL lands early in the train.
 ```
 
-S1 (tests + torture + oracle) blocks everything -- do not build members on an
-unproven harness. **S3 (the shared keyed-index substrate) is the keystone**: it
-removes the Map allocation frontier and gives every later member a strictly
-zero-GC keyed index for free. S4 (SIEVE) is the first member built ON the
-substrate and proves the oracle is parameterizable. v1.0.0 releases at S4 -- a
-family with a floor + a modern headline, not a bare LRU. S5/S6 add the rest of the
-headline trio; S7/S8 fill out the map; S9 (docs) runs parallel from S2.
+S1 (tests + torture + oracle) blocks everything and is DONE (gated green;
+onEvict-reentrancy defect found + fixed, 0002). **S3 (the shared keyed-index
+substrate) is the keystone**: it removes the Map allocation frontier and gives
+every later member a strictly zero-GC keyed index for free. S4 (SIEVE) is the first
+member built ON the substrate and proves the oracle is parameterizable. v1.0.0
+releases at S4 -- a family with a floor + a modern headline + the shipped
+measurement tool, not a bare LRU. S5/S6 add the rest of the headline trio; S7/S8
+fill out the map; S9 (docs + promoting the S1 harness to a user-facing bench tool)
+runs parallel from S2; S10-S12 add the feature axis once the substrate exists.
 
 ---
 
@@ -435,6 +466,9 @@ THE DECISION (record in decisions/0012-sieve.md BEFORE coding)
   mask/shift per access). Recommendation: `Uint8Array` first (monomorphic, the
   byte is in a hot body); measure, and only bit-pack if T6 shows the density
   matters. Record the choice and the measured writes-per-hit vs classic LRU.
+  If bit-packing is adopted it is INLINED into Lru.js (mask/shift) -- NOT a
+  dependency on `@zakkster/lite-fastbit32` or any package, which would break the
+  suite's zero-runtime-deps law (DEBATE item 15).
 TASKS
   - `Sieve` as a named export composing the substrate; the uniform `LiteCache`
     surface (law 6); `onEvict`.
@@ -594,20 +628,114 @@ TASKS / ASSERTIONS / DONE WHEN
   phase-change law.
 
 ===============================================================================
-# S9 -- v0.x.. -- README + llms.txt + CHANGELOG (parallel from S2)
+# S9 -- v0.x.. -- README + llms.txt + CHANGELOG + shipped bench tool (parallel from S2)
 ===============================================================================
 ```markdown
 status: planned
 depends_on: [S1]
 ```
 README modeled on `../LiteSepforge/README.md` (the suite blueprint spine, in
-order). The positioning H2 is the family: "the LRU family the ecosystem was
-missing" -- a workload-map table (which member for which trace), the uniform
-one-line-swap API, the shared-oracle trust story, and the honest
-"fewer-writes-per-hit, NOT lock-free" framing (DEBATE item 2). llms.txt mirrors it.
-CHANGELOG from S0. ASCII-only; grep new files for stray tool-call tags. Add README
-+ llms.txt to `files[]`. Grows one section per member as S4-S8 land; the release
-gate for each minor updates it.
+order). The positioning H2 is the family AND the measurement tool: lead with "stop
+guessing your eviction policy -- measure it on your trace" (DEBATE item 10), then a
+workload-map table (which member for which trace), the uniform one-line-swap API,
+the tree-shake-to-one-tiny-policy size story, and the honest "fewer-writes-per-hit,
+NOT lock-free" framing (item 2). An explicit "vs lru-cache / quick-lru" section:
+what we deliberately do NOT do (TTL parity race, async fetch, size-aware) and why,
+with landing spots. llms.txt mirrors it. CHANGELOG from S0.
+
+SHIP THE HARNESS AS A TOOL (item 10, the killer feature): promote the S1
+parameterized oracle/replay harness to a documented, user-facing entry -- feed it a
+trace, get per-policy hit-ratio + writes-per-hit + alloc, oracle-checked. This is
+the thing neither incumbent offers; it is part of the v1.0.0 story. Keep it out of
+the runtime `files[]` hot path if it pulls dev peers; expose it as a documented
+script / small entry per the suite's bench precedent (lite-binary-reader).
+
+BELADY OPT as the absolute reference (DEBATE item 13, RESEARCH.md sec 2): the bench
+tool reports each policy's hit-ratio AND the clairvoyant offline optimum (evict the
+entry whose next use is farthest), so a caller sees "% of optimal" and "extra misses
+vs OPT", not a bare percentage. OPT lives STRICTLY in the offline harness, NEVER a
+production policy. Impl: reverse-scan next-use + lazy-deletion max-heap with
+amortized rebuild (RESEARCH.md carries a working version). GATE (non-negotiable):
+differential-test the OPT impl against a brute-force O(N*C) OPT on small seeded
+traces -- every "% of optimal" claim depends on it being exactly right (item 9).
+
+ASCII-only; grep new files for stray tool-call tags. Add README + llms.txt to
+`files[]` (and Lru.d.ts from S2). Grows one section per member as S4-S8 land, and
+one per feature as S10-S12 land; the release gate for each minor updates it.
+
+===============================================================================
+# S10 -- v1.x -- zero-GC TTL (opt-in expiry column) [cross-cutting]
+===============================================================================
+```markdown
+status: planned
+gc_maxMajor: 0
+gc_maxPauseMs: 4
+alloc_bytes_per_op: 0
+depends_on: [S3]
+decisions: [D17]
+```
+PURPOSE
+  The one table-stakes feature vs the incumbents (DEBATE item 11). An opt-in
+  per-instance `ttl` adds a `Float64Array` (or Uint32 ms) EXPIRY column to the SoA
+  slot layout, allocated ONLY when ttl is used (pay-for-what-you-use, tree-shakeable
+  -- a cache without ttl carries zero extra bytes and zero extra branches proven by
+  T6). Expiry is checked LAZILY on get/peek/has (expired -> treated as a miss and
+  evicted in place); no timers, no background sweep on the hot path. Optional
+  `purgeStale()` is a cold bulk op.
+THE DECISION (decisions/0017-ttl.md)
+  Column width + clock source (ms epoch vs monotonic), lazy-only vs optional sweep,
+  and whether ttl is per-instance only or also per-entry. Recommend: Float64 ms
+  expiry, lazy-only on the hot path, per-instance default with optional per-put
+  override. Record how a stale hit interacts with each member's policy (a stale get
+  is a miss for recency/admission purposes).
+ASSERTIONS
+  ttl-off path byte-identical to pre-S10 (T6 zero-alloc, no new hot branch when
+  unused); a stale entry reads as a miss and frees its slot; strict-zero T6 with ttl
+  on; oracle extended with a virtual clock; control (a ttl that never expires) fails.
+
+===============================================================================
+# S11 -- v1.x -- zero-GC iteration (keys / entries / values) [cross-cutting]
+===============================================================================
+```markdown
+status: planned
+gc_maxMajor: 0
+alloc_bytes_per_op: 0
+depends_on: [S3]
+decisions: [D18]
+```
+PURPOSE
+  Iterate the cache in recency order (MRU..LRU) with ZERO per-step allocation,
+  reusing the hand-written-iterator + borrowed-tuple pattern from
+  lite-binary-reader S12 (a generator allocates an IteratorResult per yield -- the
+  trap). lru-cache's iterators allocate; ours will not. `keys()`, `values()`,
+  `entries()`, and `[Symbol.iterator]`; the yielded entry pair is BORROWED and
+  reused -- documented (copy what you keep; `Array.from(cache)` materializes).
+ASSERTIONS
+  0 B/op per step (torture gate, generator control for teeth); recency-order
+  correct vs the oracle; iteration does NOT change recency (a read-only walk);
+  break-early safe; borrowed-tuple aliasing pinned.
+
+===============================================================================
+# S12 -- v1.x -- opt-in stats (hit / miss / evict / writes-per-hit) [cross-cutting]
+===============================================================================
+```markdown
+status: planned
+gc_maxMajor: 0
+alloc_bytes_per_op: 0
+depends_on: [S1]
+decisions: [D19]
+```
+PURPOSE
+  Opt-in integer counters (hit, miss, eviction, and the writes-per-hit already
+  measured in S1) exposed via a `stats()` snapshot. Off by default; when on, pure
+  integer increments -- zero allocation, no hot-path branch when off. Feeds the
+  "measure your policy" identity (DEBATE items 10/11); no incumbent gives hit-ratio
+  out of the box. `stats()` returns a reused frozen view or plain numbers (no
+  per-call object churn on a hot path -- cold accessor only).
+ASSERTIONS
+  stats-off byte-identical to pre-S12 (T6); counters exact vs a brute tally over the
+  T5 corpus; strict-zero T6 with stats on; control (a counter that double-counts)
+  diverges from the tally.
 
 ---
 
@@ -623,6 +751,17 @@ gate for each minor updates it.
 | D14 | W-TinyLFU (fixed CM sketch + SLRU admission + bulk reset) | 0014 (S6) |
 | D15 | 2Q / SLRU (probation/protected split; one member or two) | 0015 (S7) |
 | D16 | ARC (ghost metadata + adaptive `p`; fixed-capacity honesty) | 0016 (S8) |
+| D17 | zero-GC TTL (opt-in expiry column; lazy check) | 0017 (S10) |
+| D18 | zero-GC iteration (borrowed-tuple hand-written iterator) | 0018 (S11) |
+| D19 | opt-in stats (integer counters; off by default) | 0019 (S12) |
+| D20 | Belady OPT reference in the bench tool (offline only; brute-force correctness gate) | 0020 (S9) |
+| (law) | bit-packing (if any) INLINED, never a `lite-fastbit32`/package runtime dep (item 15) | 0012 (S4) |
 
-Deferred members (CLOCK, LRU-K, LIRS/ClockPro, LFU, size-aware) get a decision
-record only if `DEBATE.md` promotes them.
+Deferred / out-of-core (get a decision record only if `DEBATE.md` promotes them):
+LRU-K, LIRS/ClockPro, LFU, MQ/CAR (deferred members, item 4); CLOCK/ClockPro (out
+of family -> on-demand standalone, item 6); async fetch (-> `lite-lru-fetch`, item
+11); size/cost-aware (-> `lite-cache-budget`, item 8); SharedArrayBuffer/cross-
+worker (future separate package, item 11); snapshot/restore (later, item 11).
+FIFO-reinsertion / lazy-promotion is a PRINCIPLE embodied by SIEVE/S3-FIFO, not a
+member (item 12). V2 EXPERIMENTAL research (item 14, RESEARCH.md): LiteMGLRU
+(userspace Multi-Gen LRU) and the self-measuring meta-policy.

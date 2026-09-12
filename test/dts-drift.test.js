@@ -1,0 +1,170 @@
+/**
+ * @zakkster/lite-lru -- .d.ts drift guard (node:test).
+ *
+ * Shipping a hand-written ambient .d.ts earns its keep only if a gate proves it
+ * never drifts from the runtime. This suite reads the file TEXT of Lru.js,
+ * Lru.d.ts and package.json (never imports them) and asserts THREE inventories
+ * agree, each DERIVED by regex, never hardcoded:
+ *
+ *   (a) version parity : the VERSION literal in Lru.js EQUALS the version in
+ *       package.json; and Lru.d.ts DECLARES `VERSION`.
+ *   (b) member parity  : the public (non-`_`) methods of `class LiteLru` in
+ *       Lru.js (get/put/has/peek/delete/clear + get size/get capacity) EQUAL the
+ *       members declared on `class LiteLru` in Lru.d.ts.
+ *   (c) family surface : Lru.d.ts defines `interface LiteCache` AND declares
+ *       `class LiteLru<...> implements LiteCache<...>` -- moat-pillar 1, the
+ *       uniform interface every future member satisfies.
+ *
+ * Each check is a PURE function over text, so the same function proves teeth: the
+ * mutation controls feed it a mutated COPY and assert it now reports a diff / a
+ * false. A vacuity control asserts the unmutated text reports zero diffs.
+ */
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+const ROOT = new URL('../', import.meta.url);
+const JS = readFileSync(new URL('Lru.js', ROOT), 'utf8');
+const DTS = readFileSync(new URL('Lru.d.ts', ROOT), 'utf8');
+const PKG = readFileSync(new URL('package.json', ROOT), 'utf8');
+
+// JS statement keywords that can start a line as `keyword (` inside a class body
+// (control flow), so the member extractor must not mistake them for methods.
+// `delete` is deliberately ABSENT: it is a real public method name here and only
+// ever appears at line-start as its own definition.
+const KEYWORDS = new Set([
+  'if', 'for', 'while', 'switch', 'catch', 'do', 'else', 'return', 'try',
+  'super', 'function', 'typeof', 'new', 'void', 'yield', 'await',
+]);
+
+// --- pure extractors (text in, Set/string out) ------------------------------
+
+/** VERSION string literal in Lru.js. */
+function jsVersion(jsText) {
+  const m = /export const VERSION\s*=\s*"([^"]+)"/.exec(jsText);
+  assert.ok(m, 'Lru.js has no `export const VERSION = "..."` literal');
+  return m[1];
+}
+
+/** version field in package.json. */
+function pkgVersion(pkgText) {
+  const m = /"version":\s*"([^"]+)"/.exec(pkgText);
+  assert.ok(m, 'package.json has no version field');
+  return m[1];
+}
+
+/** True if the d.ts DECLARES a `VERSION` export. */
+function dtsDeclaresVersion(dtsText) {
+  return /export const VERSION\b/.test(dtsText);
+}
+
+/** Public (non-`_`) member names declared on a `class Name` body in text. The
+ *  `[A-Za-z]` anchor drops every `_`-prefixed internal; KEYWORDS drops the
+ *  control-flow tokens the source body carries but the bodiless d.ts does not. */
+function classMembers(text, name) {
+  const decl = new RegExp('class ' + name + '\\b');
+  const m0 = decl.exec(text);
+  if (m0 === null) return new Set();
+  const start = m0.index;
+  const open = text.indexOf('{', start);
+  let depth = 0;
+  let i = open;
+  for (; i < text.length; i++) {
+    if (text[i] === '{') depth++;
+    else if (text[i] === '}') { depth--; if (depth === 0) break; }
+  }
+  const body = text.slice(open + 1, i);
+  const out = new Set();
+  const re = /(?:^|\n)\s*(?:static\s+)?(?:get\s+)?([A-Za-z]\w*)\s*\(/g;
+  let m;
+  while ((m = re.exec(body)) !== null) {
+    const nm = m[1];
+    if (nm === 'constructor' || KEYWORDS.has(nm)) continue;
+    out.add(nm);
+  }
+  return out;
+}
+
+/** True if the d.ts declares `interface LiteCache<...>`. */
+function hasLiteCacheInterface(dtsText) {
+  return /interface LiteCache</.test(dtsText);
+}
+
+/** True if the d.ts declares `class LiteLru<...> implements LiteCache<...>`. */
+function liteLruImplementsLiteCache(dtsText) {
+  return /class LiteLru<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
+}
+
+/** Symmetric-difference report between two sets: [] when equal. */
+function setDiff(a, b, labelA, labelB) {
+  const diffs = [];
+  for (const x of a) if (!b.has(x)) diffs.push(labelA + ' has ' + x + ' but ' + labelB + ' does not');
+  for (const x of b) if (!a.has(x)) diffs.push(labelB + ' has ' + x + ' but ' + labelA + ' does not');
+  return diffs;
+}
+
+// --- the three inventories --------------------------------------------------
+
+test('(a) version parity: Lru.js VERSION === package.json version + d.ts declares VERSION', () => {
+  assert.equal(jsVersion(JS), pkgVersion(PKG));
+  assert.ok(dtsDeclaresVersion(DTS), 'Lru.d.ts must declare `export const VERSION`');
+});
+
+test('(b) member parity: public class methods in Lru.js === members on class LiteLru in Lru.d.ts', () => {
+  const js = classMembers(JS, 'LiteLru');
+  const dts = classMembers(DTS, 'LiteLru');
+  const diffs = setDiff(js, dts, 'Lru.js', 'Lru.d.ts');
+  assert.deepEqual(diffs, [], diffs.join('; '));
+  // the full public surface, pinned by name (regex-derived above, listed here as
+  // the intended inventory so a silent add/drop on BOTH sides is still caught).
+  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'size', 'capacity']) {
+    assert.ok(js.has(nm), 'Lru.js class LiteLru is missing public member ' + nm);
+    assert.ok(dts.has(nm), 'Lru.d.ts class LiteLru is missing member ' + nm);
+  }
+  assert.equal(js.size, 8, 'expected exactly 8 public members in Lru.js, saw ' + js.size);
+  assert.equal(dts.size, 8, 'expected exactly 8 members in Lru.d.ts, saw ' + dts.size);
+});
+
+test('(c) family surface: interface LiteCache + class LiteLru implements LiteCache (moat-pillar 1)', () => {
+  assert.ok(hasLiteCacheInterface(DTS), 'Lru.d.ts must define `interface LiteCache<...>`');
+  assert.ok(liteLruImplementsLiteCache(DTS), 'class LiteLru must `implements LiteCache<...>`');
+});
+
+// --- teeth: each check must reject a mutated COPY (non-vacuity) --------------
+
+test('control: unmutated text reports zero diffs / all-present (vacuity)', () => {
+  assert.equal(jsVersion(JS), pkgVersion(PKG));
+  assert.ok(dtsDeclaresVersion(DTS));
+  assert.deepEqual(setDiff(classMembers(JS, 'LiteLru'), classMembers(DTS, 'LiteLru'), 'a', 'b'), []);
+  assert.ok(hasLiteCacheInterface(DTS));
+  assert.ok(liteLruImplementsLiteCache(DTS));
+});
+
+test('control: desyncing the package.json version makes version parity fail', () => {
+  const mutated = PKG.replace(/"version":\s*"[^"]+"/, '"version": "9.9.9"');
+  assert.notEqual(jsVersion(JS), pkgVersion(mutated));
+});
+
+test('control: dropping the VERSION declaration from the d.ts fails the version check', () => {
+  const mutated = DTS.replace(/export const VERSION\b[^\n]*\n/, '');
+  assert.ok(!dtsDeclaresVersion(mutated), 'removing VERSION from the d.ts did not fail the check');
+});
+
+test('control: dropping a method from the d.ts class makes member parity fail', () => {
+  // `peek(...)` is declared in BOTH the interface and the class; strip every copy
+  // (global) so the class body loses it and member parity must then diverge.
+  const mutated = DTS.replace(/\n\s*peek\(key: K\): V \| undefined;/g, '');
+  const diffs = setDiff(classMembers(JS, 'LiteLru'), classMembers(mutated, 'LiteLru'), 'Lru.js', 'Lru.d.ts');
+  assert.ok(diffs.length > 0, 'dropping peek() from the d.ts did not fail member parity');
+});
+
+test('control: breaking the implements clause fails the family-surface check', () => {
+  const mutated = DTS.replace(/class LiteLru<[^>]*>\s+implements LiteCache<[^>]*>/, 'class LiteLru<K = unknown, V = unknown>');
+  assert.ok(!liteLruImplementsLiteCache(mutated), 'de-implementing LiteCache did not fail the surface check');
+});
+
+test('control: dropping the LiteCache interface fails the family-surface check', () => {
+  const mutated = DTS.replace(/interface LiteCache</, 'interface NotACache<');
+  assert.ok(!hasLiteCacheInterface(mutated), 'renaming the LiteCache interface did not fail the surface check');
+});

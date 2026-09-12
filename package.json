@@ -25,9 +25,10 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
+    "test:types": "tsc -p test/types/tsconfig.json",
     "torture": "node --expose-gc test/torture.mjs",
     "torture:controls": "node test/controls.mjs",
-    "verify": "npm test && npm run torture && npm run torture:controls"
+    "verify": "npm test && npm run test:types && npm run torture && npm run torture:controls"
   },
   "keywords": [
     "lru",
@@ -63,7 +64,8 @@
   },
   "devDependencies": {
     "@zakkster/lite-gc-profiler": "^1.16.0",
-    "@zakkster/lite-leak": "^1.10.0"
+    "@zakkster/lite-leak": "^1.10.0",
+    "typescript": "^7.0.2"
   },
   "engines": {
     "node": ">=18"

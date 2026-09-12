@@ -151,6 +151,10 @@ the web traces and is barely more code. CLOCK earns a slot only as the
 SIEVE lineage explicitly. If you do, I add it as a small member between classic
 and SIEVE; if not, it stays out. Your call -- this one is close.
 
+**RESOLVED: OUT of the family.** Maintainer confirmed. CLOCK (and ClockPro) are
+too close to SIEVE to earn a family slot; if ever wanted they ship on-demand as a
+standalone module, not as a member here.
+
 ---
 
 ## 7. Packaging under the single-file law -- NO subpath-per-strategy
@@ -197,11 +201,129 @@ we have run them on a trace in-repo. A benchmarked lie is worse than no benchmar
 
 ---
 
+## 10. The incumbents, and why zero-GC alone is NOT the moat (RESOLVED)
+
+Maintainer research surfaced the two dominant packages; this pins the honest
+competitive read so the pitch never overclaims.
+
+- **`lru-cache` (isaacs), the gorilla.** v7+ is ALREADY typed-array-backed: a
+  `Map` keyMap + preallocated Uint `keyList`/`valList`/`next`/`prev` link columns +
+  a free list. Its steady-state get/set is already largely GC-friendly. It is also
+  feature-maximal: TTL, size/cost-aware (`sizeCalculation`), async `fetchMethod`
+  with in-flight dedup + stale-while-revalidate, `dispose`/`disposeAfter`,
+  iteration, `dump`/`load`. ~1000+ lines, one module, LRU-only, not tree-shakeable
+  to a subset.
+- **`quick-lru` (sindresorhus), the minimalist.** Tiny two-`Map`-swap trick,
+  minimal features, single naive policy. We beat it on zero-GC (the Map-swap
+  churns) and on policy choice; it beats us on sheer simplicity.
+
+**Consequence: "we are the zero-GC LRU" is FALSE-by-obsolescence against
+`lru-cache` -- do NOT claim it.** And chasing its kitchen sink (TTL + fetch +
+size-aware + dispose + ...) is a scope-exploding, losing game that also fights our
+fixed-capacity / zero-GC identity. Win on a DIFFERENT axis. The moat is the
+combination neither incumbent can copy:
+
+1. **A family of policies under ONE swappable interface** (LRU + SIEVE + S3-FIFO +
+   W-TinyLFU + ...). `lru-cache` is LRU-only; `quick-lru` is one naive policy.
+2. **Tree-shake to ONE tiny policy** (`import { Sieve }` -> sub-KB). The edge /
+   serverless / browser / game-loop story (Workers, Deno, bundle budgets).
+3. **The shared harness SHIPPED as a user-facing tool** -- replay YOUR trace, get
+   hit-ratio + writes-per-hit + alloc per policy. Turn "which eviction policy?"
+   from folklore into measurement. This is the KILLER feature; lead the README
+   with it. It is the natural product of the parameterized oracle S1 already built.
+
+The "fewer writes per hit" micro-win (SIEVE 1 bit vs LRU ~5 relinks) is a real but
+MINOR corroborator -- matters for GC-pause-sensitive realtime/game loops. Framed as
+a micro-win, never "lock-free / scalable" (item 2).
+
+## 11. The feature axis -- a FOCUSED set, not `lru-cache` parity (RESOLVED)
+
+Add only features that serve the "measure & trust, zero-GC" thesis and stay on-law
+(fixed capacity, pay-for-what-you-use, tree-shakeable). Each is cross-cutting
+(shared by every member) and lands AFTER the substrate (S3) so members inherit it.
+
+ADD:
+- **Zero-GC TTL** -- the one table-stakes feature we cannot skip. An opt-in
+  `Float64Array` expiry column in the SoA slot layout, checked lazily on get
+  (expired -> miss), allocated ONLY when `ttl` is used. On-law where `lru-cache`
+  allocates more freely.
+- **Zero-GC iteration** (`keys`/`entries`/`values` in recency order) -- reuse the
+  borrowed-tuple / hand-written-iterator pattern from `lite-binary-reader` S12
+  (a generator would allocate an IteratorResult per step). `lru-cache`'s iterators
+  allocate; ours will not. Direct suite synergy.
+- **Opt-in stats** (hit / miss / evict / writes-per-hit) -- integer increments,
+  zero-alloc, off by default. Feeds the measurement story; no incumbent gives
+  hit-ratio out of the box.
+- **onEvict** -- already shipped and hardened (0002). Keep.
+- **Snapshot / restore** (warm-start) -- LATER/maybe: the SoA columns ARE the
+  serial form, so `dump`/`load` is cheap; useful for edge cold-starts. Not v1.
+
+EXCLUDE from the core (with landing spots, so they are not mis-scoped):
+- **Async `fetchMethod` / dedup / stale-while-revalidate** -- Promises allocate and
+  async fights zero-GC. If wanted: a thin separate composition package
+  (`lite-lru-fetch`) or a documented recipe. NEVER in the hot core.
+- **Size / cost-aware capacity** -- separate track / sibling `lite-cache-budget`
+  (item 8): it changes the capacity model (entries -> bytes).
+- **SharedArrayBuffer / cross-worker** -- a FUTURE separate package; the typed-array
+  SoA makes it plausible, but it is a different concurrency contract. Do not claim
+  it now.
+
+## 12. FIFO-reinsertion / lazy-promotion is a PRINCIPLE, not a member (RESOLVED)
+
+The "FIFO-reinsertion / lazy-promotion" idea in the survey is exactly what SIEVE
+(set a bit, promote nothing) and S3-FIFO (promote at eviction) already embody. It
+does not earn its own member slot; it is documented as the design principle
+underlying the modern members, not shipped separately.
+
+---
+
+## 13. Belady's OPT as the harness reference point (RESOLVED, from RESEARCH.md)
+
+The shipped benchmark tool (item 10, pillar 3) gets an ABSOLUTE reference: Belady's
+OPT/MIN, the clairvoyant offline optimum (evict the entry whose next use is
+farthest). It turns "SIEVE hit 82%" into "97.6% of optimal" -- the line no
+incumbent can print. Lives STRICTLY in the offline harness (`lite-lru-benchmark`);
+NEVER a production policy. RESEARCH.md carries a practical impl (reverse-scan
+next-use + lazy-deletion max-heap with amortized rebuild, bounded to ~4x capacity).
+
+**Non-negotiable gate:** because every "% of optimal" number leans on it, the OPT
+implementation MUST be differential-tested against a brute-force O(N*C) OPT on
+small seeded traces, replayable -- the same honesty discipline as item 9. A wrong
+clairvoyant reference is worse than none.
+
+## 14. Two v2 experimental tracks worth keeping (RESOLVED, from RESEARCH.md)
+
+- **LiteMGLRU** -- a userspace, fixed-capacity, zero-GC approximation of Linux's
+  Multi-Gen LRU (merged 6.1): 4 generations, 1 byte/slot (visited bit + 2 gen
+  bits), `get` sets a bit only, cascading tail eviction. Genuine novelty/attention
+  value. V2 EXPERIMENTAL. When built as a family member it MUST conform: `put` not
+  `set` (LiteCache surface), the `[lite-lru]`-tagged `RangeError` not `TypeError`,
+  and the "O(1) amortized eviction" claim softened (the all-visited cascade is
+  amortized-bounded, not strictly O(1)).
+- **Self-measuring meta-policy** -- a zero-GC controller that watches the live S12
+  stats and auto-switches between simple modes (recency-biased <-> frequency-biased).
+  The one adaptive idea still genuinely differentiated; it consumes the stats the
+  family already exposes and strengthens the measure-&-trust moat. V2 research.
+
+## 15. lite-fastbit32 is NOT a runtime dependency (RESOLVED)
+
+RESEARCH.md floats `@zakkster/lite-fastbit32` for flag-centric policies (SIEVE's
+visited bit). Maintainer confirmed: a runtime dep would BREAK the suite's zero-
+runtime-deps law (the law that kept lite-binary-reader dep-free). Bit-packing, IF
+T6 shows density matters, is INLINED into Lru.js (mask/shift, a few lines) and
+decided at S4 (D12). `lite-fastbit32` may exist as a standalone package for other
+consumers; lite-lru never imports it. Keep it a technique, not a dependency.
+
+---
+
 ## Summary of what I need from you
 
-- **Item 1 (identity fork):** confirm B (reframe) or pick A (extend). Everything
-  else assumes B.
-- **Item 6 (CLOCK):** in or out? I lean out.
-- Items 4/5/7/8/9 I have decided as above; veto any you dislike.
-- Items 2/3 are not really debatable (they are corrections), but flagged so you
-  see the reasoning that reshaped the roadmap.
+- **Item 1 (identity fork):** RESOLVED = B (reframe). [[decisions in ROADMAP]]
+- **Item 6 (CLOCK):** RESOLVED = out of family (on-demand standalone if ever).
+- **Items 10/11/12:** RESOLVED (incumbent-aware thesis; focused feature axis;
+  FIFO-reinsertion as principle) -- maintainer approved.
+- **Items 13/14/15:** RESOLVED (Belady OPT in the harness + its correctness gate;
+  LiteMGLRU + self-measuring meta-policy as v2 tracks; lite-fastbit32 inlined, not
+  a dep) -- from RESEARCH.md, maintainer approved.
+- Items 4/5/7/8/9 decided as written; 2/3 are corrections, not debatable.
+- Nothing open. The roadmap is on the live path. Deep research reference: RESEARCH.md.
