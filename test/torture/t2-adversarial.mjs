@@ -9,7 +9,7 @@
  *   E single-capacity cache: every put evicts; head===tail always.
  */
 
-import { LiteLru } from '../../Lru.js';
+import { LiteLru, Sieve } from '../../Lru.js';
 import { makePrng, SEED, check, validate, wrapLru } from './harness.mjs';
 
 export function run() {
@@ -124,5 +124,32 @@ export function run() {
         check(c.size === 16, () => 't2 F: cache not refillable to capacity after clear');
         validate(c);
         void wrapLru(c); // exercise the wrapper on a rebuilt cache
+    }
+
+    // --- G: SIEVE scan resistance -- a hot key survives a one-hit-wonder flood ---
+    // The canonical SIEVE property (decisions/0012): a repeatedly-accessed key stays
+    // visited, so the sweeping hand always grants it a second chance and it survives
+    // an unbounded scan of unique one-hit-wonder keys. A plain FIFO would evict it.
+    {
+        const N = 16;
+        const c = new Sieve(N);
+        const HOT = 'hot';
+        c.put(HOT, 1);
+        for (let i = 0; i < N - 1; i++) c.put('cold' + i, i); // fill to capacity
+        check(c.size === N, () => 't2 G: sieve not full before the scan');
+        for (let i = 0; i < 5000; i++) {
+            check(c.get(HOT) === 1, () => 't2 G: hot key lost mid-scan at ' + i);
+            c.put('scan' + i, i); // a unique one-hit-wonder each op -> forces eviction
+            check(c.size === N, () => 't2 G: sieve drifted from capacity during the scan');
+            if ((i & 255) === 0) validate(c);
+        }
+        check(c.has(HOT), () => 't2 G: the hot key was evicted by a one-hit-wonder scan (no scan resistance)');
+        validate(c);
+
+        // Non-vacuity: the cold one-hit-wonders DO get evicted (the scan is real),
+        // so the survival above is scan resistance, not an inert cache.
+        let scanSurvivors = 0;
+        for (let i = 0; i < 5000; i++) if (c.has('scan' + i)) scanSurvivors++;
+        check(scanSurvivors < N, () => 't2 G: too many scan keys survived (' + scanSurvivors + ') -- eviction not exercised');
     }
 }

@@ -38,7 +38,12 @@ const NIL = -1;
  * @returns {Array<{name:string, head:number, tail:number, doubly:boolean}>}
  */
 export function activeListsOf(cache) {
-    // Classic LRU exposes _head/_tail on a single doubly-linked recency list.
+    // A SIEVE member (decisions/0012) exposes _head/_tail on a single doubly-linked
+    // FIFO ring (detected by its `_vis` visited column). Classic LRU exposes the
+    // same shape as a recency DLL. Both are ONE doubly-linked list -> one descriptor.
+    if (cache._vis !== undefined) {
+        return [{ name: 'sieve-fifo', head: cache._head, tail: cache._tail, doubly: true }];
+    }
     return [{ name: 'recency', head: cache._head, tail: cache._tail, doubly: true }];
 }
 
@@ -116,4 +121,32 @@ export function validate(cache, lists) {
             throw new Error('[validate] index key/slot disagree at slot ' + slot);
         }
     });
+
+    // --- term 6 (SIEVE members, decisions/0012): hand + visited-column ----------
+    // A no-op for LiteLru (no `_vis`). For a Sieve: the hand is in range or NIL,
+    // every visited byte is 0 or 1, an empty ring's hand is NIL, and a set hand
+    // points at a slot that is actually in the ring (never dangling -- fail closed).
+    if (cache._vis !== undefined) {
+        const hand = cache._hand;
+        if (hand !== NIL && (hand < 0 || hand >= cap)) {
+            throw new Error('[validate] sieve hand ' + hand + ' out of range [0,' + cap + ')');
+        }
+        if (size === 0 && hand !== NIL) {
+            throw new Error('[validate] sieve hand ' + hand + ' set on an empty ring (expected NIL)');
+        }
+        for (let i = 0; i < cap; i++) {
+            if (cache._vis[i] > 1) {
+                throw new Error('[validate] sieve _vis[' + i + '] = ' + cache._vis[i] + ' > 1');
+            }
+        }
+        if (hand !== NIL) {
+            let inRing = false;
+            for (let s = cache._head; s !== NIL; s = cache._next[s]) {
+                if (s === hand) { inRing = true; break; }
+            }
+            if (!inRing) {
+                throw new Error('[validate] sieve hand ' + hand + ' is not a live ring slot (dangling)');
+            }
+        }
+    }
 }

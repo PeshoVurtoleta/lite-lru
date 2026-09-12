@@ -47,8 +47,14 @@
  *     throws; a non-integer key in int mode throws; null is not zero.
  *   - ASCII-only source. Single file. Zero runtime deps.
  *
+ * This file also ships `Sieve` as a SECOND named export (decisions/0012): the
+ * first modern eviction-policy family member, a lazy-promotion FIFO ring over the
+ * SAME substrate. It is NOT a separate file -- single main file + sideEffects:false
+ * + named exports already tree-shake away whichever member a caller does not import.
+ *
  * Design decisions live in decisions/ (D1..D10 in 0001; the onEvict reentrancy
- * contract in 0002; the substrate D11 in 0011) and are summarized in ROADMAP.md.
+ * contract in 0002; the substrate D11 in 0011; Sieve/D12 in 0012) and are
+ * summarized in ROADMAP.md.
  */
 
 /** Shared no-op eviction callback, so a cache without an onEvict handler
@@ -281,6 +287,18 @@ class IntSlotStore extends SlotStore {
     }
 }
 
+/**
+ * The shared store factory (decisions/0011). Fail closed on an unknown `keys`
+ * value. Both `LiteLru` and `Sieve` (decisions/0012) ride this ONE factory so the
+ * keyed-index backing choice + int-key door stay identical across the family.
+ */
+function newStore(capacity, keys) {
+    if (keys === undefined) return new MapSlotStore(capacity);
+    if (keys === 'int') return new IntSlotStore(capacity);
+    throw new TypeError(
+        "[lite-lru] unknown keys option " + String(keys) + " (did you mean 'int'?)");
+}
+
 /* -------------------------------------------------------------------------- *
  * LiteLru -- a THIN doubly-linked-list POLICY over the store.
  * -------------------------------------------------------------------------- */
@@ -325,13 +343,11 @@ export class LiteLru {
         this._inOnEvict = false;
     }
 
-    /** The store factory (decisions/0011). Fail closed on an unknown `keys` value.
-     *  A member/control can override this to compose a different substrate. */
+    /** The store factory (decisions/0011), delegating to the shared `newStore` so
+     *  every family member composes the SAME substrate + int-key door. A
+     *  member/control can override this to compose a different substrate. */
     _makeStore(capacity, keys) {
-        if (keys === undefined) return new MapSlotStore(capacity);
-        if (keys === 'int') return new IntSlotStore(capacity);
-        throw new TypeError(
-            "[lite-lru] unknown keys option " + String(keys) + " (did you mean 'int'?)");
+        return newStore(capacity, keys);
     }
 
     get size() { return this._size; }
@@ -473,6 +489,258 @@ export class LiteLru {
      *  conservation invariant: `size + _freeListLength() === capacity`. */
     _freeListLength() {
         return this._store.freeListLength();
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * Sieve -- a lazy-promotion FIFO policy over the SAME SlotStore substrate
+ * (decisions/0012, D12). The first modern eviction-policy family member; ships as
+ * a SECOND named export in this file (the file-shape ruling: single main file +
+ * sideEffects:false + named exports already deliver the tree-shake moat).
+ *
+ * SIEVE (Zhang et al., NSDI'24 -- "SIEVE is simpler than LRU") is a FIFO-order
+ * ring with ONE visited bit per entry and ONE moving hand:
+ *   - a HIT sets the entry's visited bit and does NOTHING structural (zero
+ *     relinks -- the headline; classic LRU relinks a small constant per interior
+ *     or tail hit). "Bytes in a hot body, not instructions" -> D12 keeps the
+ *     visited column a `Uint8Array`, so a hit is ONE store, no mask/shift.
+ *   - new entries insert at the HEAD of FIFO order (the newest end).
+ *   - on insert-at-capacity the hand sweeps from its CURRENT position (it does
+ *     NOT reset): a visited entry gets a SECOND CHANCE (bit cleared, hand
+ *     advances toward the head); the first UNVISITED entry is the victim, evicted
+ *     in place; the hand parks where it stopped and persists across evictions.
+ *
+ * Rides the SAME substrate as LiteLru: default Map backing, opt-in `keys:'int'`
+ * strict-zero backing (via the shared `newStore` factory + the same
+ * `[lite-lru]`-tagged int-key door), the shared conservation invariant, and the
+ * onEvict fire-after + `_inOnEvict` reentrancy guard (decisions/0002). The ring is
+ * threaded through the SAME `_next`/`_prev` columns: `_next` toward the tail
+ * (older), `_prev` toward the head (newer).
+ * -------------------------------------------------------------------------- */
+
+export class Sieve {
+    /**
+     * @param {number} capacity  Max entries. Must be an integer >= 1.
+     * @param {{ onEvict?: (key: any, value: any) => void, keys?: 'int' }} [options]
+     */
+    constructor(capacity, options) {
+        // Fail closed (D9), identical to LiteLru: a non-integer or < 1 capacity is
+        // a caller bug, thrown at the door with a library-tagged error.
+        if (!Number.isInteger(capacity) || capacity < 1) {
+            throw new RangeError(
+                "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
+            );
+        }
+
+        this._capacity = capacity;
+
+        // Same shared substrate + int-key door as LiteLru (decisions/0011, 0012).
+        this._store = this._makeStore(capacity, options && options.keys);
+
+        // Cache the store's columns so the ring relinks stay direct (and so the
+        // conservation invariant + torture introspection keep working).
+        this._keys = this._store._keys;
+        this._vals = this._store._vals;
+        this._next = this._store._next; // toward the tail (older)
+        this._prev = this._store._prev; // toward the head (newer)
+
+        // D12 -- the visited column: one byte per slot, so a hit is a single store
+        // with no mask/shift. Fixed size, allocated once, never grown.
+        this._vis = new Uint8Array(capacity);
+
+        this._head = NIL; // FIFO head -- the newest insertion point
+        this._tail = NIL; // FIFO tail -- the oldest
+        this._hand = NIL;  // the sweeping hand; NIL means "start from the tail"
+        this._size = 0;
+
+        this._onEvict = (options && options.onEvict) || NOOP;
+        this._inOnEvict = false;
+    }
+
+    /** The store factory, delegating to the shared `newStore` (decisions/0011). */
+    _makeStore(capacity, keys) {
+        return newStore(capacity, keys);
+    }
+
+    get size() { return this._size; }
+    get capacity() { return this._capacity; }
+
+    // --- intrusive ring helpers (same shape as LiteLru's DLL) -----------------
+
+    /** Unlink slot s from the ring, fixing neighbours + head/tail sentinels. */
+    _detach(s) {
+        const p = this._prev[s];
+        const n = this._next[s];
+        if (p !== NIL) this._next[p] = n; else this._head = n; // s was head
+        if (n !== NIL) this._prev[n] = p; else this._tail = p; // s was tail
+    }
+
+    /** Insert slot s at the head (newest end) of the ring. */
+    _pushFront(s) {
+        this._prev[s] = NIL;
+        this._next[s] = this._head;
+        if (this._head !== NIL) this._prev[this._head] = s;
+        this._head = s;
+        if (this._tail === NIL) this._tail = s; // first element -> also the tail
+    }
+
+    /**
+     * The SIEVE sweep: from the hand (or the tail when the hand is unset), grant
+     * each visited entry a SECOND CHANCE (clear its bit, advance toward the head,
+     * wrapping to the tail), and return the first UNVISITED slot -- the victim.
+     * Terminates: each step either exits or clears a bit, and after a full ring
+     * traversal every bit is 0, so a cleared slot is reached. Zero-alloc.
+     */
+    _sweepVictim() {
+        let o = this._hand !== NIL ? this._hand : this._tail;
+        while (this._vis[o] === 1) {
+            this._vis[o] = 0;
+            o = this._prev[o] !== NIL ? this._prev[o] : this._tail;
+        }
+        return o;
+    }
+
+    // --- public API (all O(1) amortized, all zero-alloc on the hot path) -------
+
+    /**
+     * Look up a key AND mark it visited (SIEVE's second-chance flag). Unlike LRU's
+     * get this does NOTHING structural -- one `_vis` store, no relink, hand
+     * untouched (the headline). @returns the value, or undefined if absent (see D7).
+     */
+    get(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        this._vis[s] = 1; // the whole hot path: a single byte store
+        return this._vals[s];
+    }
+
+    /**
+     * Insert or update. An update rewrites the value and sets visited (an update is
+     * a write -> it matches a hit). A new key at capacity sweeps for the victim
+     * (second chance for visited entries), evicts it in place, and inserts the
+     * newcomer UNVISITED at the head. onEvict fires LAST (decisions/0002).
+     */
+    put(key, value) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const existing = store.get(key);
+        if (existing >= 0) {                 // update-in-place + mark visited
+            this._vals[existing] = value;
+            this._vis[existing] = 1;
+            return;
+        }
+
+        let s, evKey, evVal;
+        let evicted = false;
+        if (this._size === this._capacity) {
+            // SIEVE eviction: sweep for the first unvisited slot, then reuse it in
+            // place for the newcomer (D6 -- skip a free-list round trip).
+            const victim = this._sweepVictim();
+            evKey = this._keys[victim];
+            evVal = this._vals[victim];
+            const parkTarget = this._prev[victim]; // toward the head
+            this._detach(victim);
+            store.delete(evKey);
+            // Park the hand toward the head, wrapping to the (post-detach) tail; it
+            // PERSISTS across evictions (it does not reset). NIL only when the ring
+            // just emptied (a capacity-1 cache), repaired by the reinsert below.
+            this._hand = parkTarget !== NIL ? parkTarget : this._tail;
+            this._size--;
+            s = victim;
+            evicted = true;
+        } else {
+            s = store.allocSlot();
+        }
+
+        this._keys[s] = key;
+        this._vals[s] = value;
+        this._vis[s] = 0; // a newcomer starts UNVISITED
+        store.set(key, s);
+        this._pushFront(s);
+        this._size++;
+
+        // Fire onEvict LAST, cache fully consistent (decisions/0002). The guard
+        // rejects any mutating reentry; the cache is already whole here.
+        if (evicted) {
+            this._inOnEvict = true;
+            try {
+                this._onEvict(evKey, evVal);
+            } finally {
+                this._inOnEvict = false;
+            }
+        }
+    }
+
+    /** True if key is present. Visited-NEUTRAL: it does NOT grant a second chance. */
+    has(key) { return this._store.has(key); }
+
+    /** Read a value WITHOUT setting visited. undefined if absent (see D7). */
+    peek(key) {
+        const s = this._store.get(key);
+        return s < 0 ? undefined : this._vals[s];
+    }
+
+    /**
+     * Remove a key. Returns true if it was present. Frees the slot, zeroes its
+     * visited byte, and REPAIRS the hand when the hand's own slot dies (advance to
+     * a valid neighbour, or NIL when the ring empties) -- fail closed, never a
+     * dangling hand.
+     */
+    delete(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const s = store.get(key);
+        if (s < 0) return false;
+        // Repair the hand BEFORE detaching (its links are read here): move toward
+        // the head, else toward the tail, else NIL when this was the only slot.
+        if (this._hand === s) {
+            let h = this._prev[s];
+            if (h === NIL) h = this._next[s];
+            this._hand = h;
+        }
+        this._detach(s);
+        store.delete(key);
+        this._vis[s] = 0;
+        store.freeSlot(s);
+        this._size--;
+        return true;
+    }
+
+    /** Empty the cache. Rebuilds the free list, zeroes visited, resets the hand.
+     *  Allocates nothing. O(capacity). */
+    clear() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store.reset();
+        this._vis.fill(0);
+        this._head = NIL;
+        this._tail = NIL;
+        this._hand = NIL;
+        this._size = 0;
+    }
+
+    // --- test/debug only (never call on a hot path) ---------------------------
+
+    /** Free-stack length, delegated to the store (conservation invariant). */
+    _freeListLength() {
+        return this._store.freeListLength();
+    }
+
+    /**
+     * The key the NEXT over-capacity insert would evict, computed WITHOUT mutating
+     * any bit or link (the sweep's non-destructive twin). Same victim `_sweepVictim`
+     * would pick: the first unvisited slot from the hand, or the hand/tail start
+     * itself when every entry is visited. Drives the torture differential.
+     */
+    _peekVictim() {
+        if (this._size === 0) return undefined;
+        const start = this._hand !== NIL ? this._hand : this._tail;
+        let o = start;
+        for (;;) {
+            if (this._vis[o] === 0) return this._keys[o];
+            o = this._prev[o] !== NIL ? this._prev[o] : this._tail;
+            if (o === start) return this._keys[start]; // all visited -> start is the victim
+        }
     }
 }
 

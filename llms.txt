@@ -1,0 +1,148 @@
+# @zakkster/lite-lru
+
+Zero-dependency, zero-GC cache FAMILY for JavaScript under one uniform
+LiteCache<K,V> surface. A classic LRU reference member (LiteLru) and the modern
+SIEVE headline (Sieve) expose the SAME get/put/has/peek/delete/clear API, so the
+eviction policy is a one-line constructor swap. Single-file ESM, zero runtime
+dependencies, node:test only. Ships a runnable + importable benchmark tool
+(Bench.mjs) with Belady OPT so a caller measures which policy fits their trace
+instead of guessing.
+
+## Status: 0.1.0 - S9: docs + shipped bench tool + Belady OPT (the v1.0.0 gate)
+
+The family is the identity from v1.0.0: classic LRU is the reference member +
+differential oracle + honest floor, SIEVE is the headline, and the shipped
+measurement tool is the differentiator neither lru-cache nor quick-lru offers.
+
+S0 landed the classic core (Map + intrusive preallocated doubly-linked list;
+get/put/delete/has/peek/clear; onEvict; fail-closed capacity). S1 built the
+node:test suite + the policy-parameterized differential oracle + torture harness,
+and found + fixed the onEvict reentrancy defect (fire-after ordering + a
+fail-closed guard, decisions/0002). S3 factored the shared keyed-index substrate
+(SlotStore) and added the opt-in keys:'int' open-addressed typed-array index for
+STRICT zero-alloc (decisions/0011). S4 added SIEVE as the first modern member on
+that substrate (decisions/0012). S9 (this session) adds the docs, the shipped
+bench + Belady OPT tool, and the OPT torture gate -- with ZERO change to Lru.js /
+Lru.d.ts (only VERSION moves at /release; it stays 0.1.0 until then).
+
+## Members (decisions/0001, 0012)
+
+Both classes implement LiteCache<K,V>; the recency/lazy-promotion difference is
+INTERNAL, so new LiteLru(n) swaps for new Sieve(n) and stays type-checked.
+
+- LiteLru: classic Least-Recently-Used. get/put promote to most-recently-used;
+  at capacity a new key evicts the LRU tail and reuses its slot in place. A hit
+  on the MRU head early-returns (0 writes); an interior/tail hit relinks a small
+  constant (5 / 4 index stores, pinned by the torture gate). The reference member
+  + the differential oracle + the honest floor.
+- Sieve: SIEVE (Zhang et al., NSDI'24). A lazy-promotion FIFO ring with ONE
+  visited byte per entry and ONE moving hand. A hit sets the visited byte and
+  does NOTHING structural (0 link writes, exactly 1 visited-byte store -- the
+  headline). At capacity the hand sweeps FIFO order, grants each visited entry a
+  single second chance, and evicts the first unvisited entry in place. has/peek
+  are visited-neutral. Scan-resistant where LRU is not.
+
+## Uniform surface (LiteCache<K,V>)
+
+- new LiteLru(capacity, options?) / new Sieve(capacity, options?)
+  - capacity: integer >= 1, else a [lite-lru]-tagged RangeError at the door.
+- get(key) -> V | undefined. Applies the member's hit policy (LiteLru promotes to
+  MRU; Sieve sets the visited bit).
+- put(key, value) -> void. Insert or update; at capacity evicts the member's
+  victim first (firing onEvict). Amortized O(1) default / O(1) with keys:'int'.
+- has(key) -> boolean. Presence test; NEVER changes recency / visited state.
+- peek(key) -> V | undefined. Read without applying the hit policy.
+- delete(key) -> boolean. Remove; true if it was present.
+- clear() -> void. Empty the cache; allocates nothing.
+- size -> number (0 .. capacity, getter). capacity -> number (getter).
+
+## Construction options
+
+- onEvict(key, value): called once per eviction with the evicted pair (e.g.
+  return the value to a pool). Zero-GC: pass a hoisted function, not a per-ctor
+  closure. REENTRANCY (decisions/0002): fires LAST, after the cache is fully
+  consistent; it MUST NOT call put/get/delete/clear on the same instance (throws
+  a [lite-lru]-tagged Error, fail-closed); has/peek ARE allowed inside it.
+- keys: 'int' (decisions/0011): opt into an open-addressed typed-array keyed index
+  for STRICT zero-alloc (even the index never allocates, no pre-fill caveat). Keys
+  MUST be 32-bit signed integers [-2147483648, 2147483647]; a non-integer or
+  out-of-range key throws a [lite-lru]-tagged TypeError. Values stay arbitrary.
+  Omitted, the default is a JS Map: arbitrary keys, honestly AMORTIZED (its resize
+  can allocate). An unknown keys value throws with a did-you-mean hint.
+
+## Invariants (suite CLAUDE.md + ROADMAP)
+
+- Zero allocation on every hot path (get/put/delete/has/peek), for BOTH members.
+  The slot/list layer is STRICTLY zero-alloc; the keys:'int' index is strictly
+  zero-alloc too; the default Map index is amortized (stated, not hidden).
+- Fail closed: an invalid capacity throws (RangeError), an unknown keys value
+  throws, a non-integer key in int mode throws (TypeError). null is not zero.
+- The D7 undefined-value contract: get/peek return undefined for EITHER "absent"
+  OR "the stored value is literally undefined" -- indistinguishable via the return
+  value; call has(key) to disambiguate. null is a normal, distinguishable value.
+- Capacity is fixed and load-bearing: no member ever exceeds it, no growth path.
+- Conservation invariant (validate(), test-only): size + freeListLength ===
+  capacity; index.size === size; links reciprocal.
+- Gated (torture): gc maxMajor 0, maxPauseMs 4, retained maxBytesPerCall 1,
+  arrayBuffers growth 0; writes-per-hit LiteLru head/interior/tail 0/5/4 vs Sieve
+  links/vis 0/1.
+
+## Bench tool (Bench.mjs, decisions D20 / DEBATE item 13)
+
+Ships in the tarball AND in exports as "./Bench.mjs". A runnable ESM tool AND an
+importable module; imports ONLY ./Lru.js (zero runtime deps).
+
+- npm run bench  /  node Bench.mjs  -> prints a per-workload, per-member table.
+- import { runBench, beladyOpt } from '@zakkster/lite-lru/Bench.mjs'
+  - runBench(opts?) -> structured results (hitRatio, writesPerHit, nsPerOp,
+    pctOptimal) per workload (zipf / loop / scan; or a caller-supplied trace) per
+    member, plus each workload's OPT. Deterministic for a given seed. ns/op is
+    wall-clock and MACHINE-LOCAL; hit ratio is a deterministic OUTPUT of the named
+    trace, never a headline or cross-library claim.
+  - beladyOpt(trace, capacity) -> { hits, misses, hitRate }. Belady's clairvoyant
+    offline optimum (evict the resident whose NEXT use is farthest). A REFERENCE
+    ORACLE, NEVER a production policy; differential-tested vs a brute-force O(N*C)
+    OPT in the torture gate (t8).
+
+## Tree-shaking (ROADMAP law 7, decisions/0012)
+
+Single PascalCase Lru.js with named exports + sideEffects:false: import { Sieve }
+drops LiteLru's body from the bundle (and vice versa). The shared substrate is
+INTERNAL, not an export; there is NO subpath-per-policy. Bench.mjs is a separate
+runnable tool, not a second implementation.
+
+## API (0.1.0)
+
+Named exports from @zakkster/lite-lru:
+
+- LiteLru: the classic LRU member (also the default export).
+- Sieve: the SIEVE member.
+- VERSION: '0.1.0'
+
+Named exports from @zakkster/lite-lru/Bench.mjs:
+
+- runBench(opts?), beladyOpt(trace, capacity), plus the seeded trace generators
+  (zipfTrace, loopTrace, scanTrace, makePrng) used to build reproducible traces.
+
+## Testing
+
+- npm test        -- 143 node:test cases (both members, recency/SIEVE laws,
+  degenerate keys/values, dts drift, family surface).
+- npm run test:types -- tsc: the LiteCache<K,V> surface + the one-line-swap check.
+- npm run torture -- @zakkster/lite-leak + lite-gc-profiler, --expose-gc: prints
+  "ok"; tiers t0/t1/t2/t5/t6/t7/t8/t9 (t8 = the Belady OPT gate).
+- npm run torture:controls -- the deliberately-broken variants; every gate fails.
+- npm run bench   -- the measurement tool (repo + shipped).
+- npm run verify  -- test + test:types + torture + controls, the publish gate.
+
+## Composability
+
+- Measure with Bench.mjs / beladyOpt on your trace, then deploy the winning
+  member behind the SAME LiteCache surface -- the measured policy IS the shipped
+  policy, by construction.
+- @zakkster/lite-signal: zero-GC reactive graph for hot paths.
+- @zakkster/lite-binary-reader: zero-GC reader for raw / foreign binary buffers.
+
+## License
+
+MIT (c) Zahary Shinikchiev

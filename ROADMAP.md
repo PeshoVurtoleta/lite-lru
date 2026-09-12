@@ -71,20 +71,21 @@ LiteMGLRU, meta-policy; distilled into DEBATE items 13-15).
 | Lru.js onEvict reentrancy fix (decisions/0002, amends D8) | **built + gated (S1)** |
 | `Lru.d.ts` + family interface | S2 |
 | shared keyed-index substrate (was S4, now the keystone) | **built + gated (S3)** |
-| SIEVE | S4 |
+| SIEVE | **built + gated (S4)** |
 | S3-FIFO | S5 |
 | W-TinyLFU | S6 |
 | 2Q / SLRU | S7 |
 | ARC (flagged -- stresses the fixed-capacity law) | S8 |
-| README + llms.txt + CHANGELOG + shipped benchmark/trace-replay tool | S9 (parallel from S2) |
+| README + llms.txt + CHANGELOG + shipped benchmark/trace-replay tool | **built + gated (S9)** |
 | zero-GC TTL (opt-in expiry column) -- cross-cutting | S10 |
 | zero-GC iteration (keys/entries/values, recency order) -- cross-cutting | S11 |
 | opt-in stats (hit/miss/evict/writes-per-hit) -- cross-cutting | S12 |
 | snapshot / restore (dump/load; SoA columns are the serial form) | later/maybe (DEBATE 11) |
 | LRU-K, LIRS/ClockPro, LFU, MQ/CAR | `DEBATE.md` item 4 (deferred) |
 | CLOCK/ClockPro (out of family), async fetch (-> `lite-lru-fetch`), size-aware (-> `lite-cache-budget`) | `DEBATE.md` items 6/8/11 (out of core) |
-| Belady OPT reference (offline harness normalization) | S9 bench tool (DEBATE 13) |
+| Belady OPT reference (offline harness normalization) | **built + gated (S9, t8 gate + Bench.mjs)** |
 | LiteMGLRU (userspace Multi-Gen LRU) + self-measuring meta-policy | v2 research (DEBATE 14, RESEARCH.md) |
+| animated policy-visualization demo (each member's mechanics on one trace + % of optimal; in-repo demo/, never shipped) | post-1.0.0 S13 (DEBATE 16) |
 
 ---
 
@@ -439,7 +440,7 @@ DONE WHEN
 ===============================================================================
 ```markdown
 version_target: 1.0.0
-status: planned
+status: implemented -- gated green (143 node:tests incl. 40 Sieve boundary cases; hit = 0 link writes / 1 vis byte at head+interior+tail vs LRU 0/5/4; sieveIntPolicy differential clean 100k ops; A3 int strict-zero, no backing grows; A4 4096 clear-cycles conserve; C7 promote-on-hit teeth diverge; torture + controls ok). Still gated behind S9 docs for /release 1.0.0. VERSION stays 0.1.0 until /release.
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0
@@ -631,7 +632,7 @@ TASKS / ASSERTIONS / DONE WHEN
 # S9 -- v0.x.. -- README + llms.txt + CHANGELOG + shipped bench tool (parallel from S2)
 ===============================================================================
 ```markdown
-status: planned
+status: implemented -- gated green (160 node:tests incl. +17 Bench boundary cases; README on the LiteSepforge spine, both members, every cited number traced to a harness const/Lru.js door; Bench.mjs shipped as runnable + importable (runBench/beladyOpt), imports only ./Lru.js; t8 OPT gate: beladyOpt differential-tested vs independent brute farthest-next-use OPT + OPT>=each member, teeth proven; bench hit%/%OPT/wr deterministic across runs, ns/op machine-local; pack = 8 files incl README.md/llms.txt/CHANGELOG.md/Bench.mjs). VERSION stays 0.1.0 until /release. This clears the last /release 1.0.0 blocker (the three files[] docs now exist).
 depends_on: [S1]
 ```
 README modeled on `../LiteSepforge/README.md` (the suite blueprint spine, in

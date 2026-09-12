@@ -120,6 +120,43 @@ export class LiteLru<K = unknown, V = unknown> implements LiteCache<K, V> {
   get capacity(): number;
 }
 
+/**
+ * A fixed-capacity SIEVE cache with O(1) amortized get/put/has/peek/delete over a
+ * preallocated intrusive FIFO ring (decisions/0012). The first modern eviction-
+ * policy member of the family and an implementation of `LiteCache`.
+ *
+ * SIEVE (Zhang et al., NSDI'24) is lazy-promotion FIFO: `get` and `put(update)`
+ * set a per-entry VISITED bit and do NOTHING structural (zero relinks -- the
+ * headline); at capacity a moving hand sweeps FIFO order, grants each visited
+ * entry a single second chance, and evicts the first unvisited entry in place.
+ * `has` and `peek` are visited-neutral. Same `LiteCache` surface as `LiteLru`, so
+ * `new LiteLru(n)` swaps for `new Sieve(n)` and stays type-checked -- the policy
+ * difference is INTERNAL, never in the surface.
+ *
+ * See `LiteCache` for the D7 undefined-value contract and `LiteCacheOptions.onEvict`
+ * for the reentrancy contract -- both hold here. The optional `keys: 'int'` backing
+ * (decisions/0011) applies identically: 32-bit signed integer keys, strict zero-GC.
+ *
+ * @typeParam K key type (any value; SameValueZero equality via the internal Map)
+ * @typeParam V value type
+ */
+export class Sieve<K = unknown, V = unknown> implements LiteCache<K, V> {
+  /**
+   * @param capacity max entries; must be an integer >= 1 (else throws RangeError,
+   *                 fail-closed -- null is not zero).
+   * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
+   */
+  constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  get(key: K): V | undefined;
+  put(key: K, value: V): void;
+  has(key: K): boolean;
+  peek(key: K): V | undefined;
+  delete(key: K): boolean;
+  clear(): void;
+  get size(): number;
+  get capacity(): number;
+}
+
 /** The package version (kept in lock-step with package.json + Lru.js). */
 export const VERSION: string;
 

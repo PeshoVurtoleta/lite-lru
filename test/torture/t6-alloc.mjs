@@ -31,10 +31,11 @@
  * rejects the window; T9 exercises the same alloc lane in-process.
  */
 
-import { LiteLru } from '../../Lru.js';
+import { LiteLru, Sieve } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, BREAK, check, die,
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
+    CountedSieve, SIEVE_WRITES_HIT_LINKS, SIEVE_WRITES_HIT_VIS,
 } from './harness.mjs';
 
 const CAP = 4096;      // power of 2 so the hot body masks its key with & MASK
@@ -180,4 +181,63 @@ export async function run() {
     // this at S4; that comparative lands there, not here.)
     check(LRU_WRITES_HEAD_REHIT === 0 && LRU_WRITES_INTERIOR_REHIT > 0,
         () => 't6 Gate 3: the writes-per-hit baseline is not shaped {head:0, non-head:>0}');
+
+    // --- Gate SIEVE: the SIEVE member -- STRICT zero-alloc + the 1-bit headline --
+    // (decisions/0012) The int-backed Sieve churns NEW integer keys from an EMPTY
+    // ring, so after warm-up every op inserts a fresh key AND sweep-evicts a victim
+    // (open-addressed idxSet + backward-shift idxDelete + the sweep). NO pre-fill
+    // caveat: strict zero-alloc, and _vis / _next / _ixSlot / _ixKey never grow.
+    const scache = new Sieve(CAP, { keys: 'int' });
+    const sNextBytes = scache._next.buffer.byteLength;
+    const sPrevBytes = scache._prev.buffer.byteLength;
+    const sVisBytes = scache._vis.buffer.byteLength;
+    const sIxSlotBytes = scache._store._ixSlot.buffer.byteLength;
+    const sIxKeyBytes = scache._store._ixKey.buffer.byteLength;
+    let sk = 0;
+    const sieveHot = () => {
+        scache.put(sk, sk & 0xffff); // fresh int key each op; SMI value (no boxing)
+        sk++;
+    };
+    const gs = runOpsGate(sieveHot, { ops: OPS, warmup: WARMUP });
+    check(scache._next.buffer.byteLength === sNextBytes,
+        () => 't6 Gate SIEVE: _next.buffer grew ' + sNextBytes + ' -> ' + scache._next.buffer.byteLength);
+    check(scache._prev.buffer.byteLength === sPrevBytes,
+        () => 't6 Gate SIEVE: _prev.buffer grew ' + sPrevBytes + ' -> ' + scache._prev.buffer.byteLength);
+    check(scache._vis.buffer.byteLength === sVisBytes,
+        () => 't6 Gate SIEVE: _vis.buffer grew ' + sVisBytes + ' -> ' + scache._vis.buffer.byteLength);
+    check(scache._store._ixSlot.buffer.byteLength === sIxSlotBytes,
+        () => 't6 Gate SIEVE: _ixSlot.buffer grew ' + sIxSlotBytes + ' -> ' + scache._store._ixSlot.buffer.byteLength);
+    check(scache._store._ixKey.buffer.byteLength === sIxKeyBytes,
+        () => 't6 Gate SIEVE: _ixKey.buffer grew ' + sIxKeyBytes + ' -> ' + scache._store._ixKey.buffer.byteLength);
+    check(scache.size === CAP, () => 't6 Gate SIEVE: churn did not stay at capacity (size ' + scache.size + ')');
+    if (!gs.report.ok) {
+        const g = gs.summary.gc;
+        die('t6 Gate SIEVE (int churn) ops gate rejected -- verdict=' + gs.report.verdict +
+            ' source=' + gs.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gsa = runAllocsGate(sieveHot, { iterations: 50000, batches: 8 });
+    if (!gsa.ok) {
+        die('t6 Gate SIEVE (int churn) retained-alloc gate rejected -- verdict=' + gsa.report.verdict +
+            ' settled=' + gsa.result.settled + ' bytesPerCall=' + gsa.bytesPerCall);
+    }
+
+    // The DEBATE-item-2 payoff, MEASURED: a SIEVE hit relinks NOTHING (0 _next/_prev
+    // stores) and sets exactly ONE visited byte -- at the HEAD, an INTERIOR slot AND
+    // the TAIL alike (vs classic LRU's 0 / 5 / 4). This is the headline the S1 gate
+    // deferred to S4.
+    const M = 8;
+    for (const probe of [M - 1, 4, 0]) { // insertion order: head, interior, tail
+        const cs = new CountedSieve(M);
+        for (let i = 0; i < M; i++) cs.put(i, i);
+        cs.resetWrites();
+        cs.get(probe); // a hit
+        check(cs.writes() === SIEVE_WRITES_HIT_LINKS,
+            () => 't6 Gate SIEVE: hit at ' + probe + ' relinked ' + cs.writes() + ' cells, expected ' + SIEVE_WRITES_HIT_LINKS);
+        check(cs.visWrites() === SIEVE_WRITES_HIT_VIS,
+            () => 't6 Gate SIEVE: hit at ' + probe + ' wrote ' + cs.visWrites() + ' visited bytes, expected ' + SIEVE_WRITES_HIT_VIS);
+    }
+    // The comparative, now that both are measured: SIEVE's hit is strictly cheaper
+    // than classic LRU's interior/tail relink.
+    check(SIEVE_WRITES_HIT_LINKS < LRU_WRITES_INTERIOR_REHIT && SIEVE_WRITES_HIT_LINKS < LRU_WRITES_TAIL_REHIT,
+        () => 't6 Gate SIEVE: the SIEVE hit (' + SIEVE_WRITES_HIT_LINKS + ' links) is not cheaper than the LRU relink');
 }

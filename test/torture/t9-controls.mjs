@@ -15,15 +15,17 @@
  *   C4 a hot loop that allocates per op        -> the alloc gates reject it
  *   C5 a broken SECOND policy (FIFO)           -> the runner catches it (the seam)
  *   C6 a growing int index buffer             -> validate()'s stability check fails
+ *   C7 a SIEVE get that PROMOTES on hit        -> diverges from the sieve oracle
  */
 
-import { LiteLru } from '../../Lru.js';
+import { LiteLru, Sieve } from '../../Lru.js';
 import {
-    runOpsGate, runAllocsGate, runDifferential, wrapLru, validate,
+    runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, validate,
     lruPolicy, check, die,
 } from './harness.mjs';
 import { makeLruOracle } from './oracles/lru.mjs';
 import { makeFifoOracle } from './oracles/fifo.mjs';
+import { makeSieveOracle } from './oracles/sieve.mjs';
 
 const NIL = -1;
 
@@ -87,6 +89,23 @@ function makeBrokenFifoReal(cap) {
         size() { return map.size; },
         victim() { return q.length ? q[q.length - 1] : undefined; }, // BUG: newest, not oldest
     };
+}
+
+/** C7: a SIEVE get that PROMOTES the hit to the head (LRU-style relink) instead of
+ *  merely setting the visited bit. That relink reorders the FIFO ring, so the next
+ *  eviction victim drifts from the pure-SIEVE oracle -- the headline "zero relinks
+ *  on hit" is exactly what must not be violated. (The hand still points at a live
+ *  ring slot after the relink, so this is a semantic divergence, not a crash.) */
+class PromotingSieve extends Sieve {
+    get(key) {
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        this._vis[s] = 1;
+        // BUG: promote to the head like LRU -> the FIFO order (and the victim) drift.
+        this._detach(s);
+        this._pushFront(s);
+        return this._vals[s];
+    }
 }
 
 const leak = [];
@@ -177,5 +196,22 @@ export function run() {
         let threw = false;
         try { validate(c); } catch (e) { threw = true; }
         if (!threw) die('t9 C6: validate() passed a grown int index buffer (the stability gate is toothless)');
+    }
+
+    // --- C7: a SIEVE get that promotes-on-hit -> diverges from the sieve oracle ---
+    // The SIEVE headline is "a hit does nothing structural". A get that relinks the
+    // hit to the head reorders the FIFO ring, so its next-eviction victim MUST drift
+    // from the pure-SIEVE oracle. Non-vacuity: the CORRECT Sieve agrees (proven in
+    // t5); here the broken one must diverge, and specifically on the victim.
+    {
+        const brokenPolicy = {
+            name: 'sieve-promoting-get',
+            real: (cap) => wrapSieve(new PromotingSieve(cap)),
+            oracle: (cap) => makeSieveOracle(cap),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 8, ops: 20000, seed: 424242, keyspace: 20 });
+        if (r.ok) die('t9 C7: a SIEVE get() that promotes on hit did NOT diverge from the sieve oracle (no teeth)');
+        check(r.why === 'victim',
+            () => 't9 C7: expected the promoting-get divergence to be a victim mismatch, got ' + r.why);
     }
 }

@@ -13,7 +13,10 @@
  * vs brute array oracle). A future member is a fourth line.
  */
 
-import { runDifferential, lruPolicy, lruIntPolicy, fifoPolicy, SEED, die } from './harness.mjs';
+import {
+    runDifferential, lruPolicy, lruIntPolicy, fifoPolicy,
+    sievePolicy, sieveIntPolicy, SEED, die,
+} from './harness.mjs';
 
 const OPS = 100000;
 
@@ -46,6 +49,12 @@ export function run() {
     // driven across the SAME corpus against the SAME lru oracle -- identical values
     // + victims. Keys are `prng() % keyspace` (non-negative int32), valid int-mode.
     fuzzPolicy(lruIntPolicy, lruConfigs);
+
+    // The MEMBER proof (decisions/0012): SIEVE on BOTH backings against its own
+    // independent oracle -- same value AND same next victim AND same size after
+    // every op. The int backing rides the SAME strict-zero substrate.
+    fuzzPolicy(sievePolicy, lruConfigs);
+    fuzzPolicy(sieveIntPolicy, lruConfigs);
 
     // The SEAM proof: the SAME runner drives a second policy unchanged.
     fuzzPolicy(fifoPolicy, [

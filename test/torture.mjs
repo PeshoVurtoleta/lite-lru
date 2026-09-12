@@ -12,6 +12,7 @@
  *     t0 recency laws          t1 degenerate keys/values
  *     t2 adversarial + conservation   t5 differential fuzz (2 policies)
  *     t6 zero-alloc + writes-per-hit  t7 soak + conservation
+ *     t8 Belady OPT (bench oracle correctness + optimality bound)
  *     t9 controls (every gate must be able to fail)
  *
  * ENTRY CONTRACT (mirrors ../LiteBinaryReader/test/torture.mjs):
@@ -54,6 +55,7 @@ async function main() {
     const { run: t5 } = await import('./torture/t5-fuzz.mjs');
     const { run: t6 } = await import('./torture/t6-alloc.mjs');
     const { run: t7 } = await import('./torture/t7-soak.mjs');
+    const { run: t8 } = await import('./torture/t8-opt.mjs');
     const { run: t9 } = await import('./torture/t9-controls.mjs');
 
     const TIERS = [
@@ -63,6 +65,7 @@ async function main() {
         ['t5 differential', t5],
         ['t6 alloc', t6],
         ['t7 soak', t7],
+        ['t8 opt', t8],
         ['t9 controls', t9],
     ];
 

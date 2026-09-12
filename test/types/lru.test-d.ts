@@ -9,7 +9,7 @@
  * stops happening (tsc flags an unused directive). Test-only; not in files[].
  * ASCII-only.
  */
-import LiteLru, { VERSION } from "../../Lru.js";
+import LiteLru, { VERSION, Sieve } from "../../Lru.js";
 import type { LiteCache, LiteCacheOptions } from "../../Lru.js";
 
 // A type-equality check with teeth (identity holds only for exact-equal types).
@@ -73,3 +73,41 @@ c.size = 5;
 
 // @ts-expect-error -- 'float' is not a valid keys backing (only 'int').
 new LiteLru<number, number>(10, { keys: "float" });
+
+// ---- Sieve: the second family member SATISFIES the SAME LiteCache surface ----
+// (decisions/0012) The one-line policy swap: `new Sieve(n)` type-checks into the
+// SAME `LiteCache` binding as `new LiteLru(n)`.
+const sv = new Sieve<string, number>(10);
+const svGot = sv.get("a");
+expectTrue<Equal<typeof svGot, number | undefined>>();
+expectTrue<Equal<ReturnType<typeof sv.has>, boolean>>();
+expectTrue<Equal<ReturnType<typeof sv.delete>, boolean>>();
+expectTrue<Equal<typeof sv.size, number>>();
+expectTrue<Equal<typeof sv.capacity, number>>();
+
+const svIface: LiteCache<string, number> = new Sieve<string, number>(10);
+svIface.put("k", 1);
+const svIfaceGot = svIface.get("k");
+expectTrue<Equal<typeof svIfaceGot, number | undefined>>();
+
+// keys:'int' opt-in backing applies identically to Sieve.
+new Sieve<number, number>(10, { keys: "int" });
+
+// onEvict params are typed from <K, V> on Sieve too.
+new Sieve<string, number>(10, {
+  onEvict: (k, v) => {
+    const _k: string = k;
+    const _v: number = v;
+    void _k;
+    void _v;
+  },
+});
+
+// @ts-expect-error -- V is number; a string value is rejected on Sieve too.
+sv.put("a", "not-a-number");
+
+// @ts-expect-error -- 'lru' is not a valid keys backing (only 'int').
+new Sieve<number, number>(10, { keys: "lru" });
+
+// @ts-expect-error -- size is readonly on Sieve.
+sv.size = 5;

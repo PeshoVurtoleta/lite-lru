@@ -325,6 +325,33 @@ consumers; lite-lru never imports it. Keep it a technique, not a dependency.
 
 ---
 
+## 16. Animated policy-visualization demo (POST-1.0.0, from maintainer)
+
+Maintainer suggestion: after 1.0.0 ships, add a demo that VISUALIZES the different
+cache algorithms side by side -- modeled on the lite-binary-reader demo (process
+visualization), ideally animated. This is the moat's third pillar (item 10, "the
+harness shipped as a user-facing tool") made VISIBLE: the same trace fed to every
+member, each drawn with its own mechanics, so the "one interface, different policy"
+story is seen, not just read.
+
+  - WHAT it shows: for one shared trace, animate each member's structure as ops
+    stream -- LiteLru promoting a hit to the head (the ~5 relinks); SIEVE just
+    flipping a visited bit and, on eviction, the hand sweeping + second chances;
+    S3-FIFO's small/main queues; and the running hit ratio vs Belady OPT (the
+    "% of optimal" line from the S9 bench). The contrast (LRU's pointer churn vs
+    SIEVE's one bit) is the thesis on screen.
+  - WHERE it lives: an in-repo `demo/` (like lite-binary-reader's), NEVER shipped
+    in the npm tarball -- the /release pack gate already asserts `demo/` absent.
+    Zero runtime deps still holds for what ships; the demo is a dev artifact.
+  - WHEN: a post-1.0.0 session (roadmap S13), after enough members exist to make a
+    comparison interesting (at least LiteLru + SIEVE; better once S3-FIFO/S5 lands).
+    Reuses the S9 `Bench.mjs` traces + `beladyOpt` as the data source so the
+    picture and the numbers come from the same place.
+
+Status: PARKED for post-1.0.0. Not on the v1.0.0 path; recorded so it is not lost.
+
+---
+
 ## Summary of what I need from you
 
 - **Item 1 (identity fork):** RESOLVED = B (reframe). [[decisions in ROADMAP]]
@@ -335,4 +362,6 @@ consumers; lite-lru never imports it. Keep it a technique, not a dependency.
   LiteMGLRU + self-measuring meta-policy as v2 tracks; lite-fastbit32 inlined, not
   a dep) -- from RESEARCH.md, maintainer approved.
 - Items 4/5/7/8/9 decided as written; 2/3 are corrections, not debatable.
-- Nothing open. The roadmap is on the live path. Deep research reference: RESEARCH.md.
+- **Item 16 (animated policy-visualization demo):** PARKED for post-1.0.0 (roadmap
+  S13); recorded, not on the v1.0.0 path.
+- Nothing open on the v1.0.0 path. The roadmap is live. Deep research reference: RESEARCH.md.

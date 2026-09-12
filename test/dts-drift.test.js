@@ -96,6 +96,19 @@ function liteLruImplementsLiteCache(dtsText) {
   return /class LiteLru<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
 }
 
+/** True if the d.ts declares `class Sieve<...> implements LiteCache<...>`. */
+function sieveImplementsLiteCache(dtsText) {
+  return /class Sieve<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
+}
+
+/** True if BOTH sources declare a `Sieve` class (the second named export). */
+function jsDeclaresSieve(jsText) {
+  return /export class Sieve\b/.test(jsText);
+}
+function dtsDeclaresSieve(dtsText) {
+  return /export class Sieve\b/.test(dtsText);
+}
+
 /** Symmetric-difference report between two sets: [] when equal. */
 function setDiff(a, b, labelA, labelB) {
   const diffs = [];
@@ -131,14 +144,34 @@ test('(c) family surface: interface LiteCache + class LiteLru implements LiteCac
   assert.ok(liteLruImplementsLiteCache(DTS), 'class LiteLru must `implements LiteCache<...>`');
 });
 
+test('(d) Sieve surface: Sieve is a named export in BOTH sources, members agree, implements LiteCache', () => {
+  assert.ok(jsDeclaresSieve(JS), 'Lru.js must `export class Sieve` (the second named export)');
+  assert.ok(dtsDeclaresSieve(DTS), 'Lru.d.ts must `export class Sieve`');
+  const js = classMembers(JS, 'Sieve');
+  const dts = classMembers(DTS, 'Sieve');
+  const diffs = setDiff(js, dts, 'Lru.js', 'Lru.d.ts');
+  assert.deepEqual(diffs, [], diffs.join('; '));
+  // The full public surface -- identical inventory to LiteLru (moat-pillar 1: the
+  // uniform LiteCache surface every member satisfies).
+  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'size', 'capacity']) {
+    assert.ok(js.has(nm), 'Lru.js class Sieve is missing public member ' + nm);
+    assert.ok(dts.has(nm), 'Lru.d.ts class Sieve is missing member ' + nm);
+  }
+  assert.equal(js.size, 8, 'expected exactly 8 public members in Sieve (Lru.js), saw ' + js.size);
+  assert.equal(dts.size, 8, 'expected exactly 8 members in Sieve (Lru.d.ts), saw ' + dts.size);
+  assert.ok(sieveImplementsLiteCache(DTS), 'class Sieve must `implements LiteCache<...>`');
+});
+
 // --- teeth: each check must reject a mutated COPY (non-vacuity) --------------
 
 test('control: unmutated text reports zero diffs / all-present (vacuity)', () => {
   assert.equal(jsVersion(JS), pkgVersion(PKG));
   assert.ok(dtsDeclaresVersion(DTS));
   assert.deepEqual(setDiff(classMembers(JS, 'LiteLru'), classMembers(DTS, 'LiteLru'), 'a', 'b'), []);
+  assert.deepEqual(setDiff(classMembers(JS, 'Sieve'), classMembers(DTS, 'Sieve'), 'a', 'b'), []);
   assert.ok(hasLiteCacheInterface(DTS));
   assert.ok(liteLruImplementsLiteCache(DTS));
+  assert.ok(sieveImplementsLiteCache(DTS));
 });
 
 test('control: desyncing the package.json version makes version parity fail', () => {
@@ -167,4 +200,17 @@ test('control: breaking the implements clause fails the family-surface check', (
 test('control: dropping the LiteCache interface fails the family-surface check', () => {
   const mutated = DTS.replace(/interface LiteCache</, 'interface NotACache<');
   assert.ok(!hasLiteCacheInterface(mutated), 'renaming the LiteCache interface did not fail the surface check');
+});
+
+test('control: breaking Sieve implements clause fails the Sieve surface check', () => {
+  const mutated = DTS.replace(/class Sieve<[^>]*>\s+implements LiteCache<[^>]*>/, 'class Sieve<K = unknown, V = unknown>');
+  assert.ok(!sieveImplementsLiteCache(mutated), 'de-implementing LiteCache on Sieve did not fail the surface check');
+});
+
+test('control: dropping a method from the d.ts Sieve class makes Sieve member parity fail', () => {
+  // Strip every `clear(): void;` (interface + both classes); the Sieve class then
+  // loses `clear` while Lru.js's Sieve still has it, so member parity must diverge.
+  const mutated = DTS.replace(/\n\s*clear\(\): void;/g, '');
+  const diffs = setDiff(classMembers(JS, 'Sieve'), classMembers(mutated, 'Sieve'), 'Lru.js', 'Lru.d.ts');
+  assert.ok(diffs.length > 0, 'dropping clear() from the d.ts Sieve class did not fail member parity');
 });
