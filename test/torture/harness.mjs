@@ -25,9 +25,10 @@
  */
 
 import { measureOps, checkNoGc, measureAllocs, checkAllocs } from '@zakkster/lite-gc-profiler';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from '../../Lru.js';
 import { makeLruOracle, svz } from './oracles/lru.mjs';
 import { makeLirsOracle } from './oracles/lirs.mjs';
+import { makeLfuOracle } from './oracles/lfu.mjs';
 import { makeFifoOracle, makeFifoReal } from './oracles/fifo.mjs';
 import { makeSieveOracle } from './oracles/sieve.mjs';
 import { makeS3FifoOracle } from './oracles/s3fifo.mjs';
@@ -472,6 +473,44 @@ export const lirsTtlPolicy = {
     oracle: (cap, o) => makeLirsOracle(cap, o),
 };
 
+/** Wrap a real Lfu as a uniform driver. victim via `_peekVictim` (the LRU-end key of the
+ *  lowest-frequency bucket, test-only introspection, never a hot path). */
+export function wrapLfu(cache) {
+    return {
+        get: (k) => cache.get(k),
+        put: (k, v, t) => cache.put(k, v, t),
+        has: (k) => cache.has(k),
+        peek: (k) => cache.peek(k),
+        delete: (k) => cache.delete(k),
+        size: () => cache.size,
+        victim: () => cache._peekVictim(),
+        raw: cache,
+    };
+}
+
+/** The Lfu policy (decisions/0024): the exact-LFU member + its own independent
+ *  exact-frequency + LRU-tie-break oracle. Default backing (Map): arbitrary keys. */
+export const lfuPolicy = {
+    name: 'lfu',
+    real: (cap) => wrapLfu(new Lfu(cap)),
+    oracle: (cap) => makeLfuOracle(cap),
+};
+
+/** The Lfu policy on the INTEGER substrate backing (`keys: 'int'`), driven against the SAME
+ *  lfu oracle: the strict-zero backing must return byte-identical values + victims. */
+export const lfuIntPolicy = {
+    name: 'lfu-int',
+    real: (cap) => wrapLfu(new Lfu(cap, { keys: 'int' })),
+    oracle: (cap) => makeLfuOracle(cap),
+};
+
+/** Lfu with an opt-in TTL default (decisions/0017). */
+export const lfuTtlPolicy = {
+    name: 'lfu-ttl',
+    real: (cap, o) => wrapLfu(new Lfu(cap, o)),
+    oracle: (cap, o) => makeLfuOracle(cap, o),
+};
+
 /* -------------------------------------------------------------------------- *
  * The PARAMETERIZED differential runner (the whole point of S1).
  *
@@ -719,6 +758,48 @@ export class CountedLirs extends Lirs {
 /** LIRS LIR-hit-at-top baseline (measured; regression tripwire): the pinned 0-write path. */
 export const LIRS_WRITES_LIR_TOP_REHIT = 0;
 
+/**
+ * An Lfu subclass whose key-list columns `_fNext`/`_fPrev`/`_kB` AND the bucket-pool
+ * columns `_bFreq`/`_bNext`/`_bPrev`/`_bHead`/`_bTail` are wrapped in counting Proxies --
+ * used ONLY in the T6 LFU counter sub-tier, NEVER on a measured zero-alloc path (a Proxy
+ * allocates + traps and would poison the gate). An Lfu hit legitimately RELINKS across
+ * frequency buckets: the gate asserts zero-ALLOCATION, not minimal writes, and pins the
+ * DEBATE-honest numbers -- the FAST PATH (a single-key bucket with no freq+1 neighbour is
+ * RELABELLED in place: 1 write) and the worst-case bound (<= 14 writes/hit). The Proxy
+ * writes through to the same underlying buffers the store reads, so alloc/free stay
+ * consistent (as in CountedLru). */
+export class CountedLfu extends Lfu {
+    constructor(capacity, options) {
+        super(capacity, options);
+        this._writes = 0;
+        const self = this;
+        const countStores = (arr) => new Proxy(arr, {
+            set(t, prop, value) {
+                if (typeof prop === 'string' && prop !== 'length' && String(+prop) === prop) {
+                    self._writes++;
+                }
+                t[prop] = value;
+                return true;
+            },
+        });
+        this._fNext = countStores(this._fNext);
+        this._fPrev = countStores(this._fPrev);
+        this._kB = countStores(this._kB);
+        this._bFreq = countStores(this._bFreq);
+        this._bNext = countStores(this._bNext);
+        this._bPrev = countStores(this._bPrev);
+        this._bHead = countStores(this._bHead);
+        this._bTail = countStores(this._bTail);
+    }
+    resetWrites() { this._writes = 0; }
+    writes() { return this._writes; }
+}
+
+/** Lfu hit baselines (measured; regression tripwire). The FAST PATH relabels a single-key
+ *  bucket in place (1 write); the worst-case relink is bounded at LFU_WRITES_MAX. */
+export const LFU_WRITES_FASTPATH = 1;
+export const LFU_WRITES_MAX = 14;
+
 /* -------------------------------------------------------------------------- *
  * Snapshot / restore round-trip differential (decisions/0021, D21).
  *
@@ -744,6 +825,7 @@ export const SNAP_MEMBERS = [
     { name: 'TwoQ', Ctor: TwoQ, wrap: wrapTwoQ },
     { name: 'Arc', Ctor: Arc, wrap: wrapArc },
     { name: 'Lirs', Ctor: Lirs, wrap: wrapLirs },
+    { name: 'Lfu', Ctor: Lfu, wrap: wrapLfu },
 ];
 
 /** Structural deep-equality for two snapshots, IGNORING the capture-time field `t`

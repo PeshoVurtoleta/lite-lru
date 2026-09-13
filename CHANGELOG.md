@@ -7,6 +7,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.11.0] - 2026-09-13
+
+### Added
+
+- **LFU (`Lfu`) -- the ninth cache member** (decisions/0024, D24; Shah, Matani &
+  Kumar, "An O(1) algorithm for implementing the LFU cache eviction scheme", 2010):
+  EXACT Least-Frequently-Used at O(1), the exact-frequency counterpart to `WTinyLfu`'s
+  approximate Count-Min sketch, on the same `LiteCache<K,V>` surface, so
+  `new LiteLru(n)` swaps for `new Lfu(n)` type-checked.
+  - A doubly-linked list OF frequency buckets, each bucket a doubly-linked list of keys
+    at that exact frequency; the frequency lives on the bucket. Within a bucket the order
+    is recency (LRU tie-break): a new key (freq 1) and a just-promoted key attach at MRU,
+    eviction takes the LRU key of the lowest-frequency bucket.
+  - Buckets come from a preallocated pool sized to capacity: a `_bFreq` `Float64Array`
+    (exact counts to 2^53, no `Int32` wrap) + `_bNext`/`_bPrev`/`_bHead`/`_bTail`
+    `Int32Array` columns + a `_bFree` stack. A bucket is NEVER allocated with `new` on the
+    hot path; pool exhaustion is provably unreachable (live buckets partition the
+    `<= capacity` resident keys) and fail-closed regardless.
+  - Hot path is zero-ALLOCATION but NOT zero-write: a frequency bump relinks a key across
+    buckets -- fast-path relabel 1 write, worst-case relink 14 (a non-exceedable bound,
+    pinned by the torture gate). `put(update)` counts as a hit; `has`/`peek` are
+    frequency-neutral. Gate LFU 0.00032 B/op mixed churn (Map-backing amortization;
+    `keys:'int'` strictly 0 B/op), `maxPauseMs` 0.000.
+  - `Lfu` inherits TTL, zero-GC iteration (ascending frequency, MRU->LRU within each
+    bucket), opt-in stats, and snapshot/restore (tag `m:'Lfu'`; exact per-bucket
+    frequencies + the full key ordering captured verbatim, fail-closed on restore -- a
+    dropped or compacted frequency is rejected as a divergence).
+- `Lfu` in the shipped bench (`MEMBERS` 8 -> 9) and the policy-visualization demo (a
+  `Lfu` renderer drawing the frequency buckets strictly from `dump()`); the `Lfu` class on
+  `Lru.d.ts`.
+
+### Changed
+
+- Roster docs eight -> nine members (README, `llms.txt`). The exact-LFU need now points
+  at `Lfu`; `WTinyLfu` stays positioned as approximate frequency-ADMISSION (aged Count-Min
+  sketch), and a "Choosing a member" row distinguishes exact `Lfu` from approximate
+  `WTinyLfu`.
+- Test suite 1110 -> 1155 `node:test` cases (a 44-case `test/Lfu.test.js` boundary suite
+  covering the LFU law + LRU tie-break, exact frequency, TTL, iteration order, snapshot
+  round-trip + fail-closed, and degenerate caps 1..4 / keys / values).
+- Torture harness extended for `Lfu`: an independent from-scratch differential oracle
+  (`test/torture/oracles/lfu.mjs`), tiers t0/t2/t5/t6 (Gate LFU zero-alloc + pinned
+  writes-per-hit)/t7 (soak: a 4096-cycle dump/restore + `clear()` leg with a standalone
+  bucket-pool free-length == capacity assertion)/t9 (two must-fail controls,
+  `lfu-approx-freq` and `lfu-freq-dropped`), and a `validate()` conservation term 13
+  (bucket list ascending, pool conserved `live + free == capacity`, column byteLengths
+  fixed).
+
 ## [1.10.0] - 2026-09-13
 
 ### Added

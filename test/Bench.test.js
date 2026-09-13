@@ -143,9 +143,9 @@ test('runBench: returns a well-formed structure (version/node/arch/config/worklo
         assert.equal(typeof wl.opt.hits, 'number');
         assert.ok(Number.isFinite(wl.opt.hitRatio));
         assert.ok(Array.isArray(wl.members));
-        assert.equal(wl.members.length, 8);
+        assert.equal(wl.members.length, 9);
         const names = wl.members.map((m) => m.name);
-        assert.deepEqual(names, ['LiteLru', 'Sieve', 'S3Fifo', 'WTinyLfu', 'Slru', 'TwoQ', 'Arc', 'Lirs']);
+        assert.deepEqual(names, ['LiteLru', 'Sieve', 'S3Fifo', 'WTinyLfu', 'Slru', 'TwoQ', 'Arc', 'Lirs', 'Lfu']);
     }
 });
 

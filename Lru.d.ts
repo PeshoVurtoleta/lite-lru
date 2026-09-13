@@ -706,6 +706,56 @@ export class Lirs<K = unknown, V = unknown> implements LiteCache<K, V> {
   get capacity(): number;
 }
 
+/**
+ * Lfu -- an O(1) EXACT Least-Frequently-Used cache (Shah-Matani), decisions/0024. The ninth
+ * family member: eviction by EXACT access frequency, with an LRU tie-break within a frequency.
+ * A doubly-linked list of frequency buckets (each a recency list of keys at that exact count);
+ * a hit relinks the key to the freq+1 bucket -- O(1), zero-ALLOCATION but not zero-write. This
+ * is the EXACT counterpart to the approximate-sketch `WTinyLfu`: when you need a provable "the
+ * least-frequently-used key is the victim" guarantee, not a probabilistic one. Same uniform
+ * `LiteCache<K, V>` surface as every other member -- the one-line policy swap.
+ *
+ * @typeParam K key type (any value; SameValueZero equality via the internal Map)
+ * @typeParam V value type
+ */
+export class Lfu<K = unknown, V = unknown> implements LiteCache<K, V> {
+  /**
+   * @param capacity max entries; must be an integer >= 1 (else throws RangeError,
+   *                 fail-closed -- null is not zero).
+   * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
+   */
+  constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  /** Reconstruct a FRESH `Lfu` from a `dump()` snapshot (decisions/0021 + 0024), incl. the
+   *  frequency buckets, their EXACT per-bucket frequencies AND the full within-bucket key
+   *  ordering (dropping the frequencies is a fail-OPEN future-eviction bug). Fail closed on
+   *  any mismatch. */
+  static restore<K = unknown, V = unknown>(snap: CacheSnapshot, opts?: LiteCacheOptions<K, V>): Lfu<K, V>;
+  get(key: K): V | undefined;
+  put(key: K, value: V, ttlMs?: number): void;
+  has(key: K): boolean;
+  peek(key: K): V | undefined;
+  delete(key: K): boolean;
+  clear(): void;
+  purgeStale(): number;
+  /** Live runtime counters (decisions/0019). BORROWED holder -- copy what you keep;
+   *  throws on an instance built without { stats: true } (fail-closed). */
+  stats(): CacheStats;
+  /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
+  resetStats(): void;
+  /** Serialize to a plain, structurally-cloneable snapshot (decisions/0021). COLD, may
+   *  allocate (honest <= 96 B/entry; no zero-GC claim). Restore with the static restore(). */
+  dump(): CacheSnapshot;
+  keys(): IterableIterator<K>;
+  values(): IterableIterator<V>;
+  entries(): IterableIterator<[K, V]>;
+  /** Iterable protocol == entries(); the yielded [K, V] tuple is BORROWED/reused
+   *  (decisions/0018) -- copy what you keep. Only a copying map materializes
+   *  (Array.from(c.entries(), ([k,v])=>[k,v])); a bare spread reads all-undefined. */
+  [Symbol.iterator](): IterableIterator<[K, V]>;
+  get size(): number;
+  get capacity(): number;
+}
+
 /** The package version (kept in lock-step with package.json + Lru.js). */
 export const VERSION: string;
 

@@ -20,8 +20,9 @@ import {
     slruPolicy, slruIntPolicy, twoqPolicy, twoqIntPolicy,
     arcPolicy, arcIntPolicy,
     lirsPolicy, lirsIntPolicy,
+    lfuPolicy, lfuIntPolicy,
     lruTtlPolicy, sieveTtlPolicy, s3fifoTtlPolicy, wtinylfuTtlPolicy,
-    slruTtlPolicy, twoqTtlPolicy, arcTtlPolicy, lirsTtlPolicy,
+    slruTtlPolicy, twoqTtlPolicy, arcTtlPolicy, lirsTtlPolicy, lfuTtlPolicy,
     SNAP_MEMBERS, runRoundTrip,
     SEED, die,
 } from './harness.mjs';
@@ -148,6 +149,20 @@ export function run() {
     fuzzPolicy(lirsPolicy, lirsConfigs);
     fuzzPolicy(lirsIntPolicy, lirsConfigs);
 
+    // The Lfu MEMBER proof (decisions/0024): the exact-LFU member on BOTH backings against
+    // its own independent exact-frequency + LRU-tie-break oracle -- same value AND same next
+    // victim AND same size after every op. Caps 1..9 stress degenerate buckets (cap 1 -> one
+    // key whose frequency climbs unboundedly, bucket relabel fast path); 64/256 exercise many
+    // coexisting frequency buckets with promotions, in-place relabels, and min-bucket eviction.
+    const lfuConfigs = [];
+    for (let cap = 1; cap <= 9; cap++) {
+        lfuConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0xf0 + cap });
+    }
+    lfuConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0xff });
+    lfuConfigs.push({ cap: 256, keyspace: 300, ops: OPS, salt: 0xf1f });
+    fuzzPolicy(lfuPolicy, lfuConfigs);
+    fuzzPolicy(lfuIntPolicy, lfuConfigs);
+
     // The SEAM proof: the SAME runner drives a second policy unchanged.
     fuzzPolicy(fifoPolicy, [
         { cap: 1, keyspace: 4, ops: OPS, salt: 0x61 },
@@ -173,6 +188,7 @@ export function run() {
     fuzzPolicy(twoqTtlPolicy, ttlConfigs);
     fuzzPolicy(arcTtlPolicy, ttlConfigs);
     fuzzPolicy(lirsTtlPolicy, ttlConfigs);
+    fuzzPolicy(lfuTtlPolicy, ttlConfigs);
 
     // The SNAPSHOT proof (decisions/0021): for EVERY member, on BOTH backings, ttl OFF
     // and ttl ON, over the 100k corpus -- dump -> restore -> dump is a fixed point AND a

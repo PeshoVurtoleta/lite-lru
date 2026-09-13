@@ -9,8 +9,8 @@
  *   E single-capacity cache: every put evicts; head===tail always.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu } from './harness.mjs';
 
 export function run() {
     // --- A: re-hit the MRU N times (the head-re-hit fast path) -------------------
@@ -467,12 +467,70 @@ export function run() {
         }
     }
 
+    // --- P: Lfu degenerate caps + exact-frequency law + the min-bucket eviction +
+    // in-place-relabel + scan resistance + conservation (decisions/0024) ------------
+    {
+        // Degenerate caps 1..4: every put churns, conservation holds, and the exact
+        // frequency of a repeatedly-touched key climbs by exactly one per access.
+        for (const cap of [1, 2, 3, 4]) {
+            const c = new Lfu(cap);
+            for (let i = 0; i < 500; i++) {
+                c.put(i, i);
+                check(c.size === Math.min(cap, i + 1), () => 't2 P: lfu cap-' + cap + ' size drift at ' + i);
+                check(c.get(i) === i, () => 't2 P: lfu cap-' + cap + ' just-inserted key missing');
+                validate(c);
+            }
+            c.clear();
+            check(c.size === 0, () => 't2 P: lfu cap-' + cap + ' not empty after clear');
+            check(c._bMin === -1, () => 't2 P: lfu cap-' + cap + ' bucket list not empty after clear');
+            check(c._freeListLength() === cap, () => 't2 P: lfu cap-' + cap + ' free list != capacity after clear');
+            validate(c);
+        }
+
+        // The EXACT-frequency + min-bucket eviction law. Fill; then raise the frequency of
+        // a proven-hot subset far above the rest. A cap+K cold scan evicts ONLY the coldest
+        // (freq-1) keys -- never a hot key -- which is precisely what an exact LFU must do and
+        // what the approximate WTinyLfu sketch cannot guarantee.
+        {
+            const N = 64;
+            const c = new Lfu(N, { keys: 'int' });
+            for (let i = 0; i < N; i++) c.put(i, i);        // all at freq 1
+            const hot = [0, 1, 2, 3, 4, 5, 6, 7];
+            for (const h of hot) for (let t = 0; t < 20; t++) c.get(h); // lift hot keys' frequency
+            // The next victim must be a COLD (freq-1) key, and it must be the LRU-end one.
+            check(!hot.includes(c._peekVictim()), () => 't2 P: lfu victim is a hot key -- exact LFU violated');
+            for (let i = 0; i < 8000; i++) {
+                for (const h of hot) check(c.get(h) === h, () => 't2 P: lfu hot key ' + h + ' lost mid-scan at ' + i);
+                c.put(1000 + i, i);                          // cold churn
+                check(c.size === N, () => 't2 P: lfu drifted from capacity during the scan');
+                if ((i & 511) === 0) validate(c);
+            }
+            for (const h of hot) check(c.has(h), () => 't2 P: lfu hot key ' + h + ' evicted by the scan (no frequency resistance)');
+            validate(c);
+            void wrapLfu(c);
+        }
+
+        // In-place RELABEL: a single key whose frequency climbs unboundedly must never grow
+        // the bucket pool beyond one live bucket (relabel, not create+destroy).
+        {
+            const c = new Lfu(4);
+            c.put('x', 1);
+            for (let i = 0; i < 100000; i++) c.get('x');
+            check(c.size === 1, () => 't2 P: lfu single-key size drift');
+            check(c._bFreq[c._bMin] === 100001, () => 't2 P: lfu exact frequency wrong after 100k touches: ' + c._bFreq[c._bMin]);
+            // exactly one live bucket, the rest free (pool conserved, never grown)
+            let live = 0; for (let b = c._bMin; b !== -1; b = c._bNext[b]) live++;
+            check(live === 1, () => 't2 P: lfu single hot key created ' + live + ' live buckets (relabel broken)');
+            validate(c);
+        }
+    }
+
     // --- J: the LAZY-SEMANTICS TRIPLE as executable laws (decisions/0017, D17.3) --
     // For EVERY member: an expired entry is a MISS through get/has/peek alike, and each
     // of the three REAPS it in place (fires onEvict once, size drops). A fresh Infinity
     // sibling is untouched by any of them. validate() nets each reap.
     {
-        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs]];
+        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu]];
         // one probe method per fresh cache (each reap is destructive, so isolate them)
         const probes = [
             ['get', (c, k) => c.get(k), undefined],
@@ -511,7 +569,7 @@ export function run() {
     // free stack so size + freeListLength === capacity). Every member, both backings.
     {
         const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo],
-            ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs]];
+            ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu]];
         for (const [name, C] of members) {
             for (const keys of [undefined, 'int']) {
                 const o = keys ? { keys } : undefined;

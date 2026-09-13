@@ -31,7 +31,7 @@
  * rejects the window; T9 exercises the same alloc lane in-process.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, BREAK, check, die, makePrng,
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
@@ -39,6 +39,7 @@ import {
     CountedS3Fifo, S3FIFO_WRITES_HIT_LINKS, S3FIFO_WRITES_HIT_VIS,
     CountedWTinyLfu, WTINYLFU_WRITES_WINDOW_MRU_REHIT,
     CountedLirs, LIRS_WRITES_LIR_TOP_REHIT,
+    CountedLfu, LFU_WRITES_FASTPATH, LFU_WRITES_MAX,
 } from './harness.mjs';
 
 const CAP = 4096;      // power of 2 so the hot body masks its key with & MASK
@@ -154,6 +155,27 @@ class CoveredLirs extends Lirs {
         const s = this._store.get(key);
         if (s >= 0 && (this._st[s] & 1)) this._lirHits++;
         return super.get(key);
+    }
+}
+
+/** An Lfu counting the DISTINGUISHING lanes (decisions/0024) via plain integer field
+ *  increments (zero-alloc; lane coverage only, never on a MEASURED window): frequency-bucket
+ *  CREATES, DESTROYS, and in-place RELABELS (the fast path), plus the max observed
+ *  writes-per-hit. A well-mixed stream must exercise all three bucket transitions. */
+class CoveredLfu extends Lfu {
+    constructor(cap, opts) {
+        super(cap, opts);
+        this._bCreates = 0; this._bDestroys = 0; this._bRelabels = 0;
+    }
+    _bAlloc(freq) { this._bCreates++; return super._bAlloc(freq); }
+    _bRelease(b) { this._bDestroys++; return super._bRelease(b); }
+    _touch(s) {
+        const b = this._kB[s];
+        const only = this._bHead[b] === s && this._fNext[s] === -1;
+        const nb = this._bNext[b];
+        const relabel = only && (nb === -1 || this._bFreq[nb] !== this._bFreq[b] + 1);
+        if (relabel) this._bRelabels++;
+        super._touch(s);
     }
 }
 
@@ -1164,4 +1186,115 @@ export async function run() {
         glirs.summary.gc.maxMs.toFixed(3) + ' adversarial max prune length=' + adv._maxPrune + ' (L_hir=' +
         adv._Lhir + ', worst-case op ' + advMs.toFixed(3) + ' ms); lanes covered: lirHits=' +
         covLirs._lirHits + ' promos=' + covLirs._promos + ' replaces=' + covLirs._replaces + '\n');
+
+    // --- Gate LFU: the Lfu member -- STRICT zero-alloc + MEASURED writes-per-hit --------
+    // (decisions/0024) The SAME MIXED, recurring int-key stream drives every LFU lane at
+    // capacity: hot recurrence -> frequency climbs (bucket relabels + creates + destroys and
+    // relinks to the freq+1 bucket); cold churn -> min-frequency-bucket evictions. Zero-alloc:
+    // the closure indexes a preallocated Int32Array and does int get/put only. The key-list
+    // columns `_fNext`/`_fPrev`/`_kB`, the bucket-pool columns `_b*` (Float64 + Int32), and the
+    // int index buffers NEVER grow; the bucket pool stays conserved (live + free == cap always).
+    const lfuStream = buildMixedStream(STREAM_LEN, HOT_SIZE, A1IN_CAP, 0x1f00d24);
+    const lfuCache = new Lfu(CAP, { keys: 'int' });
+    const lfuSink = new Int32Array(1);
+    let lfui = 0;
+    const lfuHot = () => {
+        const k = lfuStream[lfui & STREAM_MASK]; lfui++;
+        const v = lfuCache.get(k);
+        if (v === undefined) lfuCache.put(k, k); else { lfuSink[0] += v | 0; lfuCache.get(k); }
+    };
+    for (let i = 0; i < PREFILL; i++) lfuHot(); // reach steady state
+    check(lfuCache.size === CAP, () => 't6 Gate LFU: prefill did not reach capacity (size ' + lfuCache.size + ')');
+    const lfuFNextBytes = lfuCache._fNext.buffer.byteLength;
+    const lfuFPrevBytes = lfuCache._fPrev.buffer.byteLength;
+    const lfuKBBytes = lfuCache._kB.buffer.byteLength;
+    const lfuBFreqBytes = lfuCache._bFreq.buffer.byteLength;
+    const lfuBNextBytes = lfuCache._bNext.buffer.byteLength;
+    const lfuBPrevBytes = lfuCache._bPrev.buffer.byteLength;
+    const lfuBHeadBytes = lfuCache._bHead.buffer.byteLength;
+    const lfuBTailBytes = lfuCache._bTail.buffer.byteLength;
+    const lfuIxSlotBytes = lfuCache._store._ixSlot.buffer.byteLength;
+    const lfuIxKeyBytes = lfuCache._store._ixKey.buffer.byteLength;
+    const glfu = runOpsGate(lfuHot, { ops: OPS, warmup: WARMUP });
+    check(lfuCache._fNext.buffer.byteLength === lfuFNextBytes,
+        () => 't6 Gate LFU: _fNext.buffer grew ' + lfuFNextBytes + ' -> ' + lfuCache._fNext.buffer.byteLength);
+    check(lfuCache._fPrev.buffer.byteLength === lfuFPrevBytes,
+        () => 't6 Gate LFU: _fPrev.buffer grew ' + lfuFPrevBytes + ' -> ' + lfuCache._fPrev.buffer.byteLength);
+    check(lfuCache._kB.buffer.byteLength === lfuKBBytes,
+        () => 't6 Gate LFU: _kB.buffer grew ' + lfuKBBytes + ' -> ' + lfuCache._kB.buffer.byteLength);
+    check(lfuCache._bFreq.buffer.byteLength === lfuBFreqBytes,
+        () => 't6 Gate LFU: _bFreq.buffer grew ' + lfuBFreqBytes + ' -> ' + lfuCache._bFreq.buffer.byteLength);
+    check(lfuCache._bNext.buffer.byteLength === lfuBNextBytes,
+        () => 't6 Gate LFU: _bNext.buffer grew ' + lfuBNextBytes + ' -> ' + lfuCache._bNext.buffer.byteLength);
+    check(lfuCache._bPrev.buffer.byteLength === lfuBPrevBytes,
+        () => 't6 Gate LFU: _bPrev.buffer grew ' + lfuBPrevBytes + ' -> ' + lfuCache._bPrev.buffer.byteLength);
+    check(lfuCache._bHead.buffer.byteLength === lfuBHeadBytes,
+        () => 't6 Gate LFU: _bHead.buffer grew ' + lfuBHeadBytes + ' -> ' + lfuCache._bHead.buffer.byteLength);
+    check(lfuCache._bTail.buffer.byteLength === lfuBTailBytes,
+        () => 't6 Gate LFU: _bTail.buffer grew ' + lfuBTailBytes + ' -> ' + lfuCache._bTail.buffer.byteLength);
+    check(lfuCache._store._ixSlot.buffer.byteLength === lfuIxSlotBytes,
+        () => 't6 Gate LFU: _ixSlot.buffer grew ' + lfuIxSlotBytes + ' -> ' + lfuCache._store._ixSlot.buffer.byteLength);
+    check(lfuCache._store._ixKey.buffer.byteLength === lfuIxKeyBytes,
+        () => 't6 Gate LFU: _ixKey.buffer grew ' + lfuIxKeyBytes + ' -> ' + lfuCache._store._ixKey.buffer.byteLength);
+    check(lfuCache.size === CAP, () => 't6 Gate LFU: churn did not stay at capacity (size ' + lfuCache.size + ')');
+    // The bucket pool is conserved: live buckets + free buckets == capacity (never grown).
+    let lfuLive = 0; for (let b = lfuCache._bMin; b !== -1; b = lfuCache._bNext[b]) lfuLive++;
+    let lfuFree = 0; for (let b = lfuCache._bFreeHead; b !== -1; b = lfuCache._bNext[b]) lfuFree++;
+    check(lfuLive + lfuFree === CAP,
+        () => 't6 Gate LFU: bucket pool not conserved (live ' + lfuLive + ' + free ' + lfuFree + ' != ' + CAP + ')');
+    if (!glfu.report.ok) {
+        const g = glfu.summary.gc;
+        die('t6 Gate LFU (mixed churn) ops gate rejected -- verdict=' + glfu.report.verdict +
+            ' source=' + glfu.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const glfuA = runAllocsGate(lfuHot, { iterations: 50000, batches: 8 });
+    if (!glfuA.ok) {
+        die('t6 Gate LFU (mixed churn) retained-alloc gate rejected -- verdict=' + glfuA.report.verdict +
+            ' settled=' + glfuA.result.settled + ' bytesPerCall=' + glfuA.bytesPerCall);
+    }
+    // Writes-per-hit pins (DEBATE item 2 -- an LFU hit is zero-ALLOC but NOT zero-write).
+    // (a) the FAST PATH: a single-key bucket with no freq+1 neighbour is RELABELLED in place.
+    const clfuFast = new CountedLfu(8);
+    clfuFast.put(0, 0);           // key 0 is the only key in a freq-1 bucket
+    clfuFast.resetWrites();
+    clfuFast.get(0);             // freq 1 -> 2, no freq-2 bucket -> relabel in place
+    check(clfuFast.writes() === LFU_WRITES_FASTPATH,
+        () => 't6 Gate LFU: fast-path (single-key relabel) wrote ' + clfuFast.writes() + ', expected ' + LFU_WRITES_FASTPATH);
+    // (b) the WORST case over a churn window must never exceed the pinned bound.
+    const clfu = new CountedLfu(CAP, { keys: 'int' });
+    let clfui = 0, lfuMaxWrites = 0;
+    for (let i = 0; i < STREAM_LEN; i++) {
+        const k = lfuStream[i & STREAM_MASK];
+        const s = clfu._store.get(k);
+        if (s < 0) { clfu.put(k, k); continue; }
+        clfu.resetWrites();
+        clfu.get(k);
+        if (clfu.writes() > lfuMaxWrites) lfuMaxWrites = clfu.writes();
+    }
+    check(lfuMaxWrites <= LFU_WRITES_MAX,
+        () => 't6 Gate LFU: worst-case hit wrote ' + lfuMaxWrites + ' cells (> pinned bound ' + LFU_WRITES_MAX + ')');
+    check(lfuMaxWrites > LFU_WRITES_FASTPATH,
+        () => 't6 Gate LFU: writes-per-hit never exceeded the fast path -- the relink lane was not covered');
+    // Lane coverage: the mixed stream must exercise bucket CREATES, DESTROYS and RELABELS.
+    const covLfu = new CoveredLfu(CAP, { keys: 'int' });
+    let covLfui = 0;
+    const covLfuHot = () => {
+        const k = lfuStream[covLfui & STREAM_MASK]; covLfui++;
+        if (covLfu.get(k) === undefined) covLfu.put(k, k); else covLfu.get(k);
+    };
+    for (let i = 0; i < PREFILL; i++) covLfuHot();
+    covLfu._bCreates = 0; covLfu._bDestroys = 0; covLfu._bRelabels = 0;
+    for (let i = 0; i < OPS; i++) covLfuHot();
+    check(covLfu._bCreates >= 50,
+        () => 't6 Gate LFU: the window created ' + covLfu._bCreates + ' buckets (< 50 -- lane not covered)');
+    check(covLfu._bDestroys >= 50,
+        () => 't6 Gate LFU: the window destroyed ' + covLfu._bDestroys + ' buckets (< 50 -- lane not covered)');
+    check(covLfu._bRelabels >= 50,
+        () => 't6 Gate LFU: the window relabelled ' + covLfu._bRelabels + ' buckets (< 50 -- lane not covered)');
+    process.stderr.write('t6 Gate LFU: ' + glfuA.bytesPerCall.toFixed(5) +
+        ' B/op mixed churn (' + OPS + ' ops window, capacity ' + CAP + '); maxPauseMs=' +
+        glfu.summary.gc.maxMs.toFixed(3) + '; writes/hit fast-path=' + LFU_WRITES_FASTPATH +
+        ' worst-observed=' + lfuMaxWrites + ' (stream-dependent; pinned bound=' + LFU_WRITES_MAX +
+        '); lanes covered: bucketCreates=' +
+        covLfu._bCreates + ' destroys=' + covLfu._bDestroys + ' relabels=' + covLfu._bRelabels + '\n');
 }

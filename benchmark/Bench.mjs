@@ -29,7 +29,7 @@
  * @license MIT
  */
 
-import {LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, VERSION} from '../Lru.js';
+import {LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, VERSION} from '../Lru.js';
 
 /* -------------------------------------------------------------------------- *
  * Seeded PRNG -- xorshift32, the same generator the torture harness uses, so a
@@ -277,6 +277,11 @@ function instrument(cache, counter) {
     cache._prev = wrap(cache._prev);
     if (cache._vis) cache._vis = wrap(cache._vis); // Sieve's visited column
     if (cache._sNext) { cache._sNext = wrap(cache._sNext); cache._sPrev = wrap(cache._sPrev); } // Lirs stack S
+    if (cache._fNext) { // Lfu key lists + bucket pool (a hit relinks across frequency buckets)
+        cache._fNext = wrap(cache._fNext); cache._fPrev = wrap(cache._fPrev); cache._kB = wrap(cache._kB);
+        cache._bFreq = wrap(cache._bFreq); cache._bNext = wrap(cache._bNext); cache._bPrev = wrap(cache._bPrev);
+        cache._bHead = wrap(cache._bHead); cache._bTail = wrap(cache._bTail);
+    }
 }
 
 /** Hit ratio + writes-per-hit for one member over one trace (untimed). A "hit" is
@@ -334,6 +339,7 @@ const MEMBERS = [
     {name: 'TwoQ', ctor: TwoQ},
     {name: 'Arc', ctor: Arc},
     {name: 'Lirs', ctor: Lirs},
+    {name: 'Lfu', ctor: Lfu},
 ];
 
 /* -------------------------------------------------------------------------- *

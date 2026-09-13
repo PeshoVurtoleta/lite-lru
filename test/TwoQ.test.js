@@ -21,7 +21,7 @@ const TWOQ_A1IN = 0; // matches Lru.js tags
 const TWOQ_AM = 1;
 
 test('exports: VERSION and the named TwoQ export are present', async () => {
-    assert.equal(VERSION, '1.10.0');
+    assert.equal(VERSION, '1.11.0');
     const mod = await import('../Lru.js');
     assert.equal(mod.TwoQ, TwoQ);
 });

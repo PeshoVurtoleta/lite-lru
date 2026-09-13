@@ -220,6 +220,22 @@ export const RENDERERS = {
             drawGhost(g, geom.x, y, s.hist, 'non-resident history');
         },
     },
+    Lfu: {
+        // Lfu dump() shape (decisions/0024): a list of frequency BUCKETS in ascending order,
+        // each carrying its EXACT `freq` + its recency list (MRU..LRU) of resident keys/values.
+        // The bucket ORDER (lowest freq = the eviction end) + the exact frequencies are the
+        // whole story -- render each bucket labelled with its frequency.
+        fields: ['buckets'],
+        model(s) { return pick(s, this.fields); },
+        draw(g, s, geom) {
+            let y = geom.y + 16;
+            for (let i = 0; i < s.buckets.length; i++) {
+                const bk = s.buckets[i];
+                const col = i === 0 ? COL.prob : COL.prot; // lowest freq (eviction end) stands out
+                y = drawList(g, geom.x, y, bk.list, 'freq ' + bk.freq + (i === 0 ? ' (evict end)' : ''), col);
+            }
+        },
+    },
 };
 
 /** The members this module renders. Demo.test.mjs asserts this covers every engine

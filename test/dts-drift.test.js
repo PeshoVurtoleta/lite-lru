@@ -135,6 +135,11 @@ function lirsImplementsLiteCache(dtsText) {
   return /class Lirs<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
 }
 
+/** True if the d.ts declares `class Lfu<...> implements LiteCache<...>`. */
+function lfuImplementsLiteCache(dtsText) {
+  return /class Lfu<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
+}
+
 /** True if BOTH sources declare a `Sieve` class (the second named export). */
 function jsDeclaresSieve(jsText) {
   return /export class Sieve\b/.test(jsText);
@@ -189,6 +194,14 @@ function jsDeclaresLirs(jsText) {
 }
 function dtsDeclaresLirs(dtsText) {
   return /export class Lirs\b/.test(dtsText);
+}
+
+/** True if BOTH sources declare an `Lfu` class (the ninth named export). */
+function jsDeclaresLfu(jsText) {
+  return /export class Lfu\b/.test(jsText);
+}
+function dtsDeclaresLfu(dtsText) {
+  return /export class Lfu\b/.test(dtsText);
 }
 
 /** Symmetric-difference report between two sets: [] when equal. */
@@ -342,6 +355,22 @@ test('(j) Lirs surface: Lirs is a named export in BOTH sources, members agree, i
   assert.ok(lirsImplementsLiteCache(DTS), 'class Lirs must `implements LiteCache<...>`');
 });
 
+test('(k) Lfu surface: Lfu is a named export in BOTH sources, members agree, implements LiteCache', () => {
+  assert.ok(jsDeclaresLfu(JS), 'Lru.js must `export class Lfu` (the ninth named export)');
+  assert.ok(dtsDeclaresLfu(DTS), 'Lru.d.ts must `export class Lfu`');
+  const js = classMembers(JS, 'Lfu');
+  const dts = classMembers(DTS, 'Lfu');
+  const diffs = setDiff(js, dts, 'Lru.js', 'Lru.d.ts');
+  assert.deepEqual(diffs, [], diffs.join('; '));
+  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'purgeStale', 'stats', 'resetStats', 'dump', 'keys', 'values', 'entries', 'size', 'capacity']) {
+    assert.ok(js.has(nm), 'Lru.js class Lfu is missing public member ' + nm);
+    assert.ok(dts.has(nm), 'Lru.d.ts class Lfu is missing member ' + nm);
+  }
+  assert.equal(js.size, 15, 'expected exactly 15 public members in Lfu (Lru.js), saw ' + js.size);
+  assert.equal(dts.size, 15, 'expected exactly 15 members in Lfu (Lru.d.ts), saw ' + dts.size);
+  assert.ok(lfuImplementsLiteCache(DTS), 'class Lfu must `implements LiteCache<...>`');
+});
+
 // --- teeth: each check must reject a mutated COPY (non-vacuity) --------------
 
 test('control: unmutated text reports zero diffs / all-present (vacuity)', () => {
@@ -355,6 +384,7 @@ test('control: unmutated text reports zero diffs / all-present (vacuity)', () =>
   assert.deepEqual(setDiff(classMembers(JS, 'TwoQ'), classMembers(DTS, 'TwoQ'), 'a', 'b'), []);
   assert.deepEqual(setDiff(classMembers(JS, 'Arc'), classMembers(DTS, 'Arc'), 'a', 'b'), []);
   assert.deepEqual(setDiff(classMembers(JS, 'Lirs'), classMembers(DTS, 'Lirs'), 'a', 'b'), []);
+  assert.deepEqual(setDiff(classMembers(JS, 'Lfu'), classMembers(DTS, 'Lfu'), 'a', 'b'), []);
   assert.ok(hasLiteCacheInterface(DTS));
   assert.ok(liteLruImplementsLiteCache(DTS));
   assert.ok(sieveImplementsLiteCache(DTS));
@@ -364,6 +394,7 @@ test('control: unmutated text reports zero diffs / all-present (vacuity)', () =>
   assert.ok(twoqImplementsLiteCache(DTS));
   assert.ok(arcImplementsLiteCache(DTS));
   assert.ok(lirsImplementsLiteCache(DTS));
+  assert.ok(lfuImplementsLiteCache(DTS));
 });
 
 test('control: desyncing the package.json version makes version parity fail', () => {

@@ -21,12 +21,13 @@
  *   C-stats-counts-peek   a peek that credits a hit    -> brute-tally parity fails
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, wrapWTinyLfu,
-    wrapSlru, wrapTwoQ, wrapArc, wrapLirs, validate, runRoundTrip,
+    wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, validate, runRoundTrip,
     lruPolicy, check, die, makePrng,
 } from './harness.mjs';
+import { makeLfuOracle } from './oracles/lfu.mjs';
 import { makeLruOracle } from './oracles/lru.mjs';
 import { makeFifoOracle } from './oracles/fifo.mjs';
 import { makeSieveOracle } from './oracles/sieve.mjs';
@@ -260,6 +261,18 @@ class NoHistoryLirs extends Lirs {
     constructor(cap, options) {
         super(cap, options);
         this._hist = { _len: 0, has() { return false; }, addMRU() {}, delLRU() {}, consume() {}, clear() {} };
+    }
+}
+
+/** C-lfu-approx-freq (decisions/0024): an Lfu whose frequency counting SATURATES at 2 --
+ *  the approximate-sketch behaviour Lfu exists to REJECT. Once a key reaches freq 2 it stops
+ *  climbing (and stops relinking), so hot keys the exact oracle keeps separating collapse into
+ *  one bucket -- the next-eviction victim + returned values drift from the pure EXACT-LFU
+ *  oracle. Non-vacuity: the CORRECT (exact) Lfu agrees (t5). */
+class ApproxFreqLfu extends Lfu {
+    _touch(s) {
+        if (this._bFreq[this._kB[s]] >= 2) return; // BUG: saturate -> approximate, not exact
+        super._touch(s);
     }
 }
 
@@ -620,6 +633,21 @@ export function run() {
         if (r.ok) die('t9 C-lirs-no-history: omitting the non-resident history did NOT diverge from the lirs oracle (no teeth)');
     }
 
+    // --- C-lfu-approx-freq (decisions/0024): saturating frequency -> diverges -----------
+    // Lfu's headline is EXACT frequency (what distinguishes it from the approximate-sketch
+    // WTinyLfu). A cache that saturates its counter at 2 collapses distinct hot frequencies
+    // into one bucket, so the LRU-tie-break victim + returned values drift from the pure
+    // EXACT-LFU oracle. Non-vacuity: the CORRECT Lfu agrees (t5).
+    {
+        const brokenPolicy = {
+            name: 'lfu-approx-freq',
+            real: (cap) => wrapLfu(new ApproxFreqLfu(cap)),
+            oracle: (cap) => makeLfuOracle(cap),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x1f24, keyspace: 40 });
+        if (r.ok) die('t9 C-lfu-approx-freq: saturating the frequency counter did NOT diverge from the exact-lfu oracle (no teeth)');
+    }
+
     // --- C-skip-gate (decisions/0017): a get that skips the ttl gate -> diverges ---
     // The lazy TTL rule (D17.3): a stale hit is a MISS, reaped in place. A get that never
     // checks staleness returns the expired value and keeps it resident, so it MUST
@@ -817,11 +845,25 @@ export function run() {
                 return S3Fifo.restore(copy, opts);
             }
         }
+        // lfu-freq-dropped: restore keeps the bucket ORDER but DROPS the exact frequencies,
+        // compacting them to 1,2,3,... (the gaps between counted frequencies are lost). A
+        // restore that defaults frequencies instead of reconstructing them is a fail-OPEN bug:
+        // future promotions merge buckets after the WRONG number of accesses, so the victim
+        // drifts from the twin (whose exact frequencies were preserved).
+        class FreqDroppedLfu extends Lfu {
+            static restore(snap, opts) {
+                const copy = Object.assign({}, snap, {
+                    buckets: snap.buckets.map((b, i) => ({ freq: i + 1, list: b.list })),
+                });
+                return Lfu.restore(copy, opts);
+            }
+        }
 
         const controls = [
             { name: 'arc-p-dropped', broken: { Ctor: PDroppedArc, wrap: wrapArc }, real: { Ctor: Arc, wrap: wrapArc } },
             { name: 'sketch-dropped', broken: { Ctor: SketchDroppedWTinyLfu, wrap: wrapWTinyLfu }, real: { Ctor: WTinyLfu, wrap: wrapWTinyLfu } },
             { name: 'ghost-omitted', broken: { Ctor: GhostOmittedS3Fifo, wrap: wrapS3Fifo }, real: { Ctor: S3Fifo, wrap: wrapS3Fifo } },
+            { name: 'lfu-freq-dropped', broken: { Ctor: FreqDroppedLfu, wrap: wrapLfu }, real: { Ctor: Lfu, wrap: wrapLfu } },
         ];
         for (const ctl of controls) {
             // Non-vacuity: the CORRECT round-trip agrees with the twin (also proven in t5).

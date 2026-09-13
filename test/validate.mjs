@@ -108,6 +108,21 @@ export function activeListsOf(cache) {
             { name: 'lirs-q', head: cache._qHead, tail: cache._qTail, doubly: true },
         ];
     }
+    // An Lfu member (decisions/0024) threads its resident keys through the MEMBER columns
+    // `_fNext`/`_fPrev` (NOT the shared `_next`/`_prev`), one recency list per frequency
+    // bucket (detected by its `_bMin` bucket-list head). Each live bucket is one doubly-linked
+    // key list; the descriptors carry their OWN link columns so term 3/4 walks `_fNext`/`_fPrev`.
+    // The bucket list itself + the exact frequencies are checked by the LFU conservation term.
+    if (cache._bMin !== undefined) {
+        const out = [];
+        for (let b = cache._bMin; b !== NIL; b = cache._bNext[b]) {
+            out.push({
+                name: 'lfu-freq' + cache._bFreq[b], head: cache._bHead[b], tail: cache._bTail[b],
+                doubly: true, next: cache._fNext, prev: cache._fPrev,
+            });
+        }
+        return out;
+    }
     // A SIEVE member (decisions/0012) exposes _head/_tail on a single doubly-linked
     // FIFO ring (detected by its moving `_hand`). Classic LRU exposes the same shape
     // as a recency DLL. Both are ONE doubly-linked list -> one descriptor.
@@ -177,13 +192,17 @@ export function validate(cache, lists) {
     let total = 0;
     for (let li = 0; li < descriptors.length; li++) {
         const L = descriptors[li];
+        // A descriptor may thread its OWN link columns (Lfu's per-bucket key lists ride
+        // `_fNext`/`_fPrev`, decisions/0024); default to the shared `_next`/`_prev`.
+        const nextCol = L.next || cache._next;
+        const prevCol = L.prev || cache._prev;
         let count = 0;
         let prev = NIL;
-        for (let s = L.head; s !== NIL; s = cache._next[s]) {
+        for (let s = L.head; s !== NIL; s = nextCol[s]) {
             if (s < 0 || s >= cap) {
                 throw new Error('[validate] list "' + L.name + '" reached out-of-range slot ' + s);
             }
-            if (L.doubly && cache._prev[s] !== prev) {
+            if (L.doubly && prevCol[s] !== prev) {
                 throw new Error(
                     '[validate] list "' + L.name + '" reciprocity broken at slot ' + s +
                     ': _prev=' + cache._prev[s] + ' expected ' + prev);
@@ -413,6 +432,60 @@ export function validate(cache, lists) {
         // access prunes it. The member + the brute oracle agree on this exactly (t5).
         if (cache._hist._len > cache._histCap) {
             throw new Error('[validate] lirs history(' + cache._hist._len + ') > histCap(' + cache._histCap + ')');
+        }
+    }
+
+    // --- term 13 (Lfu members, decisions/0024): the bucket list + exact frequencies -----
+    // A no-op unless the member exposes `_bMin`. For an Lfu: the bucket list is a coherent,
+    // cycle-free doubly-linked list in STRICTLY ASCENDING frequency (`_bMin` = the lowest);
+    // every bucket freq is a positive integer; every live bucket is non-empty and its keys'
+    // `_kB` all point back at it (already walked as one term-3/4 descriptor); live buckets +
+    // free buckets == capacity (the pool is conserved); and the `_b*`/`_f*`/`_kB` columns are
+    // the fixed construction-time size (never grown). The per-bucket key populations were
+    // already summed against `size` by term 3/4 via activeListsOf above.
+    if (cache._bMin !== undefined) {
+        // Every Lfu-specific column is one entry per slot/bucket, sized ONCE, never grown.
+        const cols = [['_fNext', 4], ['_fPrev', 4], ['_kB', 4], ['_bNext', 4], ['_bPrev', 4],
+            ['_bHead', 4], ['_bTail', 4], ['_bFreq', 8]];
+        for (let ci = 0; ci < cols.length; ci++) {
+            const name = cols[ci][0], w = cols[ci][1], col = cache[name];
+            if (col.length !== cap) {
+                throw new Error('[validate] lfu ' + name + '.length(' + col.length + ') != capacity(' + cap + ')');
+            }
+            if (col.buffer.byteLength !== cap * w) {
+                throw new Error('[validate] lfu ' + name + ' buffer(' + col.buffer.byteLength +
+                    ') != fixed size(' + (cap * w) + ') -- the column must never grow');
+            }
+        }
+        // Walk the bucket list: coherent + cycle-free + strictly ascending frequency, each
+        // bucket a positive-integer freq holding >= 1 key whose `_kB` points back at it.
+        let liveBuckets = 0, prevB = NIL, lastFreq = 0;
+        for (let b = cache._bMin; b !== NIL; b = cache._bNext[b]) {
+            if (b < 0 || b >= cap) throw new Error('[validate] lfu bucket list reached out-of-range bucket ' + b);
+            if (cache._bPrev[b] !== prevB) {
+                throw new Error('[validate] lfu bucket list reciprocity broken at ' + b +
+                    ': _bPrev=' + cache._bPrev[b] + ' expected ' + prevB);
+            }
+            const f = cache._bFreq[b];
+            if (!Number.isInteger(f) || f <= 0) throw new Error('[validate] lfu bucket ' + b + ' freq ' + f + ' is not a positive integer');
+            if (!(f > lastFreq)) throw new Error('[validate] lfu bucket freqs not strictly ascending at ' + b + ' (' + f + ' <= ' + lastFreq + ')');
+            if (cache._bHead[b] === NIL) throw new Error('[validate] lfu bucket ' + b + ' is empty (must hold >= 1 key)');
+            for (let s = cache._bHead[b]; s !== NIL; s = cache._fNext[s]) {
+                if (cache._kB[s] !== b) throw new Error('[validate] lfu slot ' + s + ' _kB=' + cache._kB[s] + ' != owning bucket ' + b);
+            }
+            lastFreq = f; prevB = b; liveBuckets++;
+            if (liveBuckets > cap) throw new Error('[validate] lfu bucket list has a cycle (walked > capacity)');
+        }
+        // The bucket pool is conserved: live buckets + free buckets == capacity.
+        let freeBuckets = 0;
+        for (let b = cache._bFreeHead; b !== NIL; b = cache._bNext[b]) {
+            if (b < 0 || b >= cap) throw new Error('[validate] lfu bucket free stack reached out-of-range bucket ' + b);
+            freeBuckets++;
+            if (freeBuckets > cap) throw new Error('[validate] lfu bucket free stack has a cycle (walked > capacity)');
+        }
+        if (liveBuckets + freeBuckets !== cap) {
+            throw new Error('[validate] lfu liveBuckets(' + liveBuckets + ') + freeBuckets(' + freeBuckets +
+                ') != capacity(' + cap + ')');
         }
     }
 }

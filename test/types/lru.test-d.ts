@@ -9,7 +9,7 @@
  * stops happening (tsc flags an unused directive). Test-only; not in files[].
  * ASCII-only.
  */
-import LiteLru, { VERSION, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs } from "../../Lru.js";
+import LiteLru, { VERSION, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from "../../Lru.js";
 import type { LiteCache, LiteCacheOptions } from "../../Lru.js";
 
 // A type-equality check with teeth (identity holds only for exact-equal types).
@@ -311,3 +311,26 @@ new Lirs<number, number>(10, { keys: "lir" });
 
 // @ts-expect-error -- size is readonly on Lirs.
 li.size = 5;
+
+// ---- Lfu: the ninth family member SATISFIES the SAME LiteCache surface ---------
+// (decisions/0024) The one-line policy swap: `new Lfu(n)` type-checks into the SAME
+// `LiteCache` binding as every other member.
+const lf = new Lfu<string, number>(10);
+const lfGot = lf.get("a");
+expectTrue<Equal<typeof lfGot, number | undefined>>();
+expectTrue<Equal<ReturnType<typeof lf.has>, boolean>>();
+expectTrue<Equal<typeof lf.capacity, number>>();
+const lfIface: LiteCache<string, number> = new Lfu<string, number>(10);
+lfIface.put("k", 1);
+new Lfu<number, number>(10, { keys: "int" });
+const lfTtl: LiteCache<number, number> = new Lfu<number, number>(10, { ttl: 5 });
+expectTrue<Equal<ReturnType<typeof lfTtl.purgeStale>, number>>();
+
+// @ts-expect-error -- V is number; a string value is rejected on Lfu too.
+lf.put("a", "not-a-number");
+
+// @ts-expect-error -- 'lfu' is not a valid keys backing (only 'int').
+new Lfu<number, number>(10, { keys: "lfu" });
+
+// @ts-expect-error -- size is readonly on Lfu.
+lf.size = 5;

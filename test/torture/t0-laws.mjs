@@ -15,8 +15,8 @@
  * corrupt structure still fails the tier.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu } from './harness.mjs';
 
 const NIL = -1;
 
@@ -545,6 +545,57 @@ export function run() {
         void wrapLirs(c);
     }
 
+    // --- Lfu laws (decisions/0024) ----------------------------------------------
+
+    // F1: EXACT frequency counting -- get AND put(update) each increment frequency by one;
+    // has/peek are frequency-neutral. The frequency lives on the bucket the key sits in.
+    {
+        const c = new Lfu(8);
+        c.put('a', 1);                                  // freq 1
+        check(c._bFreq[c._kB[c._store.get('a')]] === 1, () => 't0 F1: newcomer not at freq 1');
+        c.get('a'); c.get('a');                         // +2 via get
+        check(c._bFreq[c._kB[c._store.get('a')]] === 3, () => 't0 F1: get did not count exactly');
+        c.put('a', 2);                                  // +1 via put-update (D24)
+        check(c._bFreq[c._kB[c._store.get('a')]] === 4, () => 't0 F1: put-update did not count as a hit');
+        c.has('a'); c.peek('a');                        // neutral
+        check(c._bFreq[c._kB[c._store.get('a')]] === 4, () => 't0 F1: has/peek changed frequency');
+        validate(c);
+    }
+
+    // F2: LFU eviction with LRU tie-break -- the LOWEST-frequency, least-recent-within-it key
+    // is the victim. Fill; lift some keys' frequency; the victim is a freq-1 key (the LRU one).
+    {
+        const c = new Lfu(4);
+        c.put(1, 1); c.put(2, 2); c.put(3, 3); c.put(4, 4); // all freq 1; MRU=4..LRU=1
+        c.get(1); c.get(2);                                  // 1,2 -> freq 2
+        // remaining freq-1 keys are 3 (older) and 4 (newer within freq 1) -> victim is 3
+        check(c._peekVictim() === 3, () => 't0 F2: victim ' + c._peekVictim() + ' != freq-1 LRU key 3');
+        let evicted;
+        const d = new Lfu(4, { onEvict: (k) => { evicted = k; } });
+        d.put(1, 1); d.put(2, 2); d.put(3, 3); d.put(4, 4);
+        d.get(1); d.get(2);
+        d.put(5, 5);                                         // evicts the freq-1 LRU (3)
+        check(evicted === 3, () => 't0 F2: evicted ' + String(evicted) + ' != 3');
+        check(d.has(1) && d.has(2) && d.has(4) && d.has(5) && !d.has(3),
+            () => 't0 F2: wrong residents after LFU eviction');
+        validate(d);
+    }
+
+    // F3: frequency (scan) resistance -- a proven-hot set survives a distinct one-hit flood
+    // larger than capacity, exactly (an exact LFU never evicts a higher-frequency key while a
+    // lower-frequency one exists).
+    {
+        const N = 32;
+        const c = new Lfu(N, { keys: 'int' });
+        for (let i = 0; i < N; i++) c.put(i, i);
+        const hot = [0, 1, 2, 3];
+        for (const h of hot) for (let t = 0; t < 10; t++) c.get(h);
+        for (let i = 0; i < 4000; i++) { for (const h of hot) c.get(h); c.put(1000 + i, i); }
+        for (const h of hot) check(c.has(h), () => 't0 F3: hot key ' + h + ' evicted by the flood (no frequency resistance)');
+        validate(c);
+        void wrapLfu(c);
+    }
+
     // --- TTL laws (decisions/0017) ----------------------------------------------
 
     // T1: stale = MISS, and the MISS does NOTHING to policy state. get() on an expired
@@ -693,6 +744,31 @@ export function run() {
         validate(c);
     }
 
+    // I10 Lfu -- ASCENDING frequency (bucket list from _bMin up), MRU..LRU per bucket, over
+    // the MEMBER column _fNext (NOT the shared _next) -- decisions/0024, D24.
+    {
+        const c = new Lfu(20);
+        for (let i = 0; i < 8; i++) c.put(i, i);       // all at freq 1
+        for (let i = 0; i < 4; i++) { c.get(i); c.get(i); } // keys 0..3 climb to higher freqs
+        c.get(0);                                       // key 0 climbs once more (distinct freq)
+        // Build the expected walk: bucket list _bMin -> _bNext, each _bHead -> _fNext.
+        const wantK = [], wantV = [];
+        for (let b = c._bMin; b !== NIL; b = c._bNext[b]) {
+            for (let s = c._bHead[b]; s !== NIL; s = c._fNext[s]) { wantK.push(c._keys[s]); wantV.push(c._vals[s]); }
+        }
+        check(wantK.length === c.size, () => 't0 ITER lfu: expected walk length != size');
+        const gotK = collectScalars(c.keys()), gotV = collectScalars(c.values());
+        check(eqArr(gotK, wantK), () => 't0 ITER lfu: keys() order != ascending-frequency roster walk');
+        check(eqArr(gotV, wantV), () => 't0 ITER lfu: values() order != ascending-frequency roster walk');
+        const pairs = collectPairs(c.entries());
+        check(pairs.length === wantK.length, () => 't0 ITER lfu: entries() length mismatch');
+        for (let i = 0; i < pairs.length; i++) {
+            check(Object.is(pairs[i][0], wantK[i]) && Object.is(pairs[i][1], wantV[i]),
+                () => 't0 ITER lfu: entries()[' + i + '] != (key,value) roster');
+        }
+        validate(c);
+    }
+
     // I5 TTL-skip WITHOUT reap (D18.5): a walk sees only live entries, but leaves the
     // stale ones resident (size unchanged); purgeStale() is the reclamation path.
     {
@@ -711,7 +787,7 @@ export function run() {
 
     // --- Snapshot / restore laws (decisions/0021, D21) --------------------------
     const SNAP = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo],
-        ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs]];
+        ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu]];
 
     // SN1: round-trip identity. Build a churned mid-life state, dump, structuredClone,
     // restore, and assert dump==dump (fixed point) AND identical order/values/size via an

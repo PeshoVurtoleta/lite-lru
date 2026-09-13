@@ -11,7 +11,7 @@
  * the payload refs). The census is the teeth for that.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from '../../Lru.js';
 import { createLeakTracker } from '@zakkster/lite-leak';
 import { check, validate, censusOk, settleGc } from './harness.mjs';
 
@@ -276,6 +276,42 @@ export async function run() {
             () => 't7 lirs: an evicted value is still live -- the non-resident history is retaining values (leak)');
     }
 
+    // --- Lfu soak (decisions/0024): build/clear cycles + the BUCKET-POOL-conservation +
+    // no-retention census. The frequency-churn stream drives buckets being created,
+    // relabelled and destroyed; the bucket pool must stay conserved (live + free == cap)
+    // and NEVER grow, and no evicted VALUE object may outlive its cycle (the bucket columns
+    // hold only integer ids + Float64 frequencies -- they pin nothing).
+    {
+        const frefs = [];
+        const ftracker = createLeakTracker({ name: 'lfu-soak' });
+        let bFreqBytes = -1;
+        for (let cyc = 0; cyc < 1024; cyc++) {
+            const cache = new Lfu(CAP, { keys: 'int' });
+            if (bFreqBytes < 0) bFreqBytes = cache._bFreq.buffer.byteLength;
+            const h = ftracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
+            for (let i = 0; i < CAP * 3; i++) {
+                const val = { c: cyc, i };
+                cache.put(cyc * 100000 + i, val);           // distinct int keys => real eviction churn
+                if ((i & 1) === 0) cache.get(cyc * 100000 + i); // frequency churn (create/relabel buckets)
+                if ((cyc & 63) === 0 && (i & 7) === 0) frefs.push(new WeakRef(val));
+            }
+            check(cache.size === CAP, () => 't7 lfu: not full mid-life (size ' + cache.size + ')');
+            check(cache._bFreq.buffer.byteLength === bFreqBytes, () => 't7 lfu: _bFreq buffer grew (bucket pool not fixed)');
+            validate(cache); // conservation mid-life (bucket list + pool + exact freqs)
+            cache.clear();
+            check(cache.size === 0, () => 't7 lfu: size != 0 after clear (cycle ' + cyc + ')');
+            check(cache._freeListLength() === CAP, () => 't7 lfu: free list != capacity after clear (cycle ' + cyc + ')');
+            check(cache._bMin === -1, () => 't7 lfu: bucket list not empty after clear (cycle ' + cyc + ')');
+            validate(cache);
+            ftracker.untrack(h);
+        }
+        check(ftracker.size() === 0, () => 't7 lfu: leak tracker size ' + ftracker.size() + ' != 0');
+        await settleGc(6);
+        check(frefs.length > 0, () => 't7 lfu: census sample was empty (nothing to prove)');
+        check(censusOk(frefs),
+            () => 't7 lfu: an evicted value is still live -- a bucket column is retaining values (leak)');
+    }
+
     // --- TTL soak (decisions/0017): expiry churn + conservation + purgeStale + census
     // Build each cycle PAST capacity under a virtual clock, half the entries with a
     // finite ttl (they expire mid-build) and half never-expire. Assert conservation
@@ -328,7 +364,7 @@ export async function run() {
     {
         const snaptracker = createLeakTracker({ name: 'snapshot-soak' });
         const srefs = [];
-        const MEM = [LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs];
+        const MEM = [LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu];
         for (let cyc = 0; cyc < 4096; cyc++) {
             const C = MEM[cyc % MEM.length];
             const cache = new C(CAP, { keys: 'int' });
@@ -345,6 +381,26 @@ export async function run() {
             validate(restored);
             for (let i = 0; i < 8; i++) restored.put(-1 - i, { c: cyc, r: i }); // exercise the restore
             validate(restored);
+            // Lfu-specific (decisions/0024, planner assertion #4): the ORIGINAL cache (its
+            // dump() already captured into `restored` above) is also clear()-ed in this same
+            // 4096-cycle dump/restore path, so every Lfu cycle here exercises dump/restore AND
+            // clear together -- mirroring the dedicated 1024-cycle Lfu soak's explicit checks
+            // (not just validate()'s internal term 13): the bucket list empties (`_bMin===-1`),
+            // the slot free list returns to capacity, and the bucket-pool free STACK length
+            // (walked standalone, not inferred from validate()'s conservation term) also
+            // returns to exactly `CAP`.
+            if (C === Lfu) {
+                cache.clear();
+                check(cache.size === 0, () => 't7 snap: lfu cache not empty after clear (cycle ' + cyc + ')');
+                check(cache._bMin === -1, () => 't7 snap: lfu bucket list not empty after clear (cycle ' + cyc + ')');
+                check(cache._freeListLength() === CAP,
+                    () => 't7 snap: lfu free list != capacity after clear (cycle ' + cyc + ')');
+                let lfuFreeBuckets = 0;
+                for (let b = cache._bFreeHead; b !== -1; b = cache._bNext[b]) lfuFreeBuckets++;
+                check(lfuFreeBuckets === CAP,
+                    () => 't7 snap: lfu bucket-pool free length ' + lfuFreeBuckets + ' != capacity ' + CAP + ' after clear (cycle ' + cyc + ')');
+                validate(cache);
+            }
             snaptracker.untrack(h);
         }
         check(snaptracker.size() === 0, () => 't7 snap: leak tracker size ' + snaptracker.size() + ' != 0 after churn');

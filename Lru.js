@@ -124,6 +124,21 @@ const ARC_T2 = 1;
 const LIRS_LIR = 1; // bit0: 1 = LIR block, 0 = HIR block
 const LIRS_INS = 2; // bit1: slot is currently a member of the stack S
 
+/** Lfu (decisions/0024, D24) sentinel for "no bucket" -- a bucket id is a non-negative
+ *  pool index, so -1 can never collide (the bucket-pool mirror of NIL for slots). Used for
+ *  the empty bucket list (_bMin), the bucket free-stack end, and empty per-bucket key
+ *  lists (_bHead/_bTail). */
+const LFU_NIL = -1;
+
+/** Fail-closed message for Lfu bucket-pool exhaustion (decisions/0024, D24). The pool is
+ *  sized to `capacity`: at most `capacity` distinct frequencies can exist among <= capacity
+ *  keys (every live bucket holds >= 1 key), so this is provably unreachable in a coherent
+ *  cache. If it ever fires an invariant broke -- we fail CLOSED rather than `new` a bucket
+ *  on a hot path. Built once, thrown only on misuse. */
+const LFU_POOL_MSG =
+    "[lite-lru] Lfu bucket pool exhausted (more than capacity distinct frequencies); " +
+    "this is an invariant violation, not a capacity condition";
+
 /** W-TinyLFU count-min sketch shape (decisions/0014, D14.2): 4 rows of 4-bit
  *  saturating counters packed 8-per-Uint32. One per-row seed spreads a key across the
  *  rows; `Math.imul` keeps each mix an EXACT 32-bit multiply (zero-alloc). Built once. */
@@ -220,7 +235,7 @@ function validateStats(stats) {
         "[lite-lru] unknown stats option " + String(stats) + " (did you mean true?)");
 }
 
-export const VERSION = "1.10.0";
+export const VERSION = "1.11.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -486,10 +501,13 @@ function newStore(capacity, keys, hasTtl) {
  * -------------------------------------------------------------------------- */
 
 class CacheIterator {
-    constructor(cache, mode, heads) {
+    constructor(cache, mode, heads, nextCol) {
         this._store = cache._store;
         this._ver = cache._store._ver;   // D18.6 -- captured once, re-checked per step
-        this._nextCol = cache._next;
+        // The column each roster list is threaded through. Defaults to the shared `_next`
+        // (every recency/segment member); a member whose active lists ride a DIFFERENT link
+        // column (Lfu's per-bucket key lists on `_fNext`, decisions/0024) passes it here.
+        this._nextCol = nextCol !== undefined ? nextCol : cache._next;
         this._keysCol = cache._keys;
         this._valsCol = cache._vals;
         this._exp = cache._exp;          // ttl expiry column; null when ttl is off (D17)
@@ -4809,6 +4827,521 @@ export class Lirs {
      *  TEST-ONLY (drives the torture differential); never a hot path. */
     _peekVictim() {
         return this._qHead === NIL ? undefined : this._keys[this._qHead];
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * Lfu -- an O(1) EXACT Least-Frequently-Used cache (Shah-Matani), decisions/0024,
+ * D24. The NINTH named export in this file (same single-file ruling as the rest).
+ *
+ * Structure: a doubly-linked list OF frequency BUCKETS in ASCENDING frequency order
+ * (`_bMin` = head = the LOWEST frequency = the eviction end). Each bucket owns a recency
+ * list of resident key-slots threaded through the member columns `_fNext` (toward LRU) /
+ * `_fPrev` (toward MRU), with `_bHead` = MRU and `_bTail` = LRU. The frequency lives ON
+ * the bucket (`_bFreq`, a Float64Array -- EXACT to 2^53, no 2^31 wrap, same rationale as
+ * stats D19.4): every key in a bucket shares it. `_kB[s]` records which bucket owns slot s.
+ *
+ * WITHIN-BUCKET TIE-BREAK = LRU (D24): a newcomer (freq 1) and a just-promoted key attach
+ * at the MRU (head) end; eviction removes the LRU-end key (`_bTail`) of the lowest-frequency
+ * bucket (`_bMin`). This is LFU-with-LRU-tiebreak.
+ *
+ * The bucket POOL is a fixed set of `capacity` nodes (at most `capacity` distinct
+ * frequencies can exist among <= capacity keys -- provably enough); bucket nodes come from
+ * the `_bFree` stack, NEVER `new` per bucket. Exhaustion fails CLOSED (LFU_POOL_MSG).
+ *
+ * A HIT (get, or a put-UPDATE -- D24) increments the slot's frequency by one and relinks it
+ * to the MRU end of the freq+1 bucket. This is ZERO-ALLOCATION but NOT zero-write (honestly
+ * stated, DEBATE): a hit does a bucket relink, pinned at <= 14 index stores in the T6 gate.
+ * A single-key bucket that has no freq+1 neighbour is RELABELLED in place (1 write, the fast
+ * path). has()/peek() are frequency-NEUTRAL (inspections, not accesses), matching every
+ * member. Iteration is frequency-neutral (D18.4). This EXACT frequency counting is what
+ * distinguishes Lfu from the approximate-sketch WTinyLfu (decisions/0014).
+ *
+ * Rides the shared substrate (decisions/0011), TTL (0017), the zero-GC iterator (0018),
+ * opt-in stats (0019), snapshot/restore (0021), the onEvict reentrancy guard (0002) and the
+ * conservation invariant -- exactly like the other eight members.
+ * -------------------------------------------------------------------------- */
+
+export class Lfu {
+    /**
+     * @param {number} capacity  Max entries. Must be an integer >= 1.
+     * @param {{ onEvict?: (key: any, value: any) => void, keys?: 'int' }} [options]
+     */
+    constructor(capacity, options) {
+        // Fail closed (D9), identical to the rest of the family.
+        if (!Number.isInteger(capacity) || capacity < 1) {
+            throw new RangeError(
+                "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
+            );
+        }
+
+        this._capacity = capacity;
+
+        // TTL (decisions/0017), validated fail-closed at the door -- identical to LiteLru.
+        this._clock = validateClock(options && options.clock);
+        this._ttl = validateTtl(options && options.ttl);
+
+        // Same shared substrate + int-key door as the rest of the family.
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+
+        // Cache the store's columns. Lfu's ACTIVE key lists ride the member columns
+        // `_fNext`/`_fPrev` (below), NOT the shared `_next`/`_prev`; the store's `_next`
+        // still threads the FREE stack (allocSlot/freeSlot), so a resident slot leaves
+        // `_next`/`_prev` untouched -- kept here only for substrate parity + conservation.
+        this._keys = this._store._keys;
+        this._vals = this._store._vals;
+        this._next = this._store._next;
+        this._prev = this._store._prev;
+        this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+
+        // D24 -- key-slot columns. Each resident key is in exactly ONE bucket's recency list,
+        // threaded `_fNext` (toward LRU) / `_fPrev` (toward MRU). `_kB[s]` = the owning bucket
+        // id. Fixed size, allocated once, never grown.
+        this._fNext = new Int32Array(capacity);
+        this._fPrev = new Int32Array(capacity);
+        this._kB = new Int32Array(capacity);
+
+        // D24 -- the bucket pool: a doubly-linked list of frequency buckets in ASCENDING
+        // frequency order. `_bFreq` (Float64Array, EXACT to 2^53) is the frequency shared by
+        // every key in a bucket; `_bNext`/`_bPrev` link the bucket list; `_bHead`/`_bTail`
+        // are the MRU/LRU ends of the bucket's key list. All sized to capacity, never grown.
+        this._bFreq = new Float64Array(capacity);
+        this._bNext = new Int32Array(capacity);
+        this._bPrev = new Int32Array(capacity);
+        this._bHead = new Int32Array(capacity);
+        this._bTail = new Int32Array(capacity);
+        // The bucket free stack: 0 -> 1 -> ... -> capacity-1 -> LFU_NIL, chained via `_bNext`.
+        for (let i = 0; i < capacity; i++) this._bNext[i] = i + 1;
+        this._bNext[capacity - 1] = LFU_NIL;
+        this._bFreeHead = 0;
+        this._bMin = LFU_NIL; // head of the bucket list (lowest frequency); LFU_NIL when empty
+
+        this._size = 0;
+        this._onEvict = (options && options.onEvict) || NOOP;
+        this._inOnEvict = false;
+
+        // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
+        this._stats = validateStats(options && options.stats);
+    }
+
+    /** The store factory, delegating to the shared `newStore` (decisions/0011). */
+    _makeStore(capacity, keys, hasTtl) {
+        return newStore(capacity, keys, hasTtl);
+    }
+
+    get size() { return this._size; }
+    get capacity() { return this._capacity; }
+
+    // --- bucket-pool helpers (create/destroy on frequency transitions) --------
+
+    /** Pop a bucket off the free stack, stamped with `freq` and an empty key list. Fail
+     *  CLOSED (D24) if the pool is exhausted -- provably unreachable in a coherent cache. */
+    _bAlloc(freq) {
+        const b = this._bFreeHead;
+        if (b === LFU_NIL) throw new Error(LFU_POOL_MSG); // fail closed (D24)
+        this._bFreeHead = this._bNext[b];
+        this._bFreq[b] = freq;
+        this._bHead[b] = LFU_NIL;
+        this._bTail[b] = LFU_NIL;
+        return b;
+    }
+
+    /** Return a bucket (now empty) to the free stack. */
+    _bRelease(b) {
+        this._bNext[b] = this._bFreeHead;
+        this._bFreeHead = b;
+    }
+
+    /** Insert bucket `nb` immediately AFTER bucket `b` in the ascending bucket list. */
+    _bInsertAfter(b, nb) {
+        const n = this._bNext[b];
+        this._bPrev[nb] = b;
+        this._bNext[nb] = n;
+        this._bNext[b] = nb;
+        if (n !== LFU_NIL) this._bPrev[n] = nb;
+    }
+
+    /** Insert bucket `nb` at the HEAD (new minimum frequency) of the bucket list. */
+    _bInsertHead(nb) {
+        this._bPrev[nb] = LFU_NIL;
+        this._bNext[nb] = this._bMin;
+        if (this._bMin !== LFU_NIL) this._bPrev[this._bMin] = nb;
+        this._bMin = nb;
+    }
+
+    /** Unlink bucket `b` (being destroyed -- it just became empty), fixing `_bMin`. */
+    _bUnlink(b) {
+        const p = this._bPrev[b], n = this._bNext[b];
+        if (p !== LFU_NIL) this._bNext[p] = n; else this._bMin = n;
+        if (n !== LFU_NIL) this._bPrev[n] = p;
+    }
+
+    // --- within-bucket recency-list helpers -----------------------------------
+
+    /** Push key-slot s at the MRU (head) end of bucket b's recency list. */
+    _kPushHead(b, s) {
+        this._kB[s] = b;
+        this._fPrev[s] = LFU_NIL;
+        const h = this._bHead[b];
+        this._fNext[s] = h;
+        if (h !== LFU_NIL) this._fPrev[h] = s; else this._bTail[b] = s;
+        this._bHead[b] = s;
+    }
+
+    /** Unlink key-slot s from bucket b's recency list, fixing b's head/tail. */
+    _kUnlink(b, s) {
+        const p = this._fPrev[s], n = this._fNext[s];
+        if (p !== LFU_NIL) this._fNext[p] = n; else this._bHead[b] = n;
+        if (n !== LFU_NIL) this._fPrev[n] = p; else this._bTail[b] = p;
+    }
+
+    /** A HIT (get or put-UPDATE, D24): increment slot s's frequency by one and relink it to
+     *  the MRU end of the freq+1 bucket. Zero-ALLOCATION, NOT zero-write (a bucket relink;
+     *  DEBATE-honest). Fast path: if s is the ONLY key in b and no bucket sits at freq+1,
+     *  RELABEL b in place (1 write) -- s stays put at MRU, the bucket list stays ascending. */
+    _touch(s) {
+        const b = this._kB[s];
+        const target = this._bFreq[b] + 1;
+        const nb = this._bNext[b];
+        // Fast path: b holds only s and there is no freq+1 bucket above it -> relabel b.
+        // Ascending order holds: b's prev freq < target, and nb (if any) has freq != target
+        // and > b's old freq, hence >= target+1 > target.
+        if (this._bHead[b] === s && this._fNext[s] === LFU_NIL &&
+            (nb === LFU_NIL || this._bFreq[nb] !== target)) {
+            this._bFreq[b] = target;
+            return;
+        }
+        // General path: move s up to the (found or freshly-created) freq+1 bucket.
+        let dest;
+        if (nb !== LFU_NIL && this._bFreq[nb] === target) {
+            dest = nb;
+        } else {
+            dest = this._bAlloc(target);
+            this._bInsertAfter(b, dest);
+        }
+        this._kUnlink(b, s);
+        if (this._bHead[b] === LFU_NIL) { this._bUnlink(b); this._bRelease(b); } // b emptied -> destroy
+        this._kPushHead(dest, s);
+    }
+
+    /** Insert a NEWCOMER (frequency 1) at the MRU end of the freq-1 bucket, creating that
+     *  bucket at the head of the list when it does not yet exist. */
+    _insertFreq1(s) {
+        let b = this._bMin;
+        if (b === LFU_NIL || this._bFreq[b] !== 1) {
+            b = this._bAlloc(1);
+            this._bInsertHead(b);
+        }
+        this._kPushHead(b, s);
+    }
+
+    /** Free exactly ONE slot and return it for reuse. Evicts the LRU-end key (`_bTail`) of
+     *  the lowest-frequency bucket (`_bMin`) -- LFU with LRU tie-break (D24). Only ever called
+     *  at capacity, where `_bMin` is non-empty. Decrements `_size` (the caller re-inserts). */
+    _evict() {
+        const b = this._bMin;
+        const s = this._bTail[b];
+        const k = this._keys[s];
+        this._kUnlink(b, s);
+        if (this._bHead[b] === LFU_NIL) { this._bUnlink(b); this._bRelease(b); }
+        this._store.delete(k);
+        this._size--;
+        return s;
+    }
+
+    // --- public API (all O(1); the hot path is zero-alloc, NOT zero-write) -----
+
+    /** Look up a key AND count a frequency hit. @returns the value, or undefined if absent
+     *  (see D7). A stale entry is a MISS and is reaped in place (decisions/0017, D17.3). */
+    get(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const s = this._store.get(key);
+        if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
+            this._reap(s);
+            return undefined;
+        }
+        this._touch(s);
+        if (this._stats !== null) this._stats.hits++; // live hit (0019)
+        return this._vals[s];
+    }
+
+    /**
+     * Insert or update. An update rewrites the value and COUNTS as a frequency hit (D24). A
+     * new key enters the freq-1 bucket at MRU; at capacity the LRU-end key of the lowest-
+     * frequency bucket is evicted and its slot reused in place. onEvict fires LAST (0002).
+     * The positional `ttlMs` (0017, D17.4) overrides the instance ttl default.
+     */
+    put(key, value, ttlMs) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        let expiresAt;
+        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
+        this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
+        const store = this._store;
+        const existing = store.get(key);
+        if (existing >= 0) {                 // update-in-place + count a hit
+            this._vals[existing] = value;
+            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            this._touch(existing);
+            if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
+            return;
+        }
+
+        let s, evKey, evVal;
+        let evicted = false;
+        if (this._size === this._capacity) {
+            s = this._evict();          // frees exactly one slot (reused in place, D6); _size--
+            evKey = this._keys[s];
+            evVal = this._vals[s];
+            evicted = true;
+        } else {
+            s = store.allocSlot();
+        }
+
+        this._keys[s] = key;
+        this._vals[s] = value;
+        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        store.set(key, s);
+        this._insertFreq1(s);           // a newcomer enters the freq-1 bucket at MRU
+        this._size++;
+        if (this._stats !== null) this._stats.puts++; // successful insert (outcome-based); 0019
+
+        if (evicted) {
+            if (this._stats !== null) this._stats.evictions++; // capacity eviction (0019)
+            this._inOnEvict = true;
+            try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+        }
+    }
+
+    /** True if key is present (RESIDENT). Frequency-NEUTRAL. A stale entry is a MISS and is
+     *  reaped in place (decisions/0017, D17.3). */
+    has(key) {
+        const s = this._store.get(key);
+        if (s < 0) return false;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return false;
+        }
+        return true;
+    }
+
+    /** Read a value WITHOUT counting a frequency hit. undefined if absent (see D7). A stale
+     *  entry is a MISS and is reaped in place (decisions/0017, D17.3). */
+    peek(key) {
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return undefined;
+        }
+        return this._vals[s];
+    }
+
+    /** Reap an expired slot in place (decisions/0017): unlink from its bucket (destroy the
+     *  bucket if it empties), drop from the index, free the slot, fire onEvict LAST (0002). */
+    _reap(s) {
+        this._store._ver++; // D18.6 -- a reap is a structural mutation; invalidate iterators
+        const evKey = this._keys[s];
+        const evVal = this._vals[s];
+        const b = this._kB[s];
+        this._kUnlink(b, s);
+        if (this._bHead[b] === LFU_NIL) { this._bUnlink(b); this._bRelease(b); }
+        this._store.delete(evKey);
+        this._store.freeSlot(s);
+        this._size--;
+        if (this._stats !== null) this._stats.evictions++; // reap = eviction (0019, D19.2)
+        this._inOnEvict = true;
+        try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+    }
+
+    /** Evict every expired resident entry now (decisions/0017, D17.5). COLD, O(size); fires
+     *  onEvict per victim (0002) and returns the count evicted. */
+    purgeStale() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG);
+        if (this._exp === null) return 0;
+        const now = this._clock();
+        const exp = this._exp;
+        const victims = [];
+        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
+        return victims.length;
+    }
+
+    /** Remove a key. Returns true if it was present. Frees the slot, repairs its bucket
+     *  (destroying it if it empties). A delete is NOT an eviction. */
+    delete(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const s = store.get(key);
+        if (s < 0) return false;
+        store._ver++; // D18.6 -- a real delete is a structural mutation; invalidate iterators
+        const b = this._kB[s];
+        this._kUnlink(b, s);
+        if (this._bHead[b] === LFU_NIL) { this._bUnlink(b); this._bRelease(b); }
+        store.delete(key);
+        store.freeSlot(s);
+        this._size--;
+        return true;
+    }
+
+    /** Empty the cache. Rebuilds the slot free list + the bucket free stack. Allocates
+     *  nothing. O(capacity). */
+    clear() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
+        this._store.reset();
+        const cap = this._capacity;
+        for (let i = 0; i < cap; i++) this._bNext[i] = i + 1;
+        this._bNext[cap - 1] = LFU_NIL;
+        this._bFreeHead = 0;
+        this._bMin = LFU_NIL;
+        this._size = 0;
+    }
+
+    // --- opt-in runtime stats (decisions/0019, D19): cold accessors -----------
+
+    /** The live stats holder (decisions/0019, D19.3), returned BY REFERENCE (borrowed --
+     *  copy what you keep). Fail closed on an instance built without { stats: true }. */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE (decisions/0019); a borrowed holder stays valid.
+     *  Fail closed on a non-stats instance. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        const st = this._stats;
+        st.hits = 0; st.misses = 0; st.evictions = 0; st.puts = 0;
+    }
+
+    // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
+
+    /** The per-member iteration ROSTER (decisions/0018, D18.1 / 0024 D24): the bucket heads
+     *  in ASCENDING frequency (`_bMin` up), each walked MRU->LRU. NOT recency order. Cold. */
+    _iterHeads() {
+        const heads = [];
+        for (let b = this._bMin; b !== LFU_NIL; b = this._bNext[b]) heads.push(this._bHead[b]);
+        return heads;
+    }
+
+    /** Keys in iteration order (ascending frequency, MRU->LRU per bucket). Frequency-neutral
+     *  (D18.4); skips stale entries (D18.5). The shared iterator walks the `_fNext` column. */
+    keys() { return new CacheIterator(this, ITER_KEYS, this._iterHeads(), this._fNext); }
+    values() { return new CacheIterator(this, ITER_VALUES, this._iterHeads(), this._fNext); }
+    entries() { return new CacheIterator(this, ITER_ENTRIES, this._iterHeads(), this._fNext); }
+    [Symbol.iterator]() { return this.entries(); }
+
+    // --- snapshot / restore (decisions/0021, D21): COLD, may allocate --------
+
+    /** Capture one bucket's recency list (MRU..LRU over `_fNext`) as aligned plain arrays:
+     *  ordered `slots`, keys `k`, values `v`, plus `e` (expiry) when ttl is on. Cold. */
+    _snapBucketList(head) {
+        const fNext = this._fNext, keys = this._keys, vals = this._vals, exp = this._exp;
+        const slots = [], k = [], v = [];
+        const e = exp !== null ? [] : null;
+        for (let s = head; s !== LFU_NIL; s = fNext[s]) {
+            slots.push(s); k.push(keys[s]); v.push(vals[s]);
+            if (e !== null) e.push(exp[s]);
+        }
+        const o = { slots, k, v };
+        if (e !== null) o.e = e;
+        return o;
+    }
+
+    /** Serialize to a plain snapshot (decisions/0021): the frequency BUCKETS ascending, each
+     *  carrying its EXACT `freq` + its recency list (MRU..LRU) + values (+ expiry). Capturing
+     *  the frequencies VERBATIM is what makes a restored cache evict IDENTICALLY (D21.1);
+     *  dropping them would be a fail-OPEN bug. COLD; may allocate. */
+    dump() {
+        const snap = snapBase(this, "Lfu");
+        const buckets = [];
+        for (let b = this._bMin; b !== LFU_NIL; b = this._bNext[b]) {
+            buckets.push({ freq: this._bFreq[b], list: this._snapBucketList(this._bHead[b]) });
+        }
+        snap.buckets = buckets;
+        return snap;
+    }
+
+    /** Reconstruct a FRESH Lfu from a snapshot (decisions/0021). Fail closed on any mismatch:
+     *  a non-array `buckets`, a bad/absent/non-ascending frequency, an empty bucket, a
+     *  duplicate/out-of-range slot, or resident entries > capacity (REJECT, never truncate). */
+    static restore(snap, opts) {
+        const cap = snapRead(snap, "Lfu", opts);
+        const inst = new Lfu(cap, snapOpts(snap, opts));
+        if (!Array.isArray(snap.buckets)) {
+            throw new Error(SNAP_BAD + "lfu buckets must be an array");
+        }
+        // Validate each bucket's frequency (positive integer, strictly ascending) + list shape.
+        const pairs = [];
+        let prevFreq = 0;
+        for (let i = 0; i < snap.buckets.length; i++) {
+            const bk = snap.buckets[i];
+            if (bk === null || typeof bk !== "object") {
+                throw new Error(SNAP_BAD + "lfu bucket " + i + " must be an object");
+            }
+            const f = bk.freq;
+            if (typeof f !== "number" || !Number.isFinite(f) || f <= 0 || Math.floor(f) !== f) {
+                throw new Error(SNAP_BAD + "lfu bucket " + i + " freq must be a positive integer, got " + String(f));
+            }
+            if (!(f > prevFreq)) {
+                throw new Error(SNAP_BAD + "lfu bucket frequencies must be strictly ascending (bucket " +
+                    i + " freq " + f + " <= previous " + prevFreq + ")");
+            }
+            prevFreq = f;
+            if (bk.list === null || typeof bk.list !== "object" || !Array.isArray(bk.list.slots)) {
+                throw new Error(SNAP_BAD + "lfu bucket " + i + " has a malformed list");
+            }
+            if (bk.list.slots.length === 0) {
+                throw new Error(SNAP_BAD + "lfu bucket " + i + " is empty (a bucket must hold >= 1 key)");
+            }
+            pairs.push([bk.list, "bucket" + i, false]);
+        }
+        const occ = snapCheckOccupy(cap, snap.ttl, pairs);
+        // Reconstruct buckets + their key lists in ascending order, threading `_fNext`/`_fPrev`.
+        let size = 0;
+        let prevB = LFU_NIL;
+        for (let i = 0; i < snap.buckets.length; i++) {
+            const bk = snap.buckets[i];
+            const b = inst._bAlloc(bk.freq);
+            inst._bPrev[b] = prevB;
+            inst._bNext[b] = LFU_NIL;
+            if (prevB === LFU_NIL) inst._bMin = b; else inst._bNext[prevB] = b;
+            void snapWriteList(inst, bk.list); // payload + keyed index into the preserved slots
+            const slots = bk.list.slots;
+            let head = LFU_NIL, tail = LFU_NIL;
+            for (let j = 0; j < slots.length; j++) {
+                const s = slots[j];
+                inst._kB[s] = b;
+                inst._fPrev[s] = j === 0 ? LFU_NIL : slots[j - 1];
+                inst._fNext[s] = j === slots.length - 1 ? LFU_NIL : slots[j + 1];
+                if (j === 0) head = s;
+                tail = s;
+            }
+            inst._bHead[b] = head;
+            inst._bTail[b] = tail;
+            size += slots.length;
+            prevB = b;
+        }
+        inst._size = size;
+        inst._store.rebuildFreeList(occ);
+        return inst;
+    }
+
+    // --- test/debug only (never call on a hot path) ---------------------------
+
+    /** Free-stack length, delegated to the store (conservation invariant). */
+    _freeListLength() {
+        return this._store.freeListLength();
+    }
+
+    /** The key the NEXT over-capacity insert would evict (the LRU-end key of the lowest-
+     *  frequency bucket), WITHOUT mutating. TEST-ONLY (drives the torture differential). */
+    _peekVictim() {
+        if (this._bMin === LFU_NIL) return undefined;
+        return this._keys[this._bTail[this._bMin]];
     }
 }
 
