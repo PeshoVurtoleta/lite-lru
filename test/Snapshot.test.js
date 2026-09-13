@@ -1,8 +1,9 @@
 /**
  * @zakkster/lite-lru -- node:test boundary suite for snapshot/restore
- * (decisions/0021, session S-next). Parameterized over ALL SEVEN family members
- * (LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc) so a capture/reconstruct
- * regression in any one member's dump()/restore() override is caught the same way.
+ * (decisions/0021, session S-next). Parameterized over ALL TEN family members
+ * (LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro) so a
+ * capture/reconstruct regression in any one member's dump()/restore() override is
+ * caught the same way.
  *
  * The centrepiece is ROUND-TRIP IDENTITY: dump() -> structuredClone -> restore()
  * reproduces the exact resident order + values + size, and a restored cache decides
@@ -14,10 +15,10 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../Lru.js';
 import { validate } from './validate.mjs';
 
-/** Every family member -- each body runs SEVEN TIMES over the same LiteCache surface. */
+/** Every family member -- each body runs TEN TIMES over the same LiteCache surface. */
 const MEMBERS = [
     { name: 'LiteLru', Ctor: LiteLru },
     { name: 'Sieve', Ctor: Sieve },
@@ -26,6 +27,9 @@ const MEMBERS = [
     { name: 'Slru', Ctor: Slru },
     { name: 'TwoQ', Ctor: TwoQ },
     { name: 'Arc', Ctor: Arc },
+    { name: 'Lirs', Ctor: Lirs },
+    { name: 'Lfu', Ctor: Lfu },
+    { name: 'ClockPro', Ctor: ClockPro },
 ];
 
 /** Seeded xorshift32 (same generator the torture harness uses). */
