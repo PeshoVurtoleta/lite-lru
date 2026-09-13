@@ -12,7 +12,7 @@ dependencies, node:test only. Ships a runnable + importable benchmark tool
 (Bench.mjs) with Belady OPT so a caller measures which policy fits their trace
 instead of guessing.
 
-## Status: 1.9.0 - a never-shipped in-repo demo/ (S13/D22) that animates all seven members on ONE shared trace, each panel drawn STRICTLY from that member's live dump() snapshot (no shadow state - the snapshot IS the visualization model) with a running % -of-Belady-optimal readout per member: the "one interface, different policy" family story made VISIBLE (e.g. on a zipf trace S3Fifo ~82% and Arc ~82.6% of the clairvoyant optimum, the simple baselines trailing). The SHIPPED surface is byte-identical to 1.8.0 - Lru.js / Lru.d.ts / benchmark/Bench.mjs are UNCHANGED (git diff empty); the demo is a dev artifact, excluded from the npm tarball (the pack gate asserts demo/ absent) and zero runtime deps hold (the browser path imports only ../Lru.js; a tiny zero-dep Node demo/serve.mjs supplies the trace + Belady OPT). Built atop snapshot / restore (1.8.0: a COLD dump() + static restore(snap, opts?) over the shared substrate, the SoA columns ARE the serial form, no substrate field / no hot-path branch, EXACT future-eviction round-trip with every member's aux captured verbatim, fail-closed restore tag {f,m,cap,keys,ttl,t}, TTL absolute-not-rebased - full detail under "## Snapshot / restore" below), the no-tuning adaptive member Arc (1.7.0), the scan-resistant baselines Slru/TwoQ (1.6.0), opt-in zero-GC stats (1.5.0), zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool.
+## Status: 1.9.1 - consolidation of the S13 demo (S15): the demo now FAILS CLOSED when its trace cannot be loaded (opened as a static file / via an IDE static preview / server down) - a pure never-throwing fetchTrace() seam returns a payload only when it is well-shaped, else renders an actionable "run npm run demo:serve and open http://localhost:8013/" hint instead of a hung "loading..." - plus a README Node-server caveat and an honest "Choosing a member" guide. Still a never-shipped in-repo demo/ (S13/D22) that animates all seven members on ONE shared trace, each panel drawn STRICTLY from that member's live dump() snapshot (no shadow state - the snapshot IS the visualization model) with a running % -of-Belady-optimal readout per member: the "one interface, different policy" family story made VISIBLE (e.g. on a zipf trace S3Fifo ~82% and Arc ~82.6% of the clairvoyant optimum, the simple baselines trailing). The SHIPPED surface is byte-identical to 1.8.0 - Lru.js / Lru.d.ts / benchmark/Bench.mjs are UNCHANGED across 1.9.0 and 1.9.1 (git diff empty); the demo is a dev artifact, excluded from the npm tarball (the pack gate asserts demo/ absent) and zero runtime deps hold (the browser path imports only ../Lru.js; a tiny zero-dep Node demo/serve.mjs supplies the trace + Belady OPT). Built atop snapshot / restore (1.8.0: a COLD dump() + static restore(snap, opts?) over the shared substrate, the SoA columns ARE the serial form, no substrate field / no hot-path branch, EXACT future-eviction round-trip with every member's aux captured verbatim, fail-closed restore tag {f,m,cap,keys,ttl,t}, TTL absolute-not-rebased - full detail under "## Snapshot / restore" below), the no-tuning adaptive member Arc (1.7.0), the scan-resistant baselines Slru/TwoQ (1.6.0), opt-in zero-GC stats (1.5.0), zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool.
 
 The family is the identity from v1.0.0: classic LRU is the reference member +
 differential oracle + honest floor, SIEVE is the headline, and the shipped
@@ -320,7 +320,7 @@ runnable tool, not a second implementation.
 
 demo/ animates ONE shared trace through all seven members, each panel drawn STRICTLY from that member's live dump() snapshot (D22.1, no shadow state), with a running %-of-Belady-optimal line. npm run demo (headless per-member summary via demo/Visualize.mjs) and npm run demo:serve (zero-dep Node server demo/serve.mjs -> http://localhost:8013/, browser page demo/visuals.html imports only ../Lru.js). demo/ is absent from files[]; Lru.js / Lru.d.ts / Bench.mjs are consumed, never edited. Must be run through the Node server (npm run demo:serve -> http://localhost:8013/), NOT as a static file or an IDE static preview: /trace.json is a dynamic route and ES modules need an http origin, so off-server the page fails closed with an actionable message instead of hanging.
 
-## API (1.9.0)
+## API (1.9.1)
 
 Named exports from @zakkster/lite-lru:
 
@@ -331,7 +331,7 @@ Named exports from @zakkster/lite-lru:
 - Slru: the Segmented-LRU member.
 - TwoQ: the full-2Q member.
 - Arc: the Adaptive Replacement Cache member.
-- VERSION: '1.9.0'
+- VERSION: '1.9.1'
 
 Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 

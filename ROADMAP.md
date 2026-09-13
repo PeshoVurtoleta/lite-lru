@@ -81,7 +81,8 @@ LiteMGLRU, meta-policy; distilled into DEBATE items 13-15).
 | zero-GC iteration (keys/entries/values, per-member defined order) -- cross-cutting | **built + gated (S11)** |
 | opt-in stats (hit/miss/evict; writes-per-hit stays torture-only) -- cross-cutting | **built + gated (S12)** |
 | snapshot / restore (dump/load; SoA columns are the serial form) | **built + gated (S14)** |
-| LRU-K, LIRS/ClockPro, LFU, MQ/CAR | `DEBATE.md` item 4 (deferred) |
+| LIRS (list-based; the scan/loop-resistant stretch member) | **planned -- NEXT (S16, v1.10.0); brief in section 6; bounded non-resident history (D23)** |
+| LRU-K, ClockPro, LFU, MQ/CAR | `DEBATE.md` item 4 (deferred) |
 | CLOCK/ClockPro (out of family), async fetch (-> `lite-lru-fetch`), size-aware (-> `lite-cache-budget`) | `DEBATE.md` items 6/8/11 (out of core) |
 | Belady OPT reference (offline harness normalization) | **built + gated (S9, t8 gate + Bench.mjs)** |
 | LiteMGLRU (userspace Multi-Gen LRU) + self-measuring meta-policy | v2 research (DEBATE 14, RESEARCH.md) |
@@ -1234,6 +1235,105 @@ DONE WHEN
   the demo fails closed with an actionable message when off-server; the docs say it needs the
   Node server; member-selection guidance is present; the shipped surface is untouched.
 
+===============================================================================
+# S16 -- v1.10.0 -- LIRS: the eighth member (stretch)  [PLANNED -- NEXT]
+===============================================================================
+```markdown
+version_target: 1.10.0    # additive minor: an eighth LiteCache<K,V> member
+status: planned -- next session
+gc_maxMajor: 0
+gc_maxPauseMs: 4
+alloc_bytes_per_op: 0     # hot path strict zero-alloc (like every member); ghost/history bounded
+leak_cycles: 4096
+depends_on: [S3, S10, S11, S12, S14]   # substrate + TTL + iteration + stats + snapshot
+decisions: [D23 (LIRS: bounded non-resident history; fixed-capacity honesty)]
+blocks: []
+```
+GOAL
+  Add LIRS (Low Inter-reference Recency Set; Jiang & Zhang, SIGMETRICS'02) as the EIGHTH
+  member on the same LiteCache<K,V> surface -- the strongest scan/loop resistance in the
+  family and a genuinely NEW mechanism: eviction by recency-of-recency (IRR = inter-reference
+  recency, the count of DISTINCT blocks between a block's last two references), not plain
+  recency/frequency/adaptation. Requested as a learning + implementation win (the family is a
+  teaching artifact as well as a library). new LiteLru(n) <-> ... <-> new Lirs(n), type-checked.
+THE ALGORITHM (what the coder must implement)
+  - Resident split: L_hir = max(1, round(capacity * 0.01)) resident HIR slots; L_lir =
+    capacity - L_hir LIR slots. Resident value capacity stays EXACTLY capacity (only the
+    split moves) -- the ARC fixed-capacity honesty (D16.2) restated for LIRS.
+  - Two intrusive lists over the shared _next/_prev columns, tagged by _seg (the Slru/TwoQ/Arc
+    precedent): the LIRS STACK S (holds LIR + resident-HIR + non-resident-HIR entries in
+    recency order, subject to STACK PRUNING: drop HIR entries from the bottom until the bottom
+    is a LIR block) and the list Q of RESIDENT HIR blocks (the eviction candidates, LRU/FIFO).
+  - Per-slot state: an LIR/HIR class bit and an "in-stack S" bit (reuse a vis-style byte column
+    or _seg encoding; no new hot-path branch in get/put/has/peek beyond the member's own body).
+  - Access X (get or put-update):
+      LIR hit -> move X to top of S; if X was S's bottom, prune S. (hot, few writes)
+      resident-HIR hit -> move X to top of S; if X was IN S: X becomes LIR, demote S's bottom
+        LIR to Q (now resident HIR), prune S, remove X from Q; else X stays HIR, move to Q tail.
+      miss / non-resident-HIR / new -> free a resident slot by evicting Q's front (resident HIR;
+        a non-resident stack entry just loses residency). Then if X is a non-resident HIR still
+        IN S -> X becomes LIR, demote bottom LIR to Q, prune; else X is new HIR -> top of S and
+        Q tail.
+  - has/peek are neutral (no reclass, no stack move).
+THE FIXED-CAPACITY TENSION (-> D23, the central owner decision)
+  Textbook LIRS lets stack S accumulate NON-RESIDENT HIR entries (metadata for evicted blocks)
+  with only a loose practical bound. Suite law 3 requires ALL auxiliary metadata bounded at
+  construction. So the non-resident history MUST be bounded -- generalize the ArcGhost /
+  ghost-ring pattern (keys-only, strict zero-alloc on keys:'int', amortized on Map; Lru.js
+  ArcGhost + _gRing/_ghostCap/_gLen). Decision points for D23: (1) the non-resident history cap
+  (e.g. <= capacity, mirroring |B1|+|B2| <= c); (2) evicting the OLDEST non-resident stack entry
+  when the bound is hit is a bounded, honest deviation from unbounded LIRS -- documented, with
+  the rejected alternative (unbounded history) named; (3) bound the per-access stack-pruning
+  work so it stays zero-alloc and does not blow maxPauseMs. Resident value capacity is EXACTLY
+  capacity; |LIR|+|resident HIR| = capacity; the non-resident set is separately bounded.
+CROSS-CUTTING (the member must join every existing axis)
+  - TTL (S10): inherit the shared _exp column + lazy reap; ttl-OFF hot path byte-identical.
+  - Iteration (S11): define + pin a per-member order (propose S top->bottom over LIR then
+    resident HIR, ghosts excluded); zero-GC, recency-neutral, stale-skipping, fail-closed.
+  - Stats (S12): outcome-based counters via the shared holder; a non-resident-HIR miss that
+    reclasses is still a miss (define the counting law like D19.2).
+  - Snapshot (S14/D21): dump()/static restore() capturing the LIRS aux VERBATIM -- stack S
+    order + per-slot LIR/HIR + in-stack bits, Q order, the bounded non-resident history -- via
+    the snap* helpers (snapBase/snapList withVis/a ghost-style capture). Dropping any aux is
+    fail-OPEN (add a t9 control). Fail-closed restore tag {f:'litelru/1', m:'Lirs', ...}.
+  - Bench (memory: adding a member touches the bench): add Lirs to benchmark/Bench.mjs MEMBERS
+    AND update Bench.test.js counts, else the shipped tool + demo omit it. The S13 demo picks
+    members up automatically IF they expose dump() -- add a demo/renderers.mjs renderer for the
+    Lirs snapshot shape (stack S / Q / non-resident history), drawn strictly from dump().
+  - d.ts: add the Lirs class + constructor + the LiteCache surface; dts-drift instance count
+    grows; tsc one-line-swap check includes new Lirs(n).
+ASSERTIONS (falsifiable)
+  - Differential oracle: a from-scratch reference LIRS (bounded-history variant, matching D23)
+    agrees with the member on hit/miss + eviction victim over the T5 corpus (both backings,
+    +/- ttl).
+  - Fixed-capacity: resident size <= capacity always; |LIR| + |resident HIR| == size; the
+    non-resident history never exceeds its construction bound (validate() conservation term).
+  - Scan/loop resistance: on a loop trace larger than capacity, LIRS keeps the LIR set stable
+    (evicts 0 LIR on a cap+1 scan), beating LRU -- a named, measured bench assertion.
+  - Zero-GC: t6 alloc gate 0 B/op on the hot path (LIR hit, resident-HIR hit, miss/replace);
+    stack pruning + history maintenance allocate nothing; backings never grow.
+  - Snapshot round-trip: dump->restore is an exact future-eviction fixed point for Lirs (t5
+    leg + Snapshot.test.js), and t9 controls (drop stack bit / drop non-resident history)
+    diverge and fail.
+  - Degenerate caps 1..4 construct and behave (L_hir=1 edge; capacity 1 -> L_lir 0 window edge)
+    without throwing.
+NON-GOALS
+  - NOT unbounded LIRS: the non-resident history is bounded (D23); textbook infinite history is
+    a rejected design under law 3.
+  - NOT ClockPro (the CLOCK approximation of LIRS) -- that stays deferred (item 4); this is
+    list-based LIRS.
+  - No change to the other seven members' hot paths; no new runtime dependency.
+PIPELINE
+  FULL member pipeline: planner (spec + the D23 bounding decision + atomic tasks) -> coder
+  (member + cross-cutting joins + bench + demo renderer, proven by torture) -> reviewer
+  (hidden alloc, retention, the fixed-capacity honesty, fail-open on dropped aux) -> qa
+  (boundary suite + the differential oracle + the scan-resistance assertion). Every module
+  change proven by `node --expose-gc test/torture.mjs`; no gate output is a FAIL.
+DONE WHEN
+  Lirs is a full LiteCache<K,V> member with strict zero-alloc hot paths, bounded metadata,
+  the differential oracle + scan-resistance + snapshot round-trip green, joined to TTL /
+  iteration / stats / snapshot / bench / demo / d.ts, and the other seven members unchanged.
+
 ---
 
 ## 7. Decision-record index (decisions/)
@@ -1254,10 +1354,11 @@ DONE WHEN
 | D20 | Belady OPT reference in the bench tool (offline only; brute-force correctness gate) | 0020 (S9) |
 | D21 | snapshot / restore (cold dump()/static restore(); slot-verbatim serial form; fail-closed tag; TTL captured verbatim + capture-time stamp) | 0021 (S14) |
 | D22 | animated policy-visualization demo (medium; dump() IS the visualization model; demo-only introspection hook REJECTED; never shipped; occupancy-only, dump() omits fixed geometry) | 0022 (S13) |
+| D23 | LIRS (list-based; recency-of-recency; bounded non-resident history generalizing the ArcGhost pattern; fixed-capacity honesty; bounded stack pruning) | 0023 (S16) -- PLANNED |
 | (law) | bit-packing (if any) INLINED, never a `lite-fastbit32`/package runtime dep (item 15) | 0012 (S4) |
 
 Deferred / out-of-core (get a decision record only if `DEBATE.md` promotes them):
-LRU-K, LIRS/ClockPro, LFU, MQ/CAR (deferred members, item 4); CLOCK/ClockPro (out
+LRU-K, LFU, MQ/CAR (deferred members, item 4; LIRS PROMOTED to S16/D23); ClockPro (out
 of family -> on-demand standalone, item 6); async fetch (-> `lite-lru-fetch`, item
 11); size/cost-aware (-> `lite-cache-budget`, item 8); SharedArrayBuffer/cross-
 worker (future separate package, item 11). (snapshot/restore SHIPPED as S14/D21.)

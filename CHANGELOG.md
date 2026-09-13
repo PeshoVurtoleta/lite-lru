@@ -7,6 +7,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.9.1] - 2026-09-13
+
+### Changed
+
+- **The visualization demo fails closed** (S15): when `/trace.json` cannot be loaded --
+  the page opened as a static file, via an IDE static preview, or with the Node server
+  down -- `demo/` now renders an actionable message ("run `npm run demo:serve` and open
+  http://localhost:8013/; a static file or IDE preview will not work: `/trace.json` is a
+  dynamic route") instead of a permanent "loading...". The fetch path is a pure,
+  never-throwing `fetchTrace()` seam that returns a payload only when it is well-shaped
+  (array `trace`, integer `cap >= 1`, `opt.hitRate` numeric); a rejected fetch, a non-OK
+  status, an `{error}` body, or a malformed 200 all fail closed. The render path is
+  unchanged (still drawn strictly from `dump()`).
+- **Docs**: README "Watch the policies" states the demo must run via its Node server (not
+  a static file or IDE preview, because `/trace.json` is a dynamic route and ES modules
+  need an http origin); a new "Choosing a member" guide maps workload to member and directs
+  to the bench tool for real measurement.
+- Three-place version sync to 1.9.1 (`VERSION`, `package.json`, `llms.txt`), plus the seven
+  member `VERSION` asserts and the README constants table.
+
+The shipped surface is unchanged from 1.8.0/1.9.0: `Lru.js`, `Lru.d.ts`, and
+`benchmark/Bench.mjs` are byte-identical, so the published tarball differs from 1.9.0 only
+in version strings and documentation. The demo is a dev artifact excluded from the tarball.
+
 ## [1.9.0] - 2026-09-13
 
 ### Added

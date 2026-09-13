@@ -335,7 +335,7 @@ Run directly, it prints a table; imported, it returns structured results and pri
 
 | Constant  | Value     | Meaning                                                       |
 | --------- | --------- | ------------------------------------------------------------ |
-| `VERSION` | `'1.9.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
+| `VERSION` | `'1.9.1'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
 
 All seven members and `VERSION` are named exports; `LiteLru` is also the default export.
 

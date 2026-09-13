@@ -21,7 +21,7 @@ const Q_SMALL = 0; // matches Lru.js's S3-FIFO queue tags
 const Q_MAIN = 1;
 
 test('exports: VERSION and the named S3Fifo export are present', async () => {
-    assert.equal(VERSION, '1.9.0');
+    assert.equal(VERSION, '1.9.1');
     const mod = await import('../Lru.js');
     assert.equal(mod.S3Fifo, S3Fifo);
 });
