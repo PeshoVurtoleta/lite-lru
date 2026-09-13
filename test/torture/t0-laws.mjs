@@ -15,8 +15,8 @@
  * corrupt structure still fails the tier.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs } from './harness.mjs';
 
 const NIL = -1;
 
@@ -459,6 +459,92 @@ export function run() {
         void wrapArc(c);
     }
 
+    // --- Lirs laws (decisions/0023) ---------------------------------------------
+    const LIRS_LIR = 1, LIRS_INS = 2; // matches Lru.js _st bits
+
+    // L1: the resident split. L_hir = max(1, round(cap*0.01)), L_lir = cap - L_hir; the
+    // resident value cap is EXACTLY capacity (only the split moves). The first L_lir distinct
+    // blocks warm up as LIR; the next fill as resident HIR.
+    {
+        const c = new Lirs(100); // L_hir 1, L_lir 99
+        check(c._Lhir === 1 && c._Llir === 99, () => 't0 L1: split wrong (Lhir ' + c._Lhir + ' Llir ' + c._Llir + ')');
+        for (let i = 0; i < 99; i++) c.put(i, i);
+        for (let i = 0; i < 99; i++) check((c._st[c._store.get(i)] & LIRS_LIR) !== 0, () => 't0 L1: warm-up key ' + i + ' not LIR');
+        c.put(1000, 1000); // LIR set full -> a new block is resident HIR
+        check((c._st[c._store.get(1000)] & LIRS_LIR) === 0, () => 't0 L1: block after warm-up was not HIR');
+        check(c.size === 100, () => 't0 L1: resident value cap != capacity');
+        validate(c);
+    }
+
+    // L2: a LIR hit moves to the TOP of S and is NEUTRAL to Q (LIR blocks are not in Q); has/
+    // peek are neutral (no reclass, no stack move).
+    {
+        const c = new Lirs(16); // L_hir 1, L_lir 15
+        for (let i = 0; i < 15; i++) c.put(i, i);       // all LIR
+        c.get(0);                                       // LIR hit -> top of S
+        check(c._sTop === c._store.get(0), () => 't0 L2: LIR hit did not move to the top of S');
+        const topBefore = c._sTop;
+        c.has(5); c.peek(5);
+        check(c._sTop === topBefore, () => 't0 L2: has/peek moved the stack top (must be neutral)');
+        validate(c);
+    }
+
+    // L3: a resident-HIR hit while IN S reclassifies to LIR (and demotes the bottom LIR to Q);
+    // the HEADLINE recency-of-recency promotion. A non-resident HIR still in the bounded
+    // history, re-admitted, also becomes LIR.
+    {
+        const c = new Lirs(16); // L_hir 1, L_lir 15
+        for (let i = 0; i < 15; i++) c.put(i, i);       // 15 LIR
+        c.put(100, 100);                                // resident HIR (inS, at top)
+        const s100 = c._store.get(100);
+        check((c._st[s100] & LIRS_LIR) === 0 && (c._st[s100] & LIRS_INS) !== 0, () => 't0 L3: setup HIR-in-S invalid');
+        const lirBefore = c._lirCount;
+        c.get(100);                                     // resident-HIR-in-S hit -> promote to LIR
+        check((c._st[c._store.get(100)] & LIRS_LIR) !== 0, () => 't0 L3: resident-HIR-in-S hit did not promote to LIR');
+        check(c._lirCount === lirBefore, () => 't0 L3: promotion did not demote a bottom LIR (|LIR| drifted)');
+        validate(c);
+
+        // Non-resident history re-admit -> LIR (recency-of-recency across an eviction).
+        const d = new Lirs(4); // L_hir 1, L_lir 3
+        for (let i = 0; i < 3; i++) d.put(i, i);        // 3 LIR
+        d.put(10, 10);                                  // resident HIR
+        d.put(11, 11);                                  // evicts Q front (10) -> 10 into history
+        check(d._hist.has(10), () => 't0 L3: evicted resident HIR not recorded in history');
+        d.put(10, 10);                                  // history hit -> re-admit as LIR
+        check((d._st[d._store.get(10)] & LIRS_LIR) !== 0, () => 't0 L3: history re-admit did not become LIR');
+        validate(d);
+    }
+
+    // L4: victim = Q front. The next over-capacity insert evicts the LRU resident HIR.
+    {
+        const c = new Lirs(4); // L_hir 1, L_lir 3
+        for (let i = 0; i < 3; i++) c.put(i, i);       // 3 LIR
+        c.put(10, 10);                                  // resident HIR at Q front
+        check(wrapLirs(c).victim() === 10, () => 't0 L4: expected Q front 10 as victim, got ' + wrapLirs(c).victim());
+        let evKey;
+        const e = new Lirs(4, { onEvict: (k) => { evKey = k; } });
+        for (let i = 0; i < 3; i++) e.put(i, i);
+        e.put(10, 10); e.put(11, 11); // 11 evicts the Q front 10
+        check(evKey === 10, () => 't0 L4: eviction victim was not the Q front (got ' + String(evKey) + ')');
+        check(e.size === 4, () => 't0 L4: size drifted from capacity');
+        validate(e);
+    }
+
+    // L5: loop resistance -- a proven LIR set survives a distinct one-hit flood larger than cap.
+    {
+        const N = 64;
+        const c = new Lirs(N);
+        for (let h = 0; h < 8; h++) { const k = 'hot' + h; c.put(k, h); c.get(k); c.get(k); }
+        const hot = [];
+        for (let h = 0; h < 8; h++) { const s = c._store.get('hot' + h); if (s >= 0 && (c._st[s] & LIRS_LIR)) hot.push(h); }
+        check(hot.length > 0, () => 't0 L5: no hot key reached LIR (setup invalid)');
+        while (c.size < N) c.put('warm' + c.size, c.size);
+        for (let i = 0; i < 4000; i++) { for (const h of hot) c.get('hot' + h); c.put('scan' + i, i); }
+        for (const h of hot) check(c.has('hot' + h), () => 't0 L5: LIR key ' + h + ' evicted by the scan');
+        validate(c);
+        void wrapLirs(c);
+    }
+
     // --- TTL laws (decisions/0017) ----------------------------------------------
 
     // T1: stale = MISS, and the MISS does NOTHING to policy state. get() on an expired
@@ -595,6 +681,18 @@ export function run() {
         validate(c);
     }
 
+    // I9 Lirs -- the LIR list (_lirHead..) THEN Q (_qHead..), RESIDENT only, non-resident
+    // history EXCLUDED (decisions/0023). Both threaded through the shared _next columns.
+    {
+        const c = new Lirs(20); // L_hir 1, L_lir 19
+        for (let i = 0; i < 19; i++) c.put(i, i);      // 19 LIR
+        for (let i = 100; i < 106; i++) c.put(i, i);   // resident HIR churn (each evicts the Q front)
+        check(c._lirHead !== NIL, () => 't0 ITER lirs: LIR list empty (setup invalid)');
+        check(c._qHead !== NIL, () => 't0 ITER lirs: Q empty (setup invalid)');
+        checkIterOrder('lirs', c, [c._lirHead, c._qHead]);
+        validate(c);
+    }
+
     // I5 TTL-skip WITHOUT reap (D18.5): a walk sees only live entries, but leaves the
     // stale ones resident (size unchanged); purgeStale() is the reclamation path.
     {
@@ -613,7 +711,7 @@ export function run() {
 
     // --- Snapshot / restore laws (decisions/0021, D21) --------------------------
     const SNAP = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo],
-        ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc]];
+        ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs]];
 
     // SN1: round-trip identity. Build a churned mid-life state, dump, structuredClone,
     // restore, and assert dump==dump (fixed point) AND identical order/values/size via an

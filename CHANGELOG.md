@@ -7,6 +7,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.10.0] - 2026-09-13
+
+### Added
+
+- **LIRS (`Lirs`) -- the eighth cache member** (decisions/0023, D23; Jiang & Zhang,
+  SIGMETRICS'02): eviction by recency-of-recency (inter-reference recency). A LIR set
+  + a resident-HIR list `Q` + a bounded non-resident history, on the same
+  `LiteCache<K,V>` surface, so `new LiteLru(n)` swaps for `new Lirs(n)` type-checked.
+  - Hot path is strict zero-alloc: one `_st` byte per slot (bit0 LIR, bit1 in-stack);
+    a LIR hit at the stack top early-returns with 0 writes, an interior hit relinks 5
+    (pinned by the torture gate). `L_hir = max(1, round(capacity * 0.01))`,
+    `L_lir = capacity - L_hir`. Resident value capacity stays EXACTLY capacity
+    (`|LIR| + |resident HIR| == size`); the non-resident history is bounded separately.
+  - The non-resident history is a keys-only ring generalizing the ARC ghost
+    (`class LirsHistory extends ArcGhost`, cap = capacity, drop-oldest). Because it is a
+    SEPARATE ring rather than interleaved into the linked stack, a single access prunes
+    at most `L_hir` -- `O(0.01*capacity)`, not the textbook `O(capacity)` (measured
+    adversarial max prune length 41 at capacity 4096, worst-case op ~0.02 ms,
+    `maxPauseMs` 0.000). This makes `Lirs` a BOUNDED LIRS VARIANT, not bit-exact
+    textbook LIRS: membership is eviction-recency (ring) rather than stack-position. The
+    deviation is documented in D23 with the rejected unbounded-stack alternative on record.
+  - Best scan/loop resister in the family: on a loop larger than capacity, `Lirs`
+    holds 99.2% of the Belady optimum (bench `loop`), where every other member scores
+    ~0; `scan` 100% of optimal. `Lirs` inherits TTL, zero-GC iteration, opt-in stats,
+    and snapshot/restore (tag `m:'Lirs'`; stack + `Q` + `_st` + history captured
+    verbatim, fail-closed on restore). `has`/`peek` are neutral.
+- `Lirs` in the shipped bench (`MEMBERS` 7 -> 8) and the policy-visualization demo
+  (a `Lirs` renderer drawn strictly from `dump()`); the `Lirs` class on `Lru.d.ts`.
+
+### Changed
+
+- Three-place version sync to 1.10.0 (`VERSION`, `package.json`, `llms.txt`), plus the
+  seven existing member `VERSION` asserts and the README constants table.
+- Roster documentation updated from seven to eight members across `README.md` and
+  `llms.txt` (members list, uniform surface, iteration order, "Choosing a member" guide).
+- Test suite 1077 -> 1110 (`test/Lirs.test.js` boundary suite + the LIRS differential
+  oracle, torture tiers t0/t2/t5/t6/t7/t9, and the two new must-fail controls); Gate
+  LIRS 0.00000 B/op on the hot path, dump/restore round-trip exact.
+
 ## [1.9.1] - 2026-09-13
 
 ### Changed

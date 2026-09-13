@@ -81,7 +81,7 @@ LiteMGLRU, meta-policy; distilled into DEBATE items 13-15).
 | zero-GC iteration (keys/entries/values, per-member defined order) -- cross-cutting | **built + gated (S11)** |
 | opt-in stats (hit/miss/evict; writes-per-hit stays torture-only) -- cross-cutting | **built + gated (S12)** |
 | snapshot / restore (dump/load; SoA columns are the serial form) | **built + gated (S14)** |
-| LIRS (list-based; the scan/loop-resistant stretch member) | **planned -- NEXT (S16, v1.10.0); brief in section 6; bounded non-resident history (D23)** |
+| LIRS (list-based; the scan/loop-resistant eighth member) | **built + gated (S16, v1.10.0 pending /release); bounded non-resident history (D23); loop 99.2% of Belady OPT** |
 | LRU-K, ClockPro, LFU, MQ/CAR | `DEBATE.md` item 4 (deferred) |
 | CLOCK/ClockPro (out of family), async fetch (-> `lite-lru-fetch`), size-aware (-> `lite-cache-budget`) | `DEBATE.md` items 6/8/11 (out of core) |
 | Belady OPT reference (offline harness normalization) | **built + gated (S9, t8 gate + Bench.mjs)** |
@@ -151,10 +151,11 @@ occupying a DISTINCT point on the workload map at bounded, zero-GC metadata cost
 | **WTinyLfu** | skewed / Zipf popularity + admission control | window + SLRU + **fixed CM sketch** | 1 bit + 1 counter inc | strict (sketch is a fixed typed array -- the MOST on-law member) | S6 (headline) |
 | **TwoQ / Slru** | scan / one-hit filtering, the simplest scan-resistant baseline | 2 lists (probation + protected) | ~6 (protected) / 0 (probation) | strict | S7 |
 | **Arc** | phase-changing workloads; self-tuning, no knobs | 2 lists + **2 ghost lists** + adaptive `p` | ~6 relinks | strict, but FLAGGED: ghost metadata + variable split stress law 3 | S8 (flagged) |
+| **Lirs** | scan/loop-heavy; recency-of-recency (IRR) -- best loop resistance (99.2% of Belady OPT vs 0% for the rest) | stack S + resident-HIR list Q + **bounded non-resident history** (LirsHistory extends ArcGhost) + 1 `_st` byte | 0 (LIR-hit-at-top) / 5 (interior) | strict; bounded O(L_hir) prune, history capped at capacity (D23) | S16 (stretch, built) |
 
 Deferred to `DEBATE.md` (not in v1.x): **CLOCK** (likely one idea in two costumes
 with SIEVE), **LRU-K** (K timestamps/key, dominated by SIEVE/S3-FIFO here),
-**LIRS/ClockPro** (best scan resistance but the fiddliest code -- stretch member),
+**ClockPro** (the CLOCK approximation of LIRS -- LIRS itself SHIPPED as S16/D23),
 **LFU/Heap-LFU** (O(log n) hot path; W-TinyLFU captures frequency at O(1)),
 **size/cost-aware** (a different capacity model -- a v2 track, not a member).
 
@@ -1236,19 +1237,55 @@ DONE WHEN
   Node server; member-selection guidance is present; the shipped surface is untouched.
 
 ===============================================================================
-# S16 -- v1.10.0 -- LIRS: the eighth member (stretch)  [PLANNED -- NEXT]
+# S16 -- v1.10.0 -- LIRS: the eighth member (stretch)  [BUILT -- awaiting /release 1.10.0]
 ===============================================================================
 ```markdown
 version_target: 1.10.0    # additive minor: an eighth LiteCache<K,V> member
-status: planned -- next session
+status: implemented -- gated green (torture ok + differential oracle), awaiting /release 1.10.0
 gc_maxMajor: 0
 gc_maxPauseMs: 4
-alloc_bytes_per_op: 0     # hot path strict zero-alloc (like every member); ghost/history bounded
+alloc_bytes_per_op: 0     # hot path strict zero-alloc; ghost/history bounded
 leak_cycles: 4096
 depends_on: [S3, S10, S11, S12, S14]   # substrate + TTL + iteration + stats + snapshot
 decisions: [D23 (LIRS: bounded non-resident history; fixed-capacity honesty)]
 blocks: []
 ```
+WHAT LANDED (S16, working tree, uncommitted; VERSION still 1.9.1 until /release 1.10.0):
+  - Lirs = the EIGHTH LiteCache<K,V> member (Lru.js +591/-0, PURELY ADDITIVE -- the other
+    seven members' get/put bodies byte-identical). Eviction by recency-of-recency (IRR):
+    a LIR set + resident-HIR list Q + a bounded non-resident history. Hot path strict
+    zero-alloc: one `_st` Uint8 test (bit0 LIR, bit1 inS) + move-to-top; LIR-hit-at-top
+    early-returns 0 writes, interior 5 (pinned). L_hir = max(1, round(cap*0.01)).
+  - D23 (decisions/0023-lirs.md): the non-resident history is a SEPARATE keys-only ring
+    (class LirsHistory extends ArcGhost, cap = capacity, drop-OLDEST) rather than interleaved
+    into the linked stack. Consequence: the stack holds only RESIDENT blocks, so a single
+    access prunes at most L_hir (= 41 at cap 4096) -- O(0.01*capacity), NOT textbook
+    O(capacity). This is a BOUNDED LIRS VARIANT (eviction-recency-of membership vs textbook
+    stack-position), documented as an honest deviation with the rejected unbounded alternative
+    named. Scan/loop resistance is intact (bench loop 24.7% = 99.2% of Belady OPT, where all
+    seven other members score 0.0%; scan 100% OPT). Fixed-capacity honest: resident value
+    capacity EXACTLY capacity; |LIR|+|residentHIR| == size; history bounded separately.
+  - Joined every axis: TTL (shared _exp, ttl-OFF byte-identical), iteration (S top->bottom,
+    resident only, fail-closed via _ver), stats (outcome-based; reclassifying miss counts as a
+    miss), snapshot dump()/restore() (tag m:'Lirs'; S+Q+_st+history verbatim; fail-closed
+    rejection matrix), bench (MEMBERS 7->8 + Bench.test.js), the S13 demo (renderer drawn
+    strictly from dump(), engine 7->8), Lru.d.ts + dts-drift (instance surface 7->8).
+  - Torture: from-scratch INDEPENDENT differential oracle (test/torture/oracles/lirs.mjs);
+    t0 laws, t2 adversarial max-pruning + loop-resistance, t5 differential (caps 1..9+64+256 x
+    {Map,int} x +/-ttl, 100k ops), t6 Gate LIRS (0 B/op with lane-coverage floors + measured
+    adversarial max prune length=41=L_hir + maxPauseMs 0.000), t7 retention, t9 TWO must-fail
+    controls (drop _st inS bit; omit history). validate.mjs conservation term 12.
+  - PIPELINE: planner -> coder -> reviewer APPROVED (the bounded-variant crux judged SOUND +
+    honestly documented; independent oracle; 0-alloc with teeth) -> qa (verified all 5
+    assertions, added 8 coverage tests, re-scoped demo 5b to a structural check, fixed stale
+    "all 7" titles + a D23 wording nit) -> qa FOUND ONE FAIL-OPEN: Lirs.restore()'s hand-rolled
+    stack-S rebuild accepted a DUPLICATE slot within snap.s (the only list not routed through
+    snapOccupied), silently building a corrupt instance (D21.3 violation) -> coder fixed with an
+    in-walk seenS guard + a fail-closed test -> reviewer re-APPROVED the fix (rejects the
+    duplicate, does NOT over-reject the legitimate S-and-LIR/Q overlap, cold-path only).
+  - Gates: npm test 1110/1110; torture "ok"/exit 0 (Gate LIRS 0.00000 B/op, prune 41=L_hir,
+    maxPauseMs 0.000); controls "ok"/exit 0; test:types clean (dts-drift 8 members); bench
+    includes Lirs (loop 99.2% OPT, scan 100%, zipf 87.1%); npm pack 8 files, demo/+test/ absent.
 GOAL
   Add LIRS (Low Inter-reference Recency Set; Jiang & Zhang, SIGMETRICS'02) as the EIGHTH
   member on the same LiteCache<K,V> surface -- the strongest scan/loop resistance in the
@@ -1354,7 +1391,7 @@ DONE WHEN
 | D20 | Belady OPT reference in the bench tool (offline only; brute-force correctness gate) | 0020 (S9) |
 | D21 | snapshot / restore (cold dump()/static restore(); slot-verbatim serial form; fail-closed tag; TTL captured verbatim + capture-time stamp) | 0021 (S14) |
 | D22 | animated policy-visualization demo (medium; dump() IS the visualization model; demo-only introspection hook REJECTED; never shipped; occupancy-only, dump() omits fixed geometry) | 0022 (S13) |
-| D23 | LIRS (list-based; recency-of-recency; bounded non-resident history generalizing the ArcGhost pattern; fixed-capacity honesty; bounded stack pruning) | 0023 (S16) -- PLANNED |
+| D23 | LIRS (list-based; recency-of-recency; bounded non-resident history generalizing the ArcGhost pattern; fixed-capacity honesty; bounded O(L_hir) stack pruning) | 0023 (S16) |
 | (law) | bit-packing (if any) INLINED, never a `lite-fastbit32`/package runtime dep (item 15) | 0012 (S4) |
 
 Deferred / out-of-core (get a decision record only if `DEBATE.md` promotes them):

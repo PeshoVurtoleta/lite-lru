@@ -29,7 +29,7 @@
  * @license MIT
  */
 
-import {LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, VERSION} from '../Lru.js';
+import {LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, VERSION} from '../Lru.js';
 
 /* -------------------------------------------------------------------------- *
  * Seeded PRNG -- xorshift32, the same generator the torture harness uses, so a
@@ -276,6 +276,7 @@ function instrument(cache, counter) {
     cache._next = wrap(cache._next);
     cache._prev = wrap(cache._prev);
     if (cache._vis) cache._vis = wrap(cache._vis); // Sieve's visited column
+    if (cache._sNext) { cache._sNext = wrap(cache._sNext); cache._sPrev = wrap(cache._sPrev); } // Lirs stack S
 }
 
 /** Hit ratio + writes-per-hit for one member over one trace (untimed). A "hit" is
@@ -332,6 +333,7 @@ const MEMBERS = [
     {name: 'Slru', ctor: Slru},
     {name: 'TwoQ', ctor: TwoQ},
     {name: 'Arc', ctor: Arc},
+    {name: 'Lirs', ctor: Lirs},
 ];
 
 /* -------------------------------------------------------------------------- *

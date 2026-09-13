@@ -203,6 +203,23 @@ export const RENDERERS = {
             drawGhost(g, geom.x, y, s.b2, 'B2 ghost');
         },
     },
+    Lirs: {
+        // LIRS dump() shape (decisions/0023): the LIR list + Q (resident, values), the per-Q
+        // inS bits, the stack S order (slot indices top..bottom), and the bounded non-resident
+        // history (keys only). Occupancy only -- L_hir/L_lir geometry is not in dump() (D22.5).
+        fields: ['lir', 'q', 'qins', 's', 'hist'],
+        model(s) { return pick(s, this.fields); },
+        draw(g, s, geom) {
+            let y = geom.y + 16;
+            y = drawList(g, geom.x, y, s.lir, 'LIR set (hot)', COL.prot);
+            y = drawList(g, geom.x, y, s.q, 'Q resident HIR (evict front)', COL.prob);
+            g.fillStyle = COL.dim;
+            g.font = '11px ui-monospace, monospace';
+            g.fillText('stack S depth ' + s.s.length + ' (top->bottom)', geom.x, y);
+            y += 14;
+            drawGhost(g, geom.x, y, s.hist, 'non-resident history');
+        },
+    },
 };
 
 /** The members this module renders. Demo.test.mjs asserts this covers every engine

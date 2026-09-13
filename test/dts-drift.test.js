@@ -130,6 +130,11 @@ function arcImplementsLiteCache(dtsText) {
   return /class Arc<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
 }
 
+/** True if the d.ts declares `class Lirs<...> implements LiteCache<...>`. */
+function lirsImplementsLiteCache(dtsText) {
+  return /class Lirs<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
+}
+
 /** True if BOTH sources declare a `Sieve` class (the second named export). */
 function jsDeclaresSieve(jsText) {
   return /export class Sieve\b/.test(jsText);
@@ -176,6 +181,14 @@ function jsDeclaresArc(jsText) {
 }
 function dtsDeclaresArc(dtsText) {
   return /export class Arc\b/.test(dtsText);
+}
+
+/** True if BOTH sources declare a `Lirs` class (the eighth named export). */
+function jsDeclaresLirs(jsText) {
+  return /export class Lirs\b/.test(jsText);
+}
+function dtsDeclaresLirs(dtsText) {
+  return /export class Lirs\b/.test(dtsText);
 }
 
 /** Symmetric-difference report between two sets: [] when equal. */
@@ -313,6 +326,22 @@ test('(i) Arc surface: Arc is a named export in BOTH sources, members agree, imp
   assert.ok(arcImplementsLiteCache(DTS), 'class Arc must `implements LiteCache<...>`');
 });
 
+test('(j) Lirs surface: Lirs is a named export in BOTH sources, members agree, implements LiteCache', () => {
+  assert.ok(jsDeclaresLirs(JS), 'Lru.js must `export class Lirs` (the eighth named export)');
+  assert.ok(dtsDeclaresLirs(DTS), 'Lru.d.ts must `export class Lirs`');
+  const js = classMembers(JS, 'Lirs');
+  const dts = classMembers(DTS, 'Lirs');
+  const diffs = setDiff(js, dts, 'Lru.js', 'Lru.d.ts');
+  assert.deepEqual(diffs, [], diffs.join('; '));
+  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'purgeStale', 'stats', 'resetStats', 'dump', 'keys', 'values', 'entries', 'size', 'capacity']) {
+    assert.ok(js.has(nm), 'Lru.js class Lirs is missing public member ' + nm);
+    assert.ok(dts.has(nm), 'Lru.d.ts class Lirs is missing member ' + nm);
+  }
+  assert.equal(js.size, 15, 'expected exactly 15 public members in Lirs (Lru.js), saw ' + js.size);
+  assert.equal(dts.size, 15, 'expected exactly 15 members in Lirs (Lru.d.ts), saw ' + dts.size);
+  assert.ok(lirsImplementsLiteCache(DTS), 'class Lirs must `implements LiteCache<...>`');
+});
+
 // --- teeth: each check must reject a mutated COPY (non-vacuity) --------------
 
 test('control: unmutated text reports zero diffs / all-present (vacuity)', () => {
@@ -325,6 +354,7 @@ test('control: unmutated text reports zero diffs / all-present (vacuity)', () =>
   assert.deepEqual(setDiff(classMembers(JS, 'Slru'), classMembers(DTS, 'Slru'), 'a', 'b'), []);
   assert.deepEqual(setDiff(classMembers(JS, 'TwoQ'), classMembers(DTS, 'TwoQ'), 'a', 'b'), []);
   assert.deepEqual(setDiff(classMembers(JS, 'Arc'), classMembers(DTS, 'Arc'), 'a', 'b'), []);
+  assert.deepEqual(setDiff(classMembers(JS, 'Lirs'), classMembers(DTS, 'Lirs'), 'a', 'b'), []);
   assert.ok(hasLiteCacheInterface(DTS));
   assert.ok(liteLruImplementsLiteCache(DTS));
   assert.ok(sieveImplementsLiteCache(DTS));
@@ -333,6 +363,7 @@ test('control: unmutated text reports zero diffs / all-present (vacuity)', () =>
   assert.ok(slruImplementsLiteCache(DTS));
   assert.ok(twoqImplementsLiteCache(DTS));
   assert.ok(arcImplementsLiteCache(DTS));
+  assert.ok(lirsImplementsLiteCache(DTS));
 });
 
 test('control: desyncing the package.json version makes version parity fail', () => {
@@ -389,4 +420,9 @@ test('control: breaking TwoQ implements clause fails the TwoQ surface check', ()
 test('control: breaking Arc implements clause fails the Arc surface check', () => {
   const mutated = DTS.replace(/class Arc<[^>]*>\s+implements LiteCache<[^>]*>/, 'class Arc<K = unknown, V = unknown>');
   assert.ok(!arcImplementsLiteCache(mutated), 'de-implementing LiteCache on Arc did not fail the surface check');
+});
+
+test('control: breaking Lirs implements clause fails the Lirs surface check', () => {
+  const mutated = DTS.replace(/class Lirs<[^>]*>\s+implements LiteCache<[^>]*>/, 'class Lirs<K = unknown, V = unknown>');
+  assert.ok(!lirsImplementsLiteCache(mutated), 'de-implementing LiteCache on Lirs did not fail the surface check');
 });

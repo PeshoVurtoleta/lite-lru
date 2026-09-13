@@ -25,8 +25,9 @@
  */
 
 import { measureOps, checkNoGc, measureAllocs, checkAllocs } from '@zakkster/lite-gc-profiler';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs } from '../../Lru.js';
 import { makeLruOracle, svz } from './oracles/lru.mjs';
+import { makeLirsOracle } from './oracles/lirs.mjs';
 import { makeFifoOracle, makeFifoReal } from './oracles/fifo.mjs';
 import { makeSieveOracle } from './oracles/sieve.mjs';
 import { makeS3FifoOracle } from './oracles/s3fifo.mjs';
@@ -433,6 +434,44 @@ export const arcTtlPolicy = {
     oracle: (cap, o) => makeArcOracle(cap, o),
 };
 
+/** Wrap a real Lirs as a uniform driver. victim via `_peekVictim` (Q front, test-only). */
+export function wrapLirs(cache) {
+    return {
+        get: (k) => cache.get(k),
+        put: (k, v, t) => cache.put(k, v, t),
+        has: (k) => cache.has(k),
+        peek: (k) => cache.peek(k),
+        delete: (k) => cache.delete(k),
+        size: () => cache.size,
+        victim: () => cache._peekVictim(),
+        raw: cache,
+    };
+}
+
+/** The Lirs policy (decisions/0023): the LIRS member + its own independent stack/Q/bounded-
+ *  history oracle. Default backing (Map): arbitrary keys. */
+export const lirsPolicy = {
+    name: 'lirs',
+    real: (cap) => wrapLirs(new Lirs(cap)),
+    oracle: (cap) => makeLirsOracle(cap),
+};
+
+/** The Lirs policy on the INTEGER substrate backing (`keys: 'int'`), driven against the
+ *  SAME lirs oracle: the strict-zero backing (incl. the int history ring) must return
+ *  byte-identical values + victims (decisions/0011 + 0023). */
+export const lirsIntPolicy = {
+    name: 'lirs-int',
+    real: (cap) => wrapLirs(new Lirs(cap, { keys: 'int' })),
+    oracle: (cap) => makeLirsOracle(cap),
+};
+
+/** Lirs with an opt-in TTL default (decisions/0017). */
+export const lirsTtlPolicy = {
+    name: 'lirs-ttl',
+    real: (cap, o) => wrapLirs(new Lirs(cap, o)),
+    oracle: (cap, o) => makeLirsOracle(cap, o),
+};
+
 /* -------------------------------------------------------------------------- *
  * The PARAMETERIZED differential runner (the whole point of S1).
  *
@@ -649,6 +688,37 @@ export class CountedWTinyLfu extends WTinyLfu {
 /** W-TinyLFU window-MRU re-hit baseline (measured): the one 0-relink fast path. */
 export const WTINYLFU_WRITES_WINDOW_MRU_REHIT = 0;
 
+/**
+ * A Lirs subclass whose stack-S columns `_sNext`/`_sPrev` are wrapped in counting
+ * Proxies -- used ONLY in the T6 LIRS counter sub-tier, NEVER on a measured zero-alloc
+ * path (a Proxy allocates + traps and would poison the gate). It pins the ONE genuine
+ * fast path: a LIR hit at the TOP of the stack relinks NOTHING (the pinned 0-write case,
+ * like LiteLru's head re-hit), while an interior LIR hit is the 5-write "move to top of S".
+ */
+export class CountedLirs extends Lirs {
+    constructor(capacity, options) {
+        super(capacity, options);
+        this._writes = 0; // _sNext / _sPrev link stores
+        const self = this;
+        const countStores = (arr) => new Proxy(arr, {
+            set(t, prop, value) {
+                if (typeof prop === 'string' && prop !== 'length' && String(+prop) === prop) {
+                    self._writes++;
+                }
+                t[prop] = value;
+                return true;
+            },
+        });
+        this._sNext = countStores(this._sNext);
+        this._sPrev = countStores(this._sPrev);
+    }
+    resetWrites() { this._writes = 0; }
+    writes() { return this._writes; }
+}
+
+/** LIRS LIR-hit-at-top baseline (measured; regression tripwire): the pinned 0-write path. */
+export const LIRS_WRITES_LIR_TOP_REHIT = 0;
+
 /* -------------------------------------------------------------------------- *
  * Snapshot / restore round-trip differential (decisions/0021, D21).
  *
@@ -673,6 +743,7 @@ export const SNAP_MEMBERS = [
     { name: 'Slru', Ctor: Slru, wrap: wrapSlru },
     { name: 'TwoQ', Ctor: TwoQ, wrap: wrapTwoQ },
     { name: 'Arc', Ctor: Arc, wrap: wrapArc },
+    { name: 'Lirs', Ctor: Lirs, wrap: wrapLirs },
 ];
 
 /** Structural deep-equality for two snapshots, IGNORING the capture-time field `t`

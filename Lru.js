@@ -116,6 +116,14 @@ const TWOQ_AM = 1;
 const ARC_T1 = 0;
 const ARC_T2 = 1;
 
+/** LIRS (decisions/0023, D23) per-slot state bits, packed in a member-specific `_st`
+ *  Uint8 column (like W-TinyLFU's sketch -- NOT a field on the shared SlotStore, so the
+ *  other members' hot paths stay byte-identical). bit0 = LIR (low IRR, hot/resident);
+ *  bit1 = the slot is currently in the LIRS stack S. The whole LIRS hot test is a single
+ *  `_st[s]` read (`& LIRS_LIR`, `& LIRS_INS`). */
+const LIRS_LIR = 1; // bit0: 1 = LIR block, 0 = HIR block
+const LIRS_INS = 2; // bit1: slot is currently a member of the stack S
+
 /** W-TinyLFU count-min sketch shape (decisions/0014, D14.2): 4 rows of 4-bit
  *  saturating counters packed 8-per-Uint32. One per-row seed spreads a key across the
  *  rows; `Math.imul` keeps each mix an EXACT 32-bit multiply (zero-alloc). Built once. */
@@ -212,7 +220,7 @@ function validateStats(stats) {
         "[lite-lru] unknown stats option " + String(stats) + " (did you mean true?)");
 }
 
-export const VERSION = "1.9.1";
+export const VERSION = "1.10.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -4218,6 +4226,589 @@ export class Arc {
         if (!evictT1 && this._t2Size === 0) evictT1 = true;
         if (evictT1 && this._t1Size === 0) evictT1 = false;
         return evictT1 ? this._keys[this._t1Tail] : this._keys[this._t2Tail];
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * LirsHistory -- the bounded, keys-only non-resident HIR history for LIRS
+ * (decisions/0023, D23). A GENERALIZATION of ArcGhost: same open-addressed int ring
+ * (strict zero-alloc on keys:'int') / Set + FIFO array (amortized on the Map backing),
+ * bounded at construction to `capacity`. It stands in for the non-resident portion of
+ * the textbook LIRS stack S: a non-resident HIR block is "still in S" iff its key is
+ * still in this bounded ring; when the bound is hit we drop the OLDEST key -- a bounded,
+ * honest deviation from the unbounded textbook stack (D23). INTERNAL, never exported.
+ * -------------------------------------------------------------------------- */
+
+class LirsHistory extends ArcGhost {}
+
+/* -------------------------------------------------------------------------- *
+ * Lirs -- Low Inter-reference Recency Set (Jiang & Zhang, SIGMETRICS'02),
+ * decisions/0023, D23. The EIGHTH named export in this file (same file-shape ruling:
+ * single main file + sideEffects:false + named exports = the tree-shake moat).
+ *
+ * LIRS evicts by RECENCY-OF-RECENCY: a block's IRR (inter-reference recency) is the
+ * count of DISTINCT blocks referenced between its last two accesses. A LOW-IRR block is
+ * "hot" (LIR set, resident); a HIGH-IRR block is "cold" (HIR -- resident metadata in a
+ * small reserve, or non-resident metadata only). This is the strongest scan/loop
+ * resistance in the family and a genuinely NEW mechanism vs recency/frequency/adaptation.
+ *
+ * Fixed-capacity honesty (D23, restating Arc's D16.2): the RESIDENT value capacity is
+ * EXACTLY `capacity`. It is split L_hir = max(1, round(capacity * 0.01)) resident HIR
+ * slots + L_lir = capacity - L_hir LIR slots; only the split is fixed, |LIR| + |resident
+ * HIR| == size always. The non-resident history is bounded SEPARATELY (LirsHistory,
+ * cap = capacity, drop-oldest -- D23).
+ *
+ * STRUCTURES (all fixed at construction, zero-alloc on the hot path):
+ *   - Stack S (member `_sNext`/`_sPrev`, `_sTop` MRU .. `_sBot` LRU): the resident blocks
+ *     currently IN S (every LIR block + the resident HIR blocks not yet pruned). Subject
+ *     to STACK PRUNING: HIR blocks are dropped from the bottom until the bottom is a LIR.
+ *   - List Q (the SHARED `_next`/`_prev`, `_qHead` front/oldest .. `_qTail`): ALL resident
+ *     HIR blocks, in eviction (FIFO) order -- the eviction candidates.
+ *   - The LIR list (the SHARED `_next`/`_prev`, `_lirHead`/`_lirTail`): ALL LIR blocks.
+ *     The LIR list + Q are a DISJOINT partition of the resident set over the shared link
+ *     columns (a slot is LIR xor resident-HIR), so validate()/iteration reuse the shared
+ *     machinery unchanged; the interleaved stack S rides its OWN member columns.
+ *   - `_st` Uint8: bit0 LIR, bit1 inS (the single hot-path test).
+ *   - `_hist` (LirsHistory): the bounded non-resident HIR keys.
+ *
+ * HOT PATHS (proven zero-alloc by the torture gate): a LIR hit at the top of S early-
+ * returns with 0 link writes; a LIR hit elsewhere is the 5-write "move to top of S". The
+ * resident-HIR hit + the miss/replace paths reach the cold, allocation-free helpers
+ * `_prune` / `_promoteToLir` / `_demoteBottomLir` / `_replace` -- never inlined into the
+ * LIR-hit body. Rides the shared newStore factory, the onEvict fire-after + `_inOnEvict`
+ * guard (0002), TTL (0017), zero-GC iteration (0018), stats (0019), snapshot (0021).
+ * -------------------------------------------------------------------------- */
+
+export class Lirs {
+    /**
+     * @param {number} capacity  Max resident entries. Must be an integer >= 1.
+     * @param {{ onEvict?: (key: any, value: any) => void, keys?: 'int' }} [options]
+     */
+    constructor(capacity, options) {
+        if (!Number.isInteger(capacity) || capacity < 1) {
+            throw new RangeError(
+                "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
+            );
+        }
+
+        this._capacity = capacity;
+
+        // TTL (decisions/0017), validated fail-closed -- identical to the rest of the family.
+        this._clock = validateClock(options && options.clock);
+        this._ttl = validateTtl(options && options.ttl);
+
+        // Same shared substrate + int-key door as every other member.
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+
+        // Cache the store's columns so the relinks stay direct.
+        this._keys = this._store._keys;
+        this._vals = this._store._vals;
+        this._next = this._store._next; // SHARED: threads the LIR list AND Q (disjoint) + free stack
+        this._prev = this._store._prev;
+        this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+
+        // The interleaved stack S rides its OWN member link columns (D23): a slot may be in
+        // BOTH the shared list (LIR list / Q) and S at once, so S needs separate links.
+        this._sNext = new Int32Array(capacity);
+        this._sPrev = new Int32Array(capacity);
+        this._sTop = NIL; // MRU end of the stack
+        this._sBot = NIL; // LRU end of the stack (kept a LIR by pruning)
+
+        // Per-slot state (bit0 LIR, bit1 inS). Member-specific, fixed, never grown.
+        this._st = new Uint8Array(capacity);
+
+        // The LIR list (shared columns): all LIR blocks. `_lirHead` MRU-ish (order does not
+        // steer policy -- only S + Q orders do -- it exists for conservation + iteration).
+        this._lirHead = NIL; this._lirTail = NIL; this._lirCount = 0;
+
+        // The list Q (shared columns): all resident HIR blocks, FIFO eviction order.
+        this._qHead = NIL; this._qTail = NIL;
+
+        this._size = 0; // resident = |LIR| + |resident HIR| = _lirCount + |Q|
+
+        // The resident split (D23). cap 1 -> L_hir 1, L_lir 0 (all-HIR window edge).
+        this._Lhir = Math.max(1, Math.round(capacity * 0.01));
+        this._Llir = capacity - this._Lhir;
+
+        // The bounded non-resident HIR history (D23): keys only, cap = capacity, drop-oldest.
+        this._histCap = capacity;
+        this._histInt = (options && options.keys) === 'int';
+        this._hist = new LirsHistory(capacity, this._histInt);
+
+        this._onEvict = (options && options.onEvict) || NOOP;
+        this._inOnEvict = false;
+
+        // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
+        this._stats = validateStats(options && options.stats);
+    }
+
+    /** The store factory, delegating to the shared `newStore` (decisions/0011). */
+    _makeStore(capacity, keys, hasTtl) {
+        return newStore(capacity, keys, hasTtl);
+    }
+
+    get size() { return this._size; }
+    get capacity() { return this._capacity; }
+
+    // --- stack S helpers (member `_sNext`/`_sPrev`) ---------------------------
+
+    /** Unlink slot s from the stack S. */
+    _sDetach(s) {
+        const p = this._sPrev[s], n = this._sNext[s];
+        if (p !== NIL) this._sNext[p] = n; else this._sTop = n;
+        if (n !== NIL) this._sPrev[n] = p; else this._sBot = p;
+    }
+
+    /** Push slot s at the top (MRU end) of S. Caller sets the inS bit. */
+    _sPushTop(s) {
+        this._sPrev[s] = NIL; this._sNext[s] = this._sTop;
+        if (this._sTop !== NIL) this._sPrev[this._sTop] = s;
+        this._sTop = s; if (this._sBot === NIL) this._sBot = s;
+    }
+
+    /** Move an already-in-S slot to the top. No-op (0 writes) if already the top -- the
+     *  pinned LIR-hit fast path. */
+    _sMoveTop(s) {
+        if (this._sTop === s) return;
+        this._sDetach(s);
+        this._sPushTop(s);
+    }
+
+    /** STACK PRUNING (D23): drop HIR blocks from the bottom of S until the bottom is a LIR
+     *  (or S is empty). A pruned block stays RESIDENT (in Q); it just leaves S (inS cleared).
+     *  COLD / out-of-line, allocation-free; amortized O(1), worst-case O(size) (an inherent
+     *  LIRS characteristic -- MEASURED + pinned by the torture gate, never silently capped). */
+    _prune() {
+        let b = this._sBot;
+        while (b !== NIL && (this._st[b] & LIRS_LIR) === 0) {
+            const p = this._sPrev[b];       // next candidate up
+            this._sNext[b] = NIL;           // (detach bottom)
+            if (p !== NIL) this._sNext[p] = NIL; else this._sTop = NIL;
+            this._sBot = p;
+            this._st[b] &= ~LIRS_INS;       // left S, still resident in Q
+            b = p;
+        }
+    }
+
+    // --- the LIR list + Q helpers (shared `_next`/`_prev`) --------------------
+
+    /** Push slot s at the head of the LIR list. */
+    _lirPush(s) {
+        this._prev[s] = NIL; this._next[s] = this._lirHead;
+        if (this._lirHead !== NIL) this._prev[this._lirHead] = s;
+        this._lirHead = s; if (this._lirTail === NIL) this._lirTail = s;
+    }
+
+    /** Unlink slot s from the LIR list. */
+    _lirDetach(s) {
+        const p = this._prev[s], n = this._next[s];
+        if (p !== NIL) this._next[p] = n; else this._lirHead = n;
+        if (n !== NIL) this._prev[n] = p; else this._lirTail = p;
+    }
+
+    /** Push slot s at the tail (newest) of Q. */
+    _qPushTail(s) {
+        this._next[s] = NIL; this._prev[s] = this._qTail;
+        if (this._qTail !== NIL) this._next[this._qTail] = s;
+        this._qTail = s; if (this._qHead === NIL) this._qHead = s;
+    }
+
+    /** Unlink slot s from Q. */
+    _qDetach(s) {
+        const p = this._prev[s], n = this._next[s];
+        if (p !== NIL) this._next[p] = n; else this._qHead = n;
+        if (n !== NIL) this._prev[n] = p; else this._qTail = p;
+    }
+
+    // --- the LIRS policy core (COLD helpers, allocation-free) ------------------
+
+    /** Demote the bottom LIR of S to a resident HIR: move it out of S + off the LIR list,
+     *  onto Q's tail, then prune. Called ONLY when a promotion pushed `_lirCount` past
+     *  `_Llir` (D23). COLD / out-of-line. */
+    _demoteBottomLir() {
+        const b = this._sBot; // the invariant keeps this a LIR
+        this._sDetach(b);
+        this._st[b] &= ~LIRS_INS;
+        this._st[b] &= ~LIRS_LIR;
+        this._lirDetach(b);
+        this._lirCount--;
+        this._qPushTail(b);
+        this._prune();
+    }
+
+    /** Reclassify a resident HIR slot (already moved to the top of S) to LIR: drop it from
+     *  Q, add to the LIR list, and demote the bottom LIR if the LIR set overflowed. COLD. */
+    _promoteToLir(s) {
+        this._qDetach(s);
+        this._st[s] |= LIRS_LIR; // inS already set by the caller
+        this._lirPush(s);
+        this._lirCount++;
+        if (this._lirCount > this._Llir) this._demoteBottomLir();
+    }
+
+    /** Add a key to the bounded non-resident history, dropping the OLDEST at the bound
+     *  (D23). COLD (only the eviction path reaches it). */
+    _histAdd(key) {
+        if (this._hist._len >= this._histCap) this._hist.delLRU();
+        this._hist.addMRU(key);
+    }
+
+    /** Evict Q's front (the LRU resident HIR) to free a resident slot, returning that slot
+     *  for in-place reuse (D6-style, no free-list round trip). If the victim was in S it
+     *  becomes a non-resident HIR (its key enters the bounded history); otherwise it is
+     *  simply forgotten. Sets `_evKey`/`_evVal` for the onEvict fire-after. COLD; only ever
+     *  called at capacity, where Q is guaranteed non-empty (|Q| >= L_hir >= 1). */
+    _replace() {
+        const s = this._qHead;
+        this._evKey = this._keys[s];
+        this._evVal = this._vals[s];
+        this._qDetach(s);
+        const wasInS = (this._st[s] & LIRS_INS) !== 0;
+        if (wasInS) this._sDetach(s);
+        this._store.delete(this._evKey);
+        if (wasInS) this._histAdd(this._evKey);
+        this._st[s] = 0;
+        this._size--;
+        return s;
+    }
+
+    /** The per-access recency step for a RESIDENT slot (get hit / put update). Bit0/bit1 of
+     *  `_st[s]` decide the branch; the LIR-hit-at-top case does 0 writes. */
+    _access(s) {
+        const st = this._st[s];
+        if (st & LIRS_LIR) {
+            // LIR hit.
+            if (this._sTop === s) return;      // pinned 0-write fast path
+            const wasBottom = (this._sBot === s);
+            this._sMoveTop(s);                 // the 5-write "move to top of S"
+            if (wasBottom) this._prune();      // bottom changed -> re-prune (cold)
+        } else {
+            // Resident HIR hit.
+            const inSbefore = (st & LIRS_INS) !== 0;
+            if (inSbefore) this._sMoveTop(s);
+            else { this._sPushTop(s); this._st[s] |= LIRS_INS; }
+            if (inSbefore && this._Llir > 0) {
+                this._promoteToLir(s);         // in-S -> reclassify to LIR (cold)
+            } else {
+                this._qDetach(s); this._qPushTail(s); // stays HIR -> Q MRU end
+            }
+        }
+    }
+
+    // --- public API (all zero-alloc on the hot path) --------------------------
+
+    /** Look up a key AND apply the LIRS access policy. @returns the value, or undefined if
+     *  absent (see D7). A get never consults the non-resident history (a missing key is a
+     *  plain miss; reclassification happens only on a put that re-admits the key). */
+    get(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const s = this._store.get(key);
+        if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
+            this._reap(s);
+            return undefined;
+        }
+        this._access(s);
+        if (this._stats !== null) this._stats.hits++; // live hit (0019)
+        return this._vals[s];
+    }
+
+    /**
+     * Insert or update. An update rewrites the value and applies the access policy (like a
+     * hit). A new key that is a non-resident HIR STILL in the bounded history is re-admitted
+     * as LIR (recency-of-recency); a brand-new key enters as LIR while the LIR set is filling
+     * else as HIR. At capacity one resident HIR is evicted from Q's front first (its slot
+     * reused in place); onEvict fires LAST (0002). The positional `ttlMs` (0017) overrides
+     * the instance ttl default.
+     */
+    put(key, value, ttlMs) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        let expiresAt;
+        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
+        this._store._ver++; // D18.6 -- put mutates; invalidate iterators
+        const store = this._store;
+        const existing = store.get(key);
+        if (existing >= 0) {                  // update-in-place + access policy
+            this._vals[existing] = value;
+            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            this._access(existing);
+            if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
+            return;
+        }
+
+        const inHist = this._hist.has(key);
+        let s;
+        let evicted = false;
+        if (this._size === this._capacity) {
+            s = this._replace();              // evict Q front -> reuse its slot; sets _evKey/_evVal
+            evicted = true;
+        } else {
+            s = store.allocSlot();
+        }
+
+        if (inHist) this._hist.consume(key);  // it is being re-admitted (resident again)
+        this._keys[s] = key;
+        this._vals[s] = value;
+        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        store.set(key, s);
+
+        if (inHist && this._Llir > 0) {
+            // non-resident HIR still "in S" -> re-admit as LIR (the LIRS win).
+            this._st[s] = LIRS_LIR | LIRS_INS;
+            this._sPushTop(s);
+            this._lirPush(s);
+            this._lirCount++;
+            this._size++;
+            if (this._lirCount > this._Llir) this._demoteBottomLir();
+        } else if (this._lirCount < this._Llir) {
+            // still filling the LIR set -> admit as LIR (LIRS warm-up).
+            this._st[s] = LIRS_LIR | LIRS_INS;
+            this._sPushTop(s);
+            this._lirPush(s);
+            this._lirCount++;
+            this._size++;
+        } else {
+            // a new resident HIR -> top of S + tail of Q.
+            this._st[s] = LIRS_INS;
+            this._sPushTop(s);
+            this._qPushTail(s);
+            this._size++;
+        }
+
+        if (this._stats !== null) this._stats.puts++; // successful insert (outcome-based); 0019
+
+        if (evicted) {
+            if (this._stats !== null) this._stats.evictions++; // capacity eviction (0019)
+            const evKey = this._evKey, evVal = this._evVal;
+            this._evKey = undefined; this._evVal = undefined; // retention hygiene
+            this._inOnEvict = true;
+            try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+        }
+    }
+
+    /** True if key is present (RESIDENT). History keys are NOT present. Policy-NEUTRAL. A
+     *  stale entry is a MISS and is reaped in place (decisions/0017, D17.3). */
+    has(key) {
+        const s = this._store.get(key);
+        if (s < 0) return false;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return false;
+        }
+        return true;
+    }
+
+    /** Read a value WITHOUT applying the policy. undefined if absent (see D7). A stale entry
+     *  is a MISS and is reaped in place (decisions/0017, D17.3). */
+    peek(key) {
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return undefined;
+        }
+        return this._vals[s];
+    }
+
+    /** Unlink a resident slot from whatever structures hold it (LIR list or Q, and S when
+     *  inS), dropping its counts. Shared by delete + reap; NOT ghosted (like the rest of the
+     *  family, a delete/reap keeps no non-resident metadata). */
+    _unlinkResident(s) {
+        if (this._st[s] & LIRS_INS) this._sDetach(s);
+        if (this._st[s] & LIRS_LIR) { this._lirDetach(s); this._lirCount--; }
+        else this._qDetach(s);
+        this._st[s] = 0;
+        this._size--;
+    }
+
+    /** Reap an expired slot in place (decisions/0017): unlink, drop from the index, free the
+     *  slot, and fire onEvict LAST via the 0002 guard. Not ghosted, never re-splits. */
+    _reap(s) {
+        this._store._ver++; // D18.6 -- a reap is a structural mutation; invalidate iterators
+        const evKey = this._keys[s];
+        const evVal = this._vals[s];
+        this._unlinkResident(s);
+        this._store.delete(evKey);
+        this._store.freeSlot(s);
+        if (this._stats !== null) this._stats.evictions++; // reap = eviction (0019, D19.2)
+        this._inOnEvict = true;
+        try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+    }
+
+    /** Evict every expired resident entry now (decisions/0017, D17.5). COLD, O(size). */
+    purgeStale() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG);
+        if (this._exp === null) return 0;
+        const now = this._clock();
+        const exp = this._exp;
+        const victims = [];
+        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
+        return victims.length;
+    }
+
+    /** Remove a key. Returns true if it was present. Frees the slot; NOT ghosted. */
+    delete(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const s = store.get(key);
+        if (s < 0) return false;
+        store._ver++; // D18.6 -- a real delete is a structural mutation; invalidate iterators
+        this._unlinkResident(s);
+        store.delete(key);
+        store.freeSlot(s);
+        return true;
+    }
+
+    /** Empty the cache. Rebuilds the free list, empties S/Q/LIR-list + the history, and
+     *  resets the per-slot state. Allocates nothing. O(capacity). */
+    clear() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
+        this._store.reset();
+        this._sTop = NIL; this._sBot = NIL;
+        this._lirHead = NIL; this._lirTail = NIL; this._lirCount = 0;
+        this._qHead = NIL; this._qTail = NIL;
+        this._size = 0;
+        this._st.fill(0);
+        this._hist.clear();
+    }
+
+    // --- opt-in runtime stats (decisions/0019, D19): cold accessors -----------
+
+    /** The live stats holder (decisions/0019, D19.3), returned BY REFERENCE (borrowed).
+     *  Fail closed on an instance built without { stats: true }. */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE (decisions/0019). Fail closed on a non-stats instance. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        const st = this._stats;
+        st.hits = 0; st.misses = 0; st.evictions = 0; st.puts = 0;
+    }
+
+    // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
+
+    /** The per-member iteration ROSTER (decisions/0018 / 0023): the LIR list THEN Q, both
+     *  threaded through the shared `_next` columns -- RESIDENT only (LIR + resident HIR),
+     *  the non-resident history EXCLUDED. Recency-neutral, stale-skipping, fail-closed via
+     *  `_ver` -- the shared CacheIterator walks it unchanged. */
+    _iterHeads() { return [this._lirHead, this._qHead]; }
+
+    keys() { return iterKeys(this); }
+    values() { return iterValues(this); }
+    entries() { return iterEntries(this); }
+    [Symbol.iterator]() { return iterEntries(this); }
+
+    // --- snapshot / restore (decisions/0021, D21): COLD, may allocate --------
+
+    /** Serialize to a plain snapshot (decisions/0021, D21 + D23): the LIR list + Q (each
+     *  with values/expiry), the per-Q inS bit, the stack S order (slot indices top..bottom),
+     *  AND the bounded non-resident history (keys only, oldest..newest). Dropping the stack
+     *  order/bits or the history is a fail-OPEN future-eviction bug, so all are captured. */
+    dump() {
+        const snap = snapBase(this, "Lirs");
+        snap.lir = snapList(this, this._lirHead, false);
+        snap.q = snapList(this, this._qHead, false);
+        const qins = [];
+        for (let i = 0; i < snap.q.slots.length; i++) {
+            qins.push((this._st[snap.q.slots[i]] & LIRS_INS) ? 1 : 0);
+        }
+        snap.qins = qins;
+        const s = [];
+        for (let x = this._sTop; x !== NIL; x = this._sNext[x]) s.push(x);
+        snap.s = s;
+        snap.hist = snapArcGhost(this._hist);
+        return snap;
+    }
+
+    /** Reconstruct a FRESH Lirs from a snapshot (decisions/0021, D21 + D23). Fail closed on
+     *  any tag/shape mismatch, a malformed inS/stack/history column, a stack slot that is not
+     *  a resident LIR/inS-HIR, or a history that would exceed its bound. */
+    static restore(snap, opts) {
+        const cap = snapRead(snap, "Lirs", opts);
+        const inst = new Lirs(cap, snapOpts(snap, opts));
+        const occ = snapCheckOccupy(cap, snap.ttl, [[snap.lir, "lir"], [snap.q, "q"]]);
+        // Shape the LIRS-specific aux (fail closed -- "null is not zero").
+        if (!Array.isArray(snap.qins) || snap.qins.length !== snap.q.slots.length) {
+            throw new Error(SNAP_BAD + "lirs qins must be an array aligned to q");
+        }
+        for (let i = 0; i < snap.qins.length; i++) {
+            const b = snap.qins[i];
+            if (b !== 0 && b !== 1) throw new Error(SNAP_BAD + "lirs qins[" + i + "] = " + String(b) + " (must be 0 or 1)");
+        }
+        if (!Array.isArray(snap.s)) throw new Error(SNAP_BAD + "lirs stack (s) must be an array");
+        if (!Array.isArray(snap.hist)) throw new Error(SNAP_BAD + "lirs history (hist) must be an array");
+        if (snap.hist.length > cap) {
+            throw new Error(SNAP_BAD + "lirs history (" + snap.hist.length + ") exceeds capacity (" + cap + ")");
+        }
+
+        const L = snapRestoreList(inst, snap.lir, null, 0);
+        for (let i = 0; i < snap.lir.slots.length; i++) inst._st[snap.lir.slots[i]] = LIRS_LIR | LIRS_INS;
+        inst._lirHead = L.head; inst._lirTail = L.tail; inst._lirCount = L.size;
+
+        const Q = snapRestoreList(inst, snap.q, null, 0);
+        for (let i = 0; i < snap.q.slots.length; i++) inst._st[snap.q.slots[i]] = snap.qins[i] ? LIRS_INS : 0;
+        inst._qHead = Q.head; inst._qTail = Q.tail;
+
+        inst._size = L.size + Q.size;
+
+        // Rebuild the stack S from the captured slot order, verifying membership fail-closed.
+        let expectS = 0;
+        for (let i = 0; i < inst._st.length; i++) if (inst._st[i] & LIRS_INS) expectS++;
+        if (snap.s.length !== expectS) {
+            throw new Error(SNAP_BAD + "lirs stack length (" + snap.s.length + ") != in-S slots (" + expectS + ")");
+        }
+        // Track slots already used in THIS stack walk: a duplicate index in `snap.s` would
+        // corrupt the linked list (mirrors snapOccupied's cross-list duplicate rejection,
+        // which the hand-rolled stack rebuild does not go through). REJECT, never truncate.
+        const seenS = new Uint8Array(cap);
+        let prev = NIL;
+        for (let i = 0; i < snap.s.length; i++) {
+            const x = snap.s[i];
+            if (!Number.isInteger(x) || x < 0 || x >= cap || occ[x] === 0) {
+                throw new Error(SNAP_BAD + "lirs stack slot " + String(x) + " out of range or not resident");
+            }
+            if (seenS[x] !== 0) {
+                throw new Error(SNAP_BAD + "duplicate slot " + x + " in the stack (s)");
+            }
+            seenS[x] = 1;
+            if ((inst._st[x] & LIRS_INS) === 0) {
+                throw new Error(SNAP_BAD + "lirs stack slot " + x + " is not marked in-S");
+            }
+            inst._sPrev[x] = prev;
+            if (prev === NIL) inst._sTop = x; else inst._sNext[prev] = x;
+            prev = x;
+        }
+        if (prev !== NIL) inst._sNext[prev] = NIL;
+        inst._sBot = prev;
+
+        const gInt = typeof inst._store._ck === "function";
+        for (let i = 0; i < snap.hist.length; i++) {
+            if (gInt) inst._store._ck(snap.hist[i]); // fail closed on a non-int history key
+            inst._histAdd(snap.hist[i]);
+        }
+
+        inst._store.rebuildFreeList(occ);
+        return inst;
+    }
+
+    // --- test/debug only (never call on a hot path) ---------------------------
+
+    /** Free-stack length, delegated to the store (conservation invariant). */
+    _freeListLength() {
+        return this._store.freeListLength();
+    }
+
+    /** The key the NEXT over-capacity insert would evict (Q's front), WITHOUT mutating.
+     *  TEST-ONLY (drives the torture differential); never a hot path. */
+    _peekVictim() {
+        return this._qHead === NIL ? undefined : this._keys[this._qHead];
     }
 }
 

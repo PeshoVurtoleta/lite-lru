@@ -9,8 +9,8 @@
  *   E single-capacity cache: every put evicts; head===tail always.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs } from './harness.mjs';
 
 export function run() {
     // --- A: re-hit the MRU N times (the head-re-hit fast path) -------------------
@@ -392,12 +392,87 @@ export function run() {
         void wrapArc(c);
     }
 
+    // --- O: Lirs degenerate caps + the ADVERSARIAL max-pruning trace + scan/loop
+    // resistance + conservation (decisions/0023) -----------------------------------
+    {
+        const LIRS_LIR = 1;
+        // Degenerate caps 1..4: every put churns, conservation holds, the split is honored
+        // (cap 1 -> L_lir 0 all-HIR window edge), the history stays bounded.
+        for (const cap of [1, 2, 3, 4]) {
+            const c = new Lirs(cap);
+            check(c._Lhir === Math.max(1, Math.round(cap * 0.01)), () => 't2 O: cap-' + cap + ' L_hir wrong');
+            check(c._Llir === cap - c._Lhir, () => 't2 O: cap-' + cap + ' L_lir wrong');
+            for (let i = 0; i < 500; i++) {
+                c.put(i, i);
+                check(c.size === Math.min(cap, i + 1), () => 't2 O: lirs cap-' + cap + ' size drift at ' + i);
+                check(c.get(i) === i, () => 't2 O: lirs cap-' + cap + ' just-inserted key missing');
+                check(c._hist._len <= cap, () => 't2 O: lirs cap-' + cap + ' history exceeded bound');
+                validate(c);
+            }
+            c.clear();
+            check(c.size === 0, () => 't2 O: lirs cap-' + cap + ' not empty after clear');
+            check(c._hist._len === 0, () => 't2 O: lirs cap-' + cap + ' history not empty after clear');
+            validate(c);
+        }
+
+        // The ADVERSARIAL max-pruning trace (OWNER RULING: measured, never capped). Stack the
+        // WHOLE resident-HIR set at the BOTTOM of S above a single deep LIR, then touch that
+        // LIR: the move-to-top forces a prune that walks the entire HIR run in ONE access. In
+        // the bounded-ring D23 design the linked stack S holds ONLY resident blocks (non-
+        // resident history is the separate keys-only ring), so the worst case is exactly the
+        // resident-HIR reserve L_hir -- NOT O(capacity); measured here + timed under 4 ms.
+        for (const CAP of [64, 4096]) {
+            const c = new Lirs(CAP, { keys: 'int' });
+            for (let i = 0; i < CAP; i++) c.put(i, i);   // 0..L_lir-1 LIR (bottom), L_lir..CAP-1 HIR (top)
+            check(c.size === CAP, () => 't2 O: adversarial cap-' + CAP + ' not full');
+            const residentHir = CAP - c._lirCount;
+            for (let i = 1; i < c._Llir; i++) c.get(i);  // lift every LIR but key 0 above the HIR run
+            // key 0 is now the sole LIR at the bottom, with the full HIR run just above it.
+            check((c._st[c._store.get(0)] & LIRS_LIR) !== 0, () => 't2 O: key 0 lost LIR status');
+            check(c._sBot === c._store.get(0), () => 't2 O: key 0 is not the stack bottom pre-prune');
+            let hirAtBottom = 0;
+            for (let s = c._sPrev[c._sBot]; s !== -1; s = c._sPrev[s]) { if ((c._st[s] & LIRS_LIR) === 0) hirAtBottom++; else break; }
+            const t0 = performance.now();
+            c.get(0);                                    // deep-LIR hit -> the whole-run prune
+            const ms = performance.now() - t0;
+            check(hirAtBottom === residentHir, () => 't2 O: cap-' + CAP + ' expected ' + residentHir + ' HIR stacked at the bottom, saw ' + hirAtBottom);
+            check(ms <= 4, () => 't2 O: cap-' + CAP + ' adversarial prune took ' + ms.toFixed(3) + ' ms (> 4 ms) -- BLOCKER');
+            check(c.size === CAP, () => 't2 O: cap-' + CAP + ' size changed by pruning');
+            validate(c);
+        }
+
+        // LOOP resistance: a loop LARGER than capacity keeps the proven-hot LIR set stable
+        // where classic LRU would thrash it. A cap+1 scan evicts 0 LIR blocks.
+        {
+            const N = 64;
+            const c = new Lirs(N);
+            for (let h = 0; h < 8; h++) { const k = 'hot' + h; c.put(k, h); c.get(k); c.get(k); } // establish as LIR
+            const hotLir = [];
+            for (let h = 0; h < 8; h++) { const s = c._store.get('hot' + h); if (s >= 0 && (c._st[s] & LIRS_LIR)) hotLir.push(h); }
+            check(hotLir.length > 0, () => 't2 O: no hot key reached LIR (setup invalid)');
+            while (c.size < N) c.put('warm' + c.size, c.size);
+            for (let i = 0; i < 8000; i++) {
+                for (const h of hotLir) check(c.get('hot' + h) === h, () => 't2 O: hot LIR key ' + h + ' lost mid-scan at ' + i);
+                c.put('scan' + i, i);
+                check(c.size === N, () => 't2 O: lirs drifted from capacity during the scan');
+                check(c._hist._len <= N, () => 't2 O: lirs history exceeded bound in scan');
+                if ((i & 511) === 0) validate(c);
+            }
+            for (const h of hotLir) check(c.has('hot' + h), () => 't2 O: hot LIR key ' + h + ' evicted by the scan (no scan resistance)');
+            let survivors = 0;
+            for (let i = 0; i < 8000; i++) if (c.has('scan' + i)) survivors++;
+            check(survivors < N, () => 't2 O: too many scan keys survived (' + survivors + ') -- eviction not exercised');
+            validate(c);
+            void wrapLirs(c);
+        }
+    }
+
     // --- J: the LAZY-SEMANTICS TRIPLE as executable laws (decisions/0017, D17.3) --
     // For EVERY member: an expired entry is a MISS through get/has/peek alike, and each
     // of the three REAPS it in place (fires onEvict once, size drops). A fresh Infinity
     // sibling is untouched by any of them. validate() nets each reap.
     {
-        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc]];
+        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs]];
         // one probe method per fresh cache (each reap is destructive, so isolate them)
         const probes = [
             ['get', (c, k) => c.get(k), undefined],
@@ -436,7 +511,7 @@ export function run() {
     // free stack so size + freeListLength === capacity). Every member, both backings.
     {
         const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo],
-            ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc]];
+            ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs]];
         for (const [name, C] of members) {
             for (const keys of [undefined, 'int']) {
                 const o = keys ? { keys } : undefined;

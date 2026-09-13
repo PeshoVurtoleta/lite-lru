@@ -657,6 +657,55 @@ export class Arc<K = unknown, V = unknown> implements LiteCache<K, V> {
   get capacity(): number;
 }
 
+/**
+ * LIRS -- Low Inter-reference Recency Set (Jiang & Zhang, SIGMETRICS'02), decisions/0023.
+ * The eighth family member: eviction by RECENCY-OF-RECENCY (IRR = distinct blocks between a
+ * block's last two references), the strongest scan/loop resistance in the family. A hot LIR
+ * set (low IRR) is protected; cold HIR blocks (high IRR) are the eviction candidates. The
+ * resident value capacity is EXACTLY `capacity` (split L_hir = max(1, round(cap*0.01)) +
+ * L_lir); the non-resident HIR history is a SEPARATE bounded keys-only ring (D23). Same
+ * uniform `LiteCache<K, V>` surface as every other member -- the one-line policy swap.
+ *
+ * @typeParam K key type (any value; SameValueZero equality via the internal Map)
+ * @typeParam V value type
+ */
+export class Lirs<K = unknown, V = unknown> implements LiteCache<K, V> {
+  /**
+   * @param capacity max entries; must be an integer >= 1 (else throws RangeError,
+   *                 fail-closed -- null is not zero).
+   * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
+   */
+  constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  /** Reconstruct a FRESH `Lirs` from a `dump()` snapshot (decisions/0021 + 0023), incl. the
+   *  stack S order, the per-slot LIR/inS bits, list Q, AND the bounded non-resident history
+   *  (dropping any is a fail-OPEN future-eviction bug). Fail closed on any mismatch. */
+  static restore<K = unknown, V = unknown>(snap: CacheSnapshot, opts?: LiteCacheOptions<K, V>): Lirs<K, V>;
+  get(key: K): V | undefined;
+  put(key: K, value: V, ttlMs?: number): void;
+  has(key: K): boolean;
+  peek(key: K): V | undefined;
+  delete(key: K): boolean;
+  clear(): void;
+  purgeStale(): number;
+  /** Live runtime counters (decisions/0019). BORROWED holder -- copy what you keep;
+   *  throws on an instance built without { stats: true } (fail-closed). */
+  stats(): CacheStats;
+  /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
+  resetStats(): void;
+  /** Serialize to a plain, structurally-cloneable snapshot (decisions/0021). COLD, may
+   *  allocate (honest <= 96 B/entry; no zero-GC claim). Restore with the static restore(). */
+  dump(): CacheSnapshot;
+  keys(): IterableIterator<K>;
+  values(): IterableIterator<V>;
+  entries(): IterableIterator<[K, V]>;
+  /** Iterable protocol == entries(); the yielded [K, V] tuple is BORROWED/reused
+   *  (decisions/0018) -- copy what you keep. Only a copying map materializes
+   *  (Array.from(c.entries(), ([k,v])=>[k,v])); a bare spread reads all-undefined. */
+  [Symbol.iterator](): IterableIterator<[K, V]>;
+  get size(): number;
+  get capacity(): number;
+}
+
 /** The package version (kept in lock-step with package.json + Lru.js). */
 export const VERSION: string;
 

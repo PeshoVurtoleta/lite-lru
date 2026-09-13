@@ -20,7 +20,7 @@ const SLRU_PROBATION = 0; // matches Lru.js tags
 const SLRU_PROTECTED = 1;
 
 test('exports: VERSION and the named Slru export are present', async () => {
-    assert.equal(VERSION, '1.9.1');
+    assert.equal(VERSION, '1.10.0');
     const mod = await import('../Lru.js');
     assert.equal(mod.Slru, Slru);
 });

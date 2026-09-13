@@ -98,6 +98,16 @@ export function activeListsOf(cache) {
             { name: 'arc-t1', head: cache._t1Head, tail: cache._t1Tail, doubly: true },
         ];
     }
+    // A Lirs member (decisions/0023) threads a DISJOINT resident partition through the shared
+    // _next/_prev columns (detected by its `_lirHead` LIR-list endpoint): the LIR list and the
+    // resident-HIR queue Q. The interleaved stack S rides its OWN member columns and is checked
+    // by the LIRS conservation term below, not here. The keys-only history holds no slot.
+    if (cache._lirHead !== undefined) {
+        return [
+            { name: 'lirs-lir', head: cache._lirHead, tail: cache._lirTail, doubly: true },
+            { name: 'lirs-q', head: cache._qHead, tail: cache._qTail, doubly: true },
+        ];
+    }
     // A SIEVE member (decisions/0012) exposes _head/_tail on a single doubly-linked
     // FIFO ring (detected by its moving `_hand`). Classic LRU exposes the same shape
     // as a recency DLL. Both are ONE doubly-linked list -> one descriptor.
@@ -348,6 +358,61 @@ export function validate(cache, lists) {
         }
         if (b1 + b2 > cap) {
             throw new Error('[validate] arc b1(' + b1 + ') + b2(' + b2 + ') > capacity(' + cap + ')');
+        }
+    }
+
+    // --- term 12 (Lirs members, decisions/0023): the split + the stack S + the bounded
+    // history. A no-op unless the member exposes `_lirHead`. For a Lirs: |LIR| + |resident
+    // HIR| == size (the fixed-capacity split, checked via _lirCount + a Q walk); every `_st`
+    // byte is a valid 2-bit tag; the LIR/inS bits are consistent (a LIR block is always inS,
+    // a Q slot is HIR); the stack S (member `_sNext`/`_sPrev`) is a valid, cycle-free doubly-
+    // linked list whose members are EXACTLY the inS slots with a LIR bottom; and the non-
+    // resident history never exceeds its construction bound (hist._len <= capacity).
+    if (cache._lirHead !== undefined) {
+        // Q length (resident HIR) via the shared columns from _qHead.
+        let qLen = 0;
+        for (let s = cache._qHead; s !== NIL; s = cache._next[s]) {
+            if ((cache._st[s] & 1) !== 0) throw new Error('[validate] lirs Q slot ' + s + ' has the LIR bit set');
+            qLen++;
+            if (qLen > cap) throw new Error('[validate] lirs Q has a cycle (walked > capacity)');
+        }
+        if (cache._lirCount + qLen !== size) {
+            throw new Error('[validate] lirs lirCount(' + cache._lirCount + ') + |Q|(' + qLen +
+                ') != size(' + size + ')');
+        }
+        // Per-slot state bits: valid tag + LIR-implies-inS.
+        let insCount = 0;
+        for (let i = 0; i < cap; i++) {
+            const st = cache._st[i];
+            if (st > 3) throw new Error('[validate] lirs _st[' + i + '] = ' + st + ' > 3');
+            if ((st & 1) && !(st & 2)) throw new Error('[validate] lirs slot ' + i + ' is LIR but not inS');
+            if (st & 2) insCount++;
+        }
+        // The stack S: a coherent doubly-linked list over the member columns, whose bottom is
+        // a LIR (pruning invariant) and whose membership is exactly the inS slots.
+        let sLen = 0, prev = NIL;
+        for (let s = cache._sTop; s !== NIL; s = cache._sNext[s]) {
+            if (s < 0 || s >= cap) throw new Error('[validate] lirs stack reached out-of-range slot ' + s);
+            if (cache._sPrev[s] !== prev) {
+                throw new Error('[validate] lirs stack reciprocity broken at slot ' + s +
+                    ': _sPrev=' + cache._sPrev[s] + ' expected ' + prev);
+            }
+            if ((cache._st[s] & 2) === 0) throw new Error('[validate] lirs stack slot ' + s + ' not marked inS');
+            prev = s; sLen++;
+            if (sLen > cap) throw new Error('[validate] lirs stack has a cycle (walked > capacity)');
+        }
+        if (cache._sBot !== prev) {
+            throw new Error('[validate] lirs stack bottom(' + cache._sBot + ') != last walked slot(' + prev + ')');
+        }
+        if (sLen !== insCount) {
+            throw new Error('[validate] lirs stack length(' + sLen + ') != inS slots(' + insCount + ')');
+        }
+        // NOTE: "the stack bottom is a LIR" is NOT asserted -- it is a pruning-time property,
+        // not a between-ops invariant: delete()/reap() of the bottom LIR (D23: a delete is not
+        // ghosted and does not prune) can legitimately leave a HIR at the bottom until the next
+        // access prunes it. The member + the brute oracle agree on this exactly (t5).
+        if (cache._hist._len > cache._histCap) {
+            throw new Error('[validate] lirs history(' + cache._hist._len + ') > histCap(' + cache._histCap + ')');
         }
     }
 }

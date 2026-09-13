@@ -31,13 +31,14 @@
  * rejects the window; T9 exercises the same alloc lane in-process.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, BREAK, check, die, makePrng,
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
     CountedSieve, SIEVE_WRITES_HIT_LINKS, SIEVE_WRITES_HIT_VIS,
     CountedS3Fifo, S3FIFO_WRITES_HIT_LINKS, S3FIFO_WRITES_HIT_VIS,
     CountedWTinyLfu, WTINYLFU_WRITES_WINDOW_MRU_REHIT,
+    CountedLirs, LIRS_WRITES_LIR_TOP_REHIT,
 } from './harness.mjs';
 
 const CAP = 4096;      // power of 2 so the hot body masks its key with & MASK
@@ -129,6 +130,30 @@ class CoveredArc extends Arc {
             else if (this._b2.has(key)) { this._b2Hits++; this._pAdapts++; }
         }
         return super.put(key, value, ttlMs);
+    }
+}
+
+/** A Lirs counting the DISTINGUISHING lanes (decisions/0023) via plain integer field
+ *  increments (zero-alloc; lane coverage only, never on a MEASURED window): LIR hits,
+ *  resident-HIR-in-S promotions to LIR, capacity evictions (Q-front replace), AND the max
+ *  observed STACK-PRUNE length (the OWNER-RULING measurement -- pruning is NOT capped; its
+ *  length is measured and reported, and the maxPauseMs<=4 gate confirms it never blows).
+ *  In the bounded design only resident HIR (<= L_hir) sit in the linked stack, so a prune
+ *  walks at most L_hir entries -- measured here to prove it stays small. */
+class CoveredLirs extends Lirs {
+    constructor(cap, opts) { super(cap, opts); this._lirHits = 0; this._promos = 0; this._replaces = 0; this._maxPrune = 0; }
+    _prune() {
+        let n = 0, b = this._sBot;
+        while (b !== -1 && (this._st[b] & 1) === 0) { n++; b = this._sPrev[b]; }
+        if (n > this._maxPrune) this._maxPrune = n;
+        super._prune();
+    }
+    _promoteToLir(s) { this._promos++; super._promoteToLir(s); }
+    _replace() { this._replaces++; return super._replace(); }
+    get(key) {
+        const s = this._store.get(key);
+        if (s >= 0 && (this._st[s] & 1)) this._lirHits++;
+        return super.get(key);
     }
 }
 
@@ -847,6 +872,7 @@ export async function run() {
         ['Slru', new Slru(CAP)],
         ['TwoQ', new TwoQ(CAP)],
         ['Arc', new Arc(CAP)],
+        ['Lirs', new Lirs(CAP)],
     ];
     const iterSink = new Int32Array(1);
     for (let m = 0; m < iterMembers.length; m++) {
@@ -1026,4 +1052,116 @@ export async function run() {
             ' B/op restored get re-hit, ' + grca.bytesPerCall.toFixed(5) + ' B/op restored churn; dump ' +
             bytesPerEntry.toFixed(2) + ' B/entry (<= 96), writes-per-hit 0/5/4 unchanged (capacity ' + CAP + ')\n');
     }
+
+    // --- Gate LIRS: the Lirs member -- STRICT zero-alloc + MEASURED prune length -----
+    // (decisions/0023) The SAME MIXED, recurring int-key stream drives every LIRS lane at
+    // capacity: hot recurrence -> LIR hits + resident-HIR-in-S promotions (which demote the
+    // bottom LIR and prune); cold churn + re-references of recently-evicted keys -> misses,
+    // Q-front replaces, and non-resident-history hits (re-admit as LIR). Zero-alloc: the
+    // closure indexes a preallocated Int32Array and does int get/put only. The stack columns
+    // `_sNext`/`_sPrev`, the shared `_next`/`_prev`, `_st`, the int index buffers AND the
+    // history ring never grow; |LIR| + |resident HIR| == size == capacity always. maxPauseMs
+    // <= 4 is enforced by RULES on the window -- the OWNER RULING: pruning is measured, not
+    // capped, and (bounded design) walks at most L_hir entries, so the pause never blows.
+    const lrsStream = buildMixedStream(STREAM_LEN, HOT_SIZE, A1IN_CAP, 0x1145c0de);
+    const lrsCache = new Lirs(CAP, { keys: 'int' });
+    const lrsSink = new Int32Array(1);
+    let lrsi = 0;
+    const lrsHot = () => {
+        const k = lrsStream[lrsi & STREAM_MASK]; lrsi++;
+        const v = lrsCache.get(k);
+        if (v === undefined) lrsCache.put(k, k); else { lrsSink[0] += v | 0; lrsCache.get(k); }
+    };
+    for (let i = 0; i < PREFILL; i++) lrsHot(); // reach steady state
+    check(lrsCache.size === CAP, () => 't6 Gate LIRS: prefill did not reach capacity (size ' + lrsCache.size + ')');
+    const lrsSNextBytes = lrsCache._sNext.buffer.byteLength;
+    const lrsSPrevBytes = lrsCache._sPrev.buffer.byteLength;
+    const lrsNextBytes = lrsCache._next.buffer.byteLength;
+    const lrsPrevBytes = lrsCache._prev.buffer.byteLength;
+    const lrsStBytes = lrsCache._st.buffer.byteLength;
+    const lrsIxSlotBytes = lrsCache._store._ixSlot.buffer.byteLength;
+    const lrsIxKeyBytes = lrsCache._store._ixKey.buffer.byteLength;
+    const lrsHistRingBytes = lrsCache._hist._ring.buffer.byteLength;
+    const glirs = runOpsGate(lrsHot, { ops: OPS, warmup: WARMUP });
+    check(lrsCache._sNext.buffer.byteLength === lrsSNextBytes,
+        () => 't6 Gate LIRS: _sNext.buffer grew ' + lrsSNextBytes + ' -> ' + lrsCache._sNext.buffer.byteLength);
+    check(lrsCache._sPrev.buffer.byteLength === lrsSPrevBytes,
+        () => 't6 Gate LIRS: _sPrev.buffer grew ' + lrsSPrevBytes + ' -> ' + lrsCache._sPrev.buffer.byteLength);
+    check(lrsCache._next.buffer.byteLength === lrsNextBytes,
+        () => 't6 Gate LIRS: _next.buffer grew ' + lrsNextBytes + ' -> ' + lrsCache._next.buffer.byteLength);
+    check(lrsCache._prev.buffer.byteLength === lrsPrevBytes,
+        () => 't6 Gate LIRS: _prev.buffer grew ' + lrsPrevBytes + ' -> ' + lrsCache._prev.buffer.byteLength);
+    check(lrsCache._st.buffer.byteLength === lrsStBytes,
+        () => 't6 Gate LIRS: _st.buffer grew ' + lrsStBytes + ' -> ' + lrsCache._st.buffer.byteLength);
+    check(lrsCache._store._ixSlot.buffer.byteLength === lrsIxSlotBytes,
+        () => 't6 Gate LIRS: _ixSlot.buffer grew ' + lrsIxSlotBytes + ' -> ' + lrsCache._store._ixSlot.buffer.byteLength);
+    check(lrsCache._store._ixKey.buffer.byteLength === lrsIxKeyBytes,
+        () => 't6 Gate LIRS: _ixKey.buffer grew ' + lrsIxKeyBytes + ' -> ' + lrsCache._store._ixKey.buffer.byteLength);
+    check(lrsCache._hist._ring.buffer.byteLength === lrsHistRingBytes,
+        () => 't6 Gate LIRS: history _ring grew ' + lrsHistRingBytes + ' -> ' + lrsCache._hist._ring.buffer.byteLength);
+    check(lrsCache.size === CAP, () => 't6 Gate LIRS: churn did not stay at capacity (size ' + lrsCache.size + ')');
+    check(lrsCache._hist._len <= CAP,
+        () => 't6 Gate LIRS: history exceeded its bound (' + lrsCache._hist._len + ')');
+    if (!glirs.report.ok) {
+        const g = glirs.summary.gc;
+        die('t6 Gate LIRS (mixed churn) ops gate rejected -- verdict=' + glirs.report.verdict +
+            ' source=' + glirs.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const glirsA = runAllocsGate(lrsHot, { iterations: 50000, batches: 8 });
+    if (!glirsA.ok) {
+        die('t6 Gate LIRS (mixed churn) retained-alloc gate rejected -- verdict=' + glirsA.report.verdict +
+            ' settled=' + glirsA.result.settled + ' bytesPerCall=' + glirsA.bytesPerCall);
+    }
+    // Writes-per-hit pin: a LIR hit at the TOP of the stack relinks NOTHING (0 writes).
+    const NLIRS = 16; // cap 16 -> L_hir 1, L_lir 15: keys 0..14 are LIR
+    const clirs = new CountedLirs(NLIRS);
+    for (let i = 0; i < NLIRS; i++) clirs.put(i, i);
+    clirs.get(0);              // key 0 is a LIR block -> now moved to the TOP of S
+    check((clirs._st[clirs._store.get(0)] & 1) !== 0 && clirs._sTop === clirs._store.get(0),
+        () => 't6 Gate LIRS: setup -- key 0 is not a LIR at the stack top');
+    clirs.resetWrites();
+    clirs.get(0);             // LIR hit at the top -> the pinned 0-write fast path
+    check(clirs.writes() === LIRS_WRITES_LIR_TOP_REHIT,
+        () => 't6 Gate LIRS: LIR-hit-at-top wrote ' + clirs.writes() + ', expected ' + LIRS_WRITES_LIR_TOP_REHIT);
+    // Lane coverage + the MEASURED max prune length (UN-measured window). Counters reset AFTER
+    // the prefill so they reflect ONLY the steady-state window. Floors keep a regression LOUD.
+    const covLirs = new CoveredLirs(CAP, { keys: 'int' });
+    let covLirsi = 0;
+    const covLirsHot = () => {
+        const k = lrsStream[covLirsi & STREAM_MASK]; covLirsi++;
+        if (covLirs.get(k) === undefined) covLirs.put(k, k); else covLirs.get(k);
+    };
+    for (let i = 0; i < PREFILL; i++) covLirsHot();
+    covLirs._lirHits = 0; covLirs._promos = 0; covLirs._replaces = 0; covLirs._maxPrune = 0;
+    for (let i = 0; i < OPS; i++) covLirsHot();
+    check(covLirs._lirHits >= 100,
+        () => 't6 Gate LIRS: the window triggered ' + covLirs._lirHits + ' LIR hits (< 100 -- lane not covered)');
+    check(covLirs._promos >= 20,
+        () => 't6 Gate LIRS: the window triggered ' + covLirs._promos + ' HIR->LIR promotions (< 20 -- lane not covered)');
+    check(covLirs._replaces >= 50,
+        () => 't6 Gate LIRS: the window triggered ' + covLirs._replaces + ' Q-front replaces (< 50 -- lane not covered)');
+    check(covLirs._maxPrune <= covLirs._Lhir,
+        () => 't6 Gate LIRS: steady-state max prune length ' + covLirs._maxPrune + ' exceeded L_hir ' + covLirs._Lhir);
+    // The OWNER-RULING measurement: the ADVERSARIAL worst-case prune at capacity 4096.
+    // Stack every resident HIR at the bottom of S above a single LIR, then touch that deep
+    // LIR -> the move-to-top triggers a prune that walks the ENTIRE HIR run. In the bounded
+    // design only resident HIR (<= L_hir) are ever in the linked stack, so the worst case is
+    // exactly L_hir -- NOT O(capacity). Measured here (never capped), and timed to confirm
+    // the single worst-case op stays well under the 4 ms pause budget.
+    const adv = new CoveredLirs(CAP, { keys: 'int' });
+    for (let i = 0; i < CAP; i++) adv.put(i, i);          // keys 0..L_lir-1 LIR, L_lir..CAP-1 HIR (at top)
+    for (let i = 1; i < adv._Llir; i++) adv.get(i);       // lift every LIR but key 0 above the HIR run
+    adv._maxPrune = 0;
+    const advT0 = performance.now();
+    adv.get(0);                                           // deep-LIR hit at the bottom -> the big prune
+    const advMs = performance.now() - advT0;
+    check(adv._maxPrune === adv._Lhir,
+        () => 't6 Gate LIRS: adversarial prune measured ' + adv._maxPrune + ', expected the L_hir bound ' + adv._Lhir);
+    check(advMs <= 4,
+        () => 't6 Gate LIRS: adversarial worst-case prune took ' + advMs.toFixed(3) + ' ms (> 4 ms budget) -- BLOCKER');
+    process.stderr.write('t6 Gate LIRS: ' + glirsA.bytesPerCall.toFixed(5) +
+        ' B/op mixed churn (' + OPS + ' ops window, capacity ' + CAP + '); maxPauseMs=' +
+        glirs.summary.gc.maxMs.toFixed(3) + ' adversarial max prune length=' + adv._maxPrune + ' (L_hir=' +
+        adv._Lhir + ', worst-case op ' + advMs.toFixed(3) + ' ms); lanes covered: lirHits=' +
+        covLirs._lirHits + ' promos=' + covLirs._promos + ' replaces=' + covLirs._replaces + '\n');
 }

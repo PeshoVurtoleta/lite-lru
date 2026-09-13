@@ -4,15 +4,16 @@ Zero-dependency, zero-GC cache FAMILY for JavaScript under one uniform
 LiteCache<K,V> surface. A classic LRU reference member (LiteLru), the modern SIEVE
 headline (Sieve), the admission-controlled S3-FIFO member (S3Fifo), the
 frequency-admission W-TinyLFU member (WTinyLfu), the two scan-resistant
-baselines Segmented-LRU (Slru) and 2Q (TwoQ), and the no-tuning adaptive member
-ARC (Arc) expose the
+baselines Segmented-LRU (Slru) and 2Q (TwoQ), the no-tuning adaptive member
+ARC (Arc), and the scan/loop-resistant recency-of-recency member LIRS (Lirs)
+expose the
 SAME get/put/has/peek/delete/clear API, so the eviction policy is a one-line
 constructor swap. Single-file ESM, zero runtime
 dependencies, node:test only. Ships a runnable + importable benchmark tool
 (Bench.mjs) with Belady OPT so a caller measures which policy fits their trace
 instead of guessing.
 
-## Status: 1.9.1 - consolidation of the S13 demo (S15): the demo now FAILS CLOSED when its trace cannot be loaded (opened as a static file / via an IDE static preview / server down) - a pure never-throwing fetchTrace() seam returns a payload only when it is well-shaped, else renders an actionable "run npm run demo:serve and open http://localhost:8013/" hint instead of a hung "loading..." - plus a README Node-server caveat and an honest "Choosing a member" guide. Still a never-shipped in-repo demo/ (S13/D22) that animates all seven members on ONE shared trace, each panel drawn STRICTLY from that member's live dump() snapshot (no shadow state - the snapshot IS the visualization model) with a running % -of-Belady-optimal readout per member: the "one interface, different policy" family story made VISIBLE (e.g. on a zipf trace S3Fifo ~82% and Arc ~82.6% of the clairvoyant optimum, the simple baselines trailing). The SHIPPED surface is byte-identical to 1.8.0 - Lru.js / Lru.d.ts / benchmark/Bench.mjs are UNCHANGED across 1.9.0 and 1.9.1 (git diff empty); the demo is a dev artifact, excluded from the npm tarball (the pack gate asserts demo/ absent) and zero runtime deps hold (the browser path imports only ../Lru.js; a tiny zero-dep Node demo/serve.mjs supplies the trace + Belady OPT). Built atop snapshot / restore (1.8.0: a COLD dump() + static restore(snap, opts?) over the shared substrate, the SoA columns ARE the serial form, no substrate field / no hot-path branch, EXACT future-eviction round-trip with every member's aux captured verbatim, fail-closed restore tag {f,m,cap,keys,ttl,t}, TTL absolute-not-rebased - full detail under "## Snapshot / restore" below), the no-tuning adaptive member Arc (1.7.0), the scan-resistant baselines Slru/TwoQ (1.6.0), opt-in zero-GC stats (1.5.0), zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool.
+## Status: 1.10.0 - LIRS (Lirs), the EIGHTH member (Jiang & Zhang, SIGMETRICS'02): eviction by recency-of-recency (IRR), the family's best scan/loop resister - on a loop larger than capacity Lirs holds 99.2% of the Belady optimum where every other member scores ~0. A LIR set + a resident-HIR list Q + a BOUNDED non-resident history (a keys-only ring generalizing the ARC ghost, cap = capacity, drop-oldest) over the shared substrate; hot path strict zero-alloc (one _st byte: bit0 LIR / bit1 in-stack; LIR-hit-at-top 0 writes, interior 5), fixed-capacity honest (resident value capacity EXACTLY capacity; |LIR|+|resident HIR| == size). This is a BOUNDED LIRS VARIANT, not textbook-exact (D23): putting the non-resident history in a separate ring - rather than interleaving it into the linked stack - makes a single access prune at most L_hir = max(1,round(cap*0.01)), i.e. O(0.01*capacity) not O(capacity), at the cost of eviction-recency membership rather than stack-position membership; an honest, documented deviation, the rejected unbounded-stack alternative on the record. new LiteLru(n) <-> ... <-> new Arc(n) <-> new Lirs(n), type-checked; TTL / iteration / stats / snapshot / bench / the demo all extend to the eighth member. Built atop the S13/S15 policy-visualization demo (a never-shipped demo/ that animates all eight members on one trace drawn strictly from dump(), served by a zero-dep Node demo/serve.mjs, fails closed off-server), snapshot / restore (1.8.0: a COLD dump() + static restore(snap, opts?), the SoA columns ARE the serial form, no substrate field / no hot-path branch, EXACT future-eviction round-trip, fail-closed restore tag {f,m,cap,keys,ttl,t}, TTL absolute-not-rebased), the no-tuning adaptive member Arc (1.7.0), the scan-resistant baselines Slru/TwoQ (1.6.0), opt-in zero-GC stats (1.5.0), zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool.
 
 The family is the identity from v1.0.0: classic LRU is the reference member +
 differential oracle + honest floor, SIEVE is the headline, and the shipped
@@ -29,11 +30,12 @@ that substrate (decisions/0012). S9 (this session) adds the docs, the shipped
 bench + Belady OPT tool, and the OPT torture gate -- with ZERO change to Lru.js /
 Lru.d.ts (the three version sites move together, only at /release).
 
-## Members (decisions/0001, 0012, 0013, 0014, 0015, 0016)
+## Members (decisions/0001, 0012, 0013, 0014, 0015, 0016, 0023)
 
 All classes implement LiteCache<K,V>; the recency/lazy-promotion/admission/adaptive
 difference is INTERNAL, so new LiteLru(n) swaps for new Sieve(n), new S3Fifo(n),
-new WTinyLfu(n), new Slru(n), new TwoQ(n) or new Arc(n) and stays type-checked.
+new WTinyLfu(n), new Slru(n), new TwoQ(n), new Arc(n) or new Lirs(n) and stays
+type-checked.
 
 - LiteLru: classic Least-Recently-Used. get/put promote to most-recently-used;
   at capacity a new key evicts the LRU tail and reuses its slot in place. A hit
@@ -105,11 +107,36 @@ new WTinyLfu(n), new Slru(n), new TwoQ(n) or new Arc(n) and stays type-checked.
   ghost. RESIDENT value capacity stays EXACTLY capacity -- only the split adapts, never
   the total (D16.2); bounds |T1|+|B1| <= c and |B1|+|B2| <= c hold. has/peek are neutral;
   a get never touches the ghosts.
+- Lirs: LIRS (Jiang & Zhang, SIGMETRICS'02), decisions/0023. Eviction by
+  RECENCY-OF-RECENCY: a block's IRR (inter-reference recency) is the count of DISTINCT
+  blocks referenced between its last two accesses. Low-IRR blocks are the hot LIR set
+  (resident); high-IRR blocks are HIR (a small resident reserve + non-resident metadata).
+  Structure: a LIR set + a list Q of resident-HIR eviction candidates (both threaded
+  through the shared _next/_prev columns, a disjoint resident partition), an interleaved
+  stack S on its own member columns (per-slot _st byte: bit0 LIR, bit1 inS), and a BOUNDED
+  non-resident history -- LirsHistory extends ArcGhost, keys-only, cap = capacity,
+  drop-OLDEST (strict zero-alloc on keys:'int', amortized on the Map backing). Split:
+  L_hir = max(1, round(capacity*0.01)) resident-HIR slots, L_lir = capacity - L_hir LIR
+  slots; RESIDENT value capacity stays EXACTLY capacity (only the split moves,
+  |LIR|+|resident HIR| == size). A LIR hit moves to the top of S (0 link writes at the top,
+  else the 5-write move); a resident-HIR hit while IN S reclassifies to LIR (demoting the
+  bottom LIR to Q, then pruning); a returning key still in the bounded history is re-admitted
+  as LIR (the loop/scan discriminator). At capacity the Q front (LRU resident HIR) is
+  evicted. has/peek are neutral. D23 BOUNDED LIRS VARIANT (honest, NOT textbook-exact): the
+  non-resident history is a SEPARATE bounded FIFO ring rather than entries interleaved in
+  the stack, so "still in S" is eviction-recency membership (FIFO) rather than textbook
+  stack-position, and a single access's STACK PRUNING is O(L_hir) (measured max 41 at
+  cap 4096, worst-case op ~0.02 ms) rather than textbook O(capacity) -- a strict latency
+  improvement, measured + pinned, never capped. Best loop/scan resistance in the family:
+  on a loop LARGER than capacity it keeps the LIR set stable where LRU thrashes (bench loop
+  99.2% of Belady OPT vs ~0% for the other members; scan 100% of OPT).
 
 ## Uniform surface (LiteCache<K,V>)
 
 - new LiteLru(capacity, options?) / new Sieve(capacity, options?) /
-  new S3Fifo(capacity, options?) / new WTinyLfu(capacity, options?)
+  new S3Fifo(capacity, options?) / new WTinyLfu(capacity, options?) /
+  new Slru(capacity, options?) / new TwoQ(capacity, options?) /
+  new Arc(capacity, options?) / new Lirs(capacity, options?)
   - capacity: integer >= 1, else a [lite-lru]-tagged RangeError at the door.
 - get(key) -> V | undefined. Applies the member's hit policy (LiteLru promotes to
   MRU; Sieve and S3Fifo set the visited bit; WTinyLfu bumps the frequency sketch
@@ -166,7 +193,7 @@ new WTinyLfu(n), new Slru(n), new TwoQ(n) or new Arc(n) and stays type-checked.
 
 - OPT-IN, zero-cost-when-off, pay-for-what-you-use. { stats: true } mints a fresh
   per-instance holder {hits,misses,evictions,puts}; omitted -> _stats === null and
-  the hot path writes NOTHING (same writes-per-hit as the pre-stats build). All seven
+  the hot path writes NOTHING (same writes-per-hit as the pre-stats build). All eight
   members, one LiteCache<K,V> surface.
 - Counting law (D19.2): get -> hits (live resident) or misses (absent OR stale-TTL);
   put -> one puts always, plus one evictions when a new key is inserted at capacity;
@@ -184,7 +211,7 @@ new WTinyLfu(n), new Slru(n), new TwoQ(n) or new Arc(n) and stays type-checked.
   out-of-band MEASUREMENT (a runtime counter would need a store per hit).
 - Gated: t6 Gate STATS (>= 60000 ops at capacity, { stats: true }) = 0 B/op, holder
   identity stable, holder plain with exactly the four names; Stats.test.js brute-tally
-  parity over the T5 corpus (all seven members); t9 stats-double-count + stats-counts-
+  parity over the T5 corpus (all eight members); t9 stats-double-count + stats-counts-
   peek controls (each diverges from the brute tally and fails).
 
 ## TTL (decisions/0017, D17)
@@ -198,7 +225,7 @@ new WTinyLfu(n), new Slru(n), new TwoQ(n) or new Arc(n) and stays type-checked.
   toward size until touched or purgeStale()'d.
 - Fail-closed: ttlMs on a cache with no ttl configured throws [lite-lru]; ttl/ttlMs
   <= 0 / NaN throw [lite-lru] RangeError; Infinity = never (NEVER 0).
-- All seven members support it identically over the shared SlotStore _exp column.
+- All eight members support it identically over the shared SlotStore _exp column.
 - Off-path decision (measured, D17): a single monomorphic this._exp===null guard.
   ttl-OFF writes-per-hit unchanged (LiteLru 0/5/4, Sieve/S3Fifo 0 links + 1 vis,
   WTinyLfu window-MRU 0); ttl-ON strict zero-alloc (maxMajor 0), _exp.byteLength
@@ -215,12 +242,14 @@ new WTinyLfu(n), new Slru(n), new TwoQ(n) or new Arc(n) and stays type-checked.
   yield). One hand-written iterator reuses a single {value,done} result mutated in
   place; the iterator object is allocated once per keys()/values()/entries() call
   (cold), never per step. Gated: >=10,000 next() steps at capacity = 0 B/op per step
-  on all seven members. Honest pitch: our iterators allocate nothing per step,
+  on all eight members. Honest pitch: our iterators allocate nothing per step,
   lru-cache's allocate. Never "lock-free".
 - Per-member ORDER (only LiteLru is true recency): LiteLru MRU->LRU (recency);
   Sieve newest->oldest (FIFO insertion, NOT recency); S3Fifo MAIN newest->oldest
   THEN SMALL newest->oldest (ghost EXCLUDED, keys-only); WTinyLfu WINDOW THEN
-  PROTECTED THEN PROBATION, each MRU->LRU (three segments concatenated).
+  PROTECTED THEN PROBATION, each MRU->LRU (three segments concatenated); Lirs the
+  LIR set THEN Q (resident HIR), each in list order -- RESIDENT ONLY, the
+  non-resident history EXCLUDED.
 - Borrowed-tuple caveat: entries()/[Symbol.iterator] yield ONE REUSED [k,v] array,
   mutated in place -- copy what you keep. Only a copying map materializes:
   Array.from(cache.entries(), ([k,v])=>[k,v]) or a manual per-step copy. A plain
@@ -242,15 +271,16 @@ new WTinyLfu(n), new Slru(n), new TwoQ(n) or new Arc(n) and stays type-checked.
 ## Snapshot / restore (decisions/0021, D21)
 
 - Persist a warm cache and bring it back warm. dump() -> a plain, structurally-
-  cloneable snapshot; Member.restore(snap, opts?) -> a FRESH instance. All seven
+  cloneable snapshot; Member.restore(snap, opts?) -> a FRESH instance. All eight
   members, one LiteCache<K,V> surface. COLD: no substrate field, no hot-path branch --
   a cache that never dumps is byte-identical to the pre-snapshot build.
 - EXACT round-trip (D21.1/D21.4): a restored cache decides FUTURE evictions identically
   to the un-snapshotted twin fed the same trace. Slots are preserved verbatim, so every
   member captures ALL policy aux: Sieve's hand + visited bits; S3Fifo/TwoQ's keys-only
   ghost; W-TinyLFU's Count-Min sketch + aging counter; Arc's adaptive p + both ghosts.
+  Lirs's stack-S order + per-slot LIR/inS bits + the bounded non-resident history.
   Dropping any of these is a fail-OPEN bug (t9 arc-p-dropped / sketch-dropped /
-  ghost-omitted each diverge).
+  ghost-omitted / lirs-drop-ins-bit / lirs-no-history each diverge).
 - Plain graph (D21.1): plain arrays + plain numbers/values, NO typed-array views, so it
   round-trips through structuredClone (and JSON for JSON-safe keys/values). Object keys
   clone under structuredClone (new identity) -- documented, not a bug.
@@ -271,7 +301,7 @@ new WTinyLfu(n), new Slru(n), new TwoQ(n) or new Arc(n) and stays type-checked.
   backings never grow, writes-per-hit unchanged. dump() is read-only (no _ver bump), so
   a walk in progress is not invalidated.
 - Gated: t6 Gate SNAP (0 B/op restored hot path + dump B/entry + writes-per-hit), t5
-  round-trip differential over the 100k corpus (all seven members x both backings x ttl
+  round-trip differential over the 100k corpus (all eight members x both backings x ttl
   off/on), Snapshot.test.js (round-trip identity + 8 rejections + capacity law + interop
   + degenerate caps/keys/values), t7 4096 dump/restore cycles, t9 three drop controls.
 
@@ -318,9 +348,9 @@ runnable tool, not a second implementation.
 
 ## Demo (decisions/0022, D22; dev-only, NEVER shipped)
 
-demo/ animates ONE shared trace through all seven members, each panel drawn STRICTLY from that member's live dump() snapshot (D22.1, no shadow state), with a running %-of-Belady-optimal line. npm run demo (headless per-member summary via demo/Visualize.mjs) and npm run demo:serve (zero-dep Node server demo/serve.mjs -> http://localhost:8013/, browser page demo/visuals.html imports only ../Lru.js). demo/ is absent from files[]; Lru.js / Lru.d.ts / Bench.mjs are consumed, never edited. Must be run through the Node server (npm run demo:serve -> http://localhost:8013/), NOT as a static file or an IDE static preview: /trace.json is a dynamic route and ES modules need an http origin, so off-server the page fails closed with an actionable message instead of hanging.
+demo/ animates ONE shared trace through all eight members, each panel drawn STRICTLY from that member's live dump() snapshot (D22.1, no shadow state), with a running %-of-Belady-optimal line. npm run demo (headless per-member summary via demo/Visualize.mjs) and npm run demo:serve (zero-dep Node server demo/serve.mjs -> http://localhost:8013/, browser page demo/visuals.html imports only ../Lru.js). demo/ is absent from files[]; Lru.js / Lru.d.ts / Bench.mjs are consumed, never edited. Must be run through the Node server (npm run demo:serve -> http://localhost:8013/), NOT as a static file or an IDE static preview: /trace.json is a dynamic route and ES modules need an http origin, so off-server the page fails closed with an actionable message instead of hanging.
 
-## API (1.9.1)
+## API (1.10.0)
 
 Named exports from @zakkster/lite-lru:
 
@@ -331,7 +361,8 @@ Named exports from @zakkster/lite-lru:
 - Slru: the Segmented-LRU member.
 - TwoQ: the full-2Q member.
 - Arc: the Adaptive Replacement Cache member.
-- VERSION: '1.9.1'
+- Lirs: the LIRS member (recency-of-recency; scan/loop-resistant; bounded non-resident history).
+- VERSION: '1.10.0'
 
 Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
@@ -340,8 +371,8 @@ Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
 ## Testing
 
-- npm test        -- 1077 node:test cases (all seven members, recency/SIEVE/S3-FIFO/
-  W-TinyLFU/Slru/TwoQ laws, TTL laws + fail-closed + purgeStale, stats parity,
+- npm test        -- 1110 node:test cases (all eight members, recency/SIEVE/S3-FIFO/
+  W-TinyLFU/Slru/TwoQ/Arc/LIRS laws, TTL laws + fail-closed + purgeStale, stats parity,
   iteration order, snapshot/restore round-trip + fail-closed, degenerate keys/values
   + degenerate caps 1..4, dts drift, family surface).
 - npm run test:types -- tsc: the LiteCache<K,V> surface + the one-line-swap check.

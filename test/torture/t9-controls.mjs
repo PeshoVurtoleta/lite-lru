@@ -21,10 +21,10 @@
  *   C-stats-counts-peek   a peek that credits a hit    -> brute-tally parity fails
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, wrapWTinyLfu,
-    wrapSlru, wrapTwoQ, wrapArc, validate, runRoundTrip,
+    wrapSlru, wrapTwoQ, wrapArc, wrapLirs, validate, runRoundTrip,
     lruPolicy, check, die, makePrng,
 } from './harness.mjs';
 import { makeLruOracle } from './oracles/lru.mjs';
@@ -35,6 +35,7 @@ import { makeWTinyLfuOracle } from './oracles/wtinylfu.mjs';
 import { makeSlruOracle } from './oracles/slru.mjs';
 import { makeTwoQOracle } from './oracles/twoq.mjs';
 import { makeArcOracle } from './oracles/arc.mjs';
+import { makeLirsOracle } from './oracles/lirs.mjs';
 
 const NIL = -1;
 
@@ -228,6 +229,38 @@ class UnboundedGhostArc extends Arc {
  *  self-consistent yet WRONG versus the oracle -- exactly what the gate must catch. */
 class AdmitAlwaysWTinyLfu extends WTinyLfu {
     _admit(_candSlot, _victimSlot) { return true; } // BUG: never reject
+}
+
+/** C-lirs-drop-ins-bit (decisions/0023): a Lirs whose access policy IGNORES the `inS` bit,
+ *  so a resident-HIR hit NEVER reclassifies to LIR (the recency-of-recency headline). Without
+ *  the inS test a looping/scan-hot HIR that should promote stays HIR forever, so the LIR/HIR
+ *  populations and the next-eviction victim (Q front) drift from the pure LIRS oracle. Self-
+ *  consistent (its own _peekVictim reads its own Q), yet WRONG versus the oracle. */
+class DropInsBitLirs extends Lirs {
+    _access(s) {
+        if (this._st[s] & 1) { // LIR branch -- unchanged
+            if (this._sTop === s) return;
+            const wasBottom = (this._sBot === s);
+            this._sMoveTop(s);
+            if (wasBottom) this._prune();
+        } else {
+            // BUG: never consult the inS bit -> a resident-HIR-in-S hit does not promote.
+            if ((this._st[s] & 2) === 0) { this._sPushTop(s); this._st[s] |= 2; } else this._sMoveTop(s);
+            this._qDetach(s); this._qPushTail(s);
+        }
+    }
+}
+
+/** C-lirs-no-history (decisions/0023): a Lirs whose bounded non-resident history is a NO-OP
+ *  (has() always false, add/consume ignored). The history is load-bearing: a block evicted
+ *  then re-referenced while still remembered is re-admitted as LIR (distinguishing a loop
+ *  from a one-shot scan). Omitting it re-admits every returning key as a plain HIR, drifting
+ *  the LIR set + the next-eviction victim from the pure (bounded-history) LIRS oracle. */
+class NoHistoryLirs extends Lirs {
+    constructor(cap, options) {
+        super(cap, options);
+        this._hist = { _len: 0, has() { return false; }, addMRU() {}, delLRU() {}, consume() {}, clear() {} };
+    }
 }
 
 /** C-skip-gate (decisions/0017): a get that SKIPS the ttl staleness gate entirely, so a
@@ -555,6 +588,36 @@ export function run() {
         let threw = false;
         try { validate(c); } catch (e) { threw = true; }
         if (!threw) die('t9 C-arc-unbounded-ghost: validate() passed a ghost over its bound (the ghost-bound term is toothless)');
+    }
+
+    // --- C-lirs-drop-ins-bit (decisions/0023): ignoring the inS bit -> diverges --------
+    // The LIRS headline is recency-of-recency: a resident-HIR hit while IN the stack S
+    // reclassifies to LIR. A policy that never reads the inS bit never promotes, so the
+    // LIR/HIR split + the next-eviction victim drift from the pure LIRS oracle. Non-vacuity:
+    // the CORRECT Lirs agrees (t5).
+    {
+        const brokenPolicy = {
+            name: 'lirs-drop-ins-bit',
+            real: (cap) => wrapLirs(new DropInsBitLirs(cap)),
+            oracle: (cap) => makeLirsOracle(cap),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x1145, keyspace: 40 });
+        if (r.ok) die('t9 C-lirs-drop-ins-bit: ignoring the inS bit did NOT diverge from the lirs oracle (no teeth)');
+    }
+
+    // --- C-lirs-no-history (decisions/0023): omitting the non-resident history -> diverges
+    // The bounded history is what lets a returning (evicted) block re-enter as LIR -- the
+    // loop/scan discriminator. A no-op history re-admits every returning key as a plain HIR,
+    // so the LIR set + victim drift from the pure (bounded-history) LIRS oracle. Non-vacuity:
+    // the CORRECT Lirs agrees (t5).
+    {
+        const brokenPolicy = {
+            name: 'lirs-no-history',
+            real: (cap) => wrapLirs(new NoHistoryLirs(cap)),
+            oracle: (cap) => makeLirsOracle(cap),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x1146, keyspace: 40 });
+        if (r.ok) die('t9 C-lirs-no-history: omitting the non-resident history did NOT diverge from the lirs oracle (no teeth)');
     }
 
     // --- C-skip-gate (decisions/0017): a get that skips the ttl gate -> diverges ---

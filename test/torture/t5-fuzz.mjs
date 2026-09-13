@@ -19,8 +19,9 @@ import {
     wtinylfuPolicy, wtinylfuIntPolicy,
     slruPolicy, slruIntPolicy, twoqPolicy, twoqIntPolicy,
     arcPolicy, arcIntPolicy,
+    lirsPolicy, lirsIntPolicy,
     lruTtlPolicy, sieveTtlPolicy, s3fifoTtlPolicy, wtinylfuTtlPolicy,
-    slruTtlPolicy, twoqTtlPolicy, arcTtlPolicy,
+    slruTtlPolicy, twoqTtlPolicy, arcTtlPolicy, lirsTtlPolicy,
     SNAP_MEMBERS, runRoundTrip,
     SEED, die,
 } from './harness.mjs';
@@ -132,6 +133,21 @@ export function run() {
     fuzzPolicy(arcPolicy, arcConfigs);
     fuzzPolicy(arcIntPolicy, arcConfigs);
 
+    // The Lirs MEMBER proof (decisions/0023): the LIRS member on BOTH backings against its
+    // own independent stack-S / Q / bounded-history oracle -- same value AND same next victim
+    // AND same size after every op, including the resident-HIR-in-S promotion, the bottom-LIR
+    // demotion, stack pruning, and the bounded non-resident history (drop-oldest). Caps 1..9
+    // stress the L_hir=max(1,round(cap*0.01)) split incl. cap 1 -> L_lir 0 (all-HIR window);
+    // 64/256 exercise a normal split where promotion + demotion + pruning all fire.
+    const lirsConfigs = [];
+    for (let cap = 1; cap <= 9; cap++) {
+        lirsConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0xe0 + cap });
+    }
+    lirsConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0xef });
+    lirsConfigs.push({ cap: 256, keyspace: 300, ops: OPS, salt: 0xe1f });
+    fuzzPolicy(lirsPolicy, lirsConfigs);
+    fuzzPolicy(lirsIntPolicy, lirsConfigs);
+
     // The SEAM proof: the SAME runner drives a second policy unchanged.
     fuzzPolicy(fifoPolicy, [
         { cap: 1, keyspace: 4, ops: OPS, salt: 0x61 },
@@ -156,6 +172,7 @@ export function run() {
     fuzzPolicy(slruTtlPolicy, ttlConfigs);
     fuzzPolicy(twoqTtlPolicy, ttlConfigs);
     fuzzPolicy(arcTtlPolicy, ttlConfigs);
+    fuzzPolicy(lirsTtlPolicy, ttlConfigs);
 
     // The SNAPSHOT proof (decisions/0021): for EVERY member, on BOTH backings, ttl OFF
     // and ttl ON, over the 100k corpus -- dump -> restore -> dump is a fixed point AND a
