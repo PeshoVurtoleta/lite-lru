@@ -104,7 +104,7 @@
 
 <script type="module">
 import {
-  createEngine, step, frameModel, summary, MEMBER_NAMES,
+  createEngine, step, frameModel, summary, MEMBER_NAMES, fetchTrace,
 } from './Visualize.mjs';
 import { RENDERERS } from './renderers.mjs';
 
@@ -221,17 +221,12 @@ async function loadTrace() {
   const length = Math.max(1, Number($length.value) | 0);
   const url = '/trace.json?kind=' + encodeURIComponent(kind) +
     '&seed=' + seed + '&cap=' + cap + '&length=' + length;
-  let data;
-  try {
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error('server ' + resp.status);
-    data = await resp.json();
-    if (data.error) throw new Error(data.error);
-  } catch (err) {
-    $status.textContent = 'failed to load /trace.json (' + err.message +
-      ') -- run: npm run demo:serve';
-    return;
-  }
+  // Fail CLOSED: a rejected fetch or a non-OK status (static file / IDE preview /
+  // server down) renders the actionable hint into the status area and stops --
+  // never a permanent "loading...", never an uncaught throw.
+  const result = await fetchTrace(url);
+  if (!result.ok) { $status.textContent = result.message; return; }
+  const data = result.data;
   engine = createEngine({ trace: data.trace, cap: data.cap, opt: data.opt, kind: data.kind, seed: data.seed });
   lastDrawT = 0;
   draw();

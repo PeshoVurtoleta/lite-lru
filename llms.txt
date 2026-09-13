@@ -318,7 +318,7 @@ runnable tool, not a second implementation.
 
 ## Demo (decisions/0022, D22; dev-only, NEVER shipped)
 
-demo/ animates ONE shared trace through all seven members, each panel drawn STRICTLY from that member's live dump() snapshot (D22.1, no shadow state), with a running %-of-Belady-optimal line. npm run demo (headless per-member summary via demo/Visualize.mjs) and npm run demo:serve (zero-dep Node server demo/serve.mjs -> http://localhost:8013/, browser page demo/visuals.html imports only ../Lru.js). demo/ is absent from files[]; Lru.js / Lru.d.ts / Bench.mjs are consumed, never edited.
+demo/ animates ONE shared trace through all seven members, each panel drawn STRICTLY from that member's live dump() snapshot (D22.1, no shadow state), with a running %-of-Belady-optimal line. npm run demo (headless per-member summary via demo/Visualize.mjs) and npm run demo:serve (zero-dep Node server demo/serve.mjs -> http://localhost:8013/, browser page demo/visuals.html imports only ../Lru.js). demo/ is absent from files[]; Lru.js / Lru.d.ts / Bench.mjs are consumed, never edited. Must be run through the Node server (npm run demo:serve -> http://localhost:8013/), NOT as a static file or an IDE static preview: /trace.json is a dynamic route and ES modules need an http origin, so off-server the page fails closed with an actionable message instead of hanging.
 
 ## API (1.9.0)
 

@@ -18,7 +18,7 @@ import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../Lru.js';
 import { zipfTrace, loopTrace, scanTrace, beladyOpt } from '../benchmark/Bench.mjs';
 import {
     createEngine, step, runToEnd, frameModel, summary,
-    MEMBER_NAMES, MEMBER_DEFS,
+    MEMBER_NAMES, MEMBER_DEFS, fetchTrace, TRACE_SERVER_HINT,
 } from './Visualize.mjs';
 import { RENDERERS, RENDERED_MEMBERS, BASE_FIELDS } from './renderers.mjs';
 import { serveTrace, handle } from './serve.mjs';
@@ -476,6 +476,82 @@ test('gap: "/" 302-redirects to /demo/visuals.html (the advertised entry URL is 
         assert.equal(src.statusCode, 200, p + ' must load');
         assert.match(src.headers['content-type'], /javascript/, p + ' must be JS');
     }
+});
+
+/* ------------------- fetchTrace: the fail-closed loading state (S15) ------- */
+
+test('S15: a REJECTED /trace.json fetch fails closed with the actionable hint, never throws', async () => {
+    // Simulates opening the page as a static file / IDE preview: fetch rejects
+    // (no such dynamic route). Must resolve to an actionable message, not throw,
+    // and never leave the page on a bare "loading...".
+    const reject = () => Promise.reject(new TypeError('Failed to fetch'));
+    const result = await fetchTrace('/trace.json?kind=zipf', reject);
+    assert.equal(result.ok, false, 'a rejected fetch must fail closed');
+    assert.ok(result.message.startsWith(TRACE_SERVER_HINT), 'message must lead with the actionable hint');
+    assert.match(result.message, /npm run demo:serve/, 'message must name the command to run');
+    assert.match(result.message, /localhost:8013/, 'message must name the URL to open');
+    assert.match(result.message, /dynamic route/, 'message must explain WHY a static preview fails');
+    assert.notEqual(result.message, 'loading...', 'must not remain on the bare loading state');
+    // The underlying detail is appended for debuggability, not a raw stack.
+    assert.match(result.message, /Failed to fetch/);
+});
+
+test('S15: a non-OK status (e.g. 404 from an IDE static server) fails closed with the hint', async () => {
+    // WebStorm's static server on :63342 answers /trace.json with 404 -- resp.ok
+    // is false. That is the exact miss S15 fixes.
+    const notFound = () => Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    const result = await fetchTrace('/trace.json?kind=zipf', notFound);
+    assert.equal(result.ok, false, 'a non-OK status must fail closed');
+    assert.ok(result.message.startsWith(TRACE_SERVER_HINT));
+    assert.match(result.message, /server 404/, 'the status is surfaced in the detail');
+});
+
+test('S15: a 200 with a server-reported {error} body fails closed with the hint', async () => {
+    const errBody = () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ error: 'bad kind' }) });
+    const result = await fetchTrace('/trace.json?kind=bogus', errBody);
+    assert.equal(result.ok, false, 'a server-reported error must fail closed');
+    assert.ok(result.message.startsWith(TRACE_SERVER_HINT));
+    assert.match(result.message, /bad kind/);
+});
+
+test('S15: a well-formed 200 payload succeeds and carries the data through (the happy path still works)', async () => {
+    const payload = { trace: [1, 2, 3], cap: 4, opt: { hits: 0, misses: 3, hitRate: 0 }, kind: 'zipf', seed: 1 };
+    const okFetch = () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(payload) });
+    const result = await fetchTrace('/trace.json?kind=zipf', okFetch);
+    assert.equal(result.ok, true, 'a good payload must succeed');
+    assert.deepStrictEqual(result.data, payload, 'the data must pass through untouched');
+    // Teeth: the data must be usable to build an engine (the real caller does this next).
+    assert.doesNotThrow(() => createEngine(result.data));
+});
+
+test('S15: a 200 with valid JSON but the WRONG SHAPE fails closed (no ok:true, no throw)', async () => {
+    // A malformed 200 (valid JSON, no {error}, but missing trace/opt) must NOT pass
+    // as ok:true -- otherwise createEngine throws downstream and the page hangs on
+    // "loading...". ok:true is contractually a payload createEngine can consume.
+    const bodies = [{}, { foo: 1 }, { trace: [1, 2] }, { trace: 'nope', opt: { hitRate: 0 } },
+        { trace: [1], opt: null }, { trace: [1], opt: {} }, { trace: [1], cap: 0, opt: { hitRate: 0 } }];
+    for (const body of bodies) {
+        const ok200 = () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+        const result = await fetchTrace('/trace.json?kind=zipf', ok200);
+        assert.equal(result.ok, false, 'wrong-shape body ' + JSON.stringify(body) + ' must fail closed');
+        assert.ok(result.message.startsWith(TRACE_SERVER_HINT));
+        assert.match(result.message, /malformed trace payload/);
+    }
+    // Teeth: the SAME code path with a WELL-shaped body must still succeed (so the
+    // shape check is not a blanket reject).
+    const good = { trace: [1, 2, 3], cap: 4, opt: { hits: 0, misses: 3, hitRate: 0 }, kind: 'zipf', seed: 1 };
+    const okFetch = () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(good) });
+    const okResult = await fetchTrace('/trace.json?kind=zipf', okFetch);
+    assert.equal(okResult.ok, true, 'a well-shaped body must still pass');
+    assert.doesNotThrow(() => createEngine(okResult.data));
+});
+
+test('S15: the actionable hint is ASCII-only and names all three fix ingredients', () => {
+    // eslint-disable-next-line no-control-regex
+    assert.ok(/^[\x00-\x7F]*$/.test(TRACE_SERVER_HINT), 'hint must be ASCII-only');
+    assert.match(TRACE_SERVER_HINT, /npm run demo:serve/);
+    assert.match(TRACE_SERVER_HINT, /http:\/\/localhost:8013\//);
+    assert.match(TRACE_SERVER_HINT, /dynamic route/);
 });
 
 test('gap: static route 404s on a missing file instead of throwing', async () => {

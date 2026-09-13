@@ -59,6 +59,7 @@ One `LiteCache<K,V>` surface, `get`/`put`/`has`/`peek`/`delete`/`clear`, all O(1
 - [Why this exists](#why-this-exists)
 - [What you get](#what-you-get)
 - [LRU vs SIEVE vs S3-FIFO -- which member, and when](#lru-vs-sieve-vs-s3-fifo----which-member-and-when)
+- [Choosing a member](#choosing-a-member)
 - [API reference](#api-reference)
   - [The members](#the-members)
   - [Construction options](#construction-options)
@@ -135,6 +136,24 @@ The ghost is what sets S3-FIFO apart: a one-hit-wonder is demoted out of the sma
 Pick with the [bench tool](#measure--trust), not by intuition -- the whole point of the family is that this is a measurable choice on YOUR trace.
 
 </details>
+
+---
+
+## Choosing a member
+
+A starting point by workload -- not a verdict. Every member shares the same surface, so the choice is a one-line swap.
+
+| Your workload | Start with | Why |
+| --- | --- | --- |
+| Strong temporal locality; the reference / floor | `LiteLru` | Classic recency; the differential oracle every other member is checked against. |
+| One-hit-wonder-heavy web / CDN traffic | `Sieve` | Lazy-promotion FIFO: 1 visited bit per hit, scan-resistant, matches or beats LRU on real web traces. |
+| General-purpose with scan resistance | `S3Fifo` | Quick-demotion + a bounded ghost queue; strong hit ratio at near-zero per-hit writes. |
+| Skewed / Zipf popularity where frequency matters | `WTinyLfu` | Admission control via a fixed Count-Min sketch; the best fit when a few keys dominate. |
+| A simple, textbook scan-resistant baseline | `Slru` | Probation + protected LRU segments, promote on the 2nd hit; the honest baseline the modern trio is measured against. |
+| A one-hit filter with a recently-evicted memory | `TwoQ` | A1in FIFO for newcomers + Am LRU for the hot set + a keys-only A1out ghost that admits a re-seen key straight to Am; the other textbook scan-resistant baseline. |
+| Phase-changing traffic with no time to tune | `Arc` | Self-tuning recency/frequency split, no knobs. |
+
+Then **measure your own trace with the [bench tool](#measure--trust)** -- hit ratio, % of Belady optimal, writes per hit, and alloc, all oracle-checked. The measured policy is the shipped policy.
 
 ---
 
@@ -472,6 +491,8 @@ npm run demo:serve     # zero-dep Node server, then open http://localhost:8013/
 ```
 
 The browser page (`demo/visuals.html`) imports only `../Lru.js`; a tiny zero-dep server (`demo/serve.mjs`) computes the trace + Belady OPT with `Bench.mjs` and serves them as JSON, because the page cannot import `Bench.mjs` (it uses a Node builtin). See `decisions/0022-demo.md` for the "dump() IS the visualization model" ruling.
+
+**Run it through the Node server, not as a static file.** `/trace.json` is a dynamic route, and ES modules need an http origin, so opening `demo/visuals.html` directly (`file://`) or through an IDE static preview (WebStorm et al., on some other port) will not work -- the page fails closed with an actionable message instead of loading. Always start `npm run demo:serve` and open `http://localhost:8013/`.
 
 ---
 

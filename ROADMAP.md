@@ -1157,6 +1157,83 @@ DONE WHEN
   a live % -of-optimal line; Lru.js / Lru.d.ts unchanged; the pack gate still excludes
   demo/; zero runtime deps hold.
 
+===============================================================================
+# S15 -- v1.9.1 -- consolidation: demo hardening + docs polish  [BUILT -- awaiting /release 1.9.1]
+===============================================================================
+```markdown
+version_target: 1.9.1     # PATCH; demo + docs only, shipped surface UNCHANGED (again)
+status: implemented -- gated green (demo assertions), awaiting /release 1.9.1
+alloc: N/A on shipped hot paths (Lru.js/Lru.d.ts/benchmark UNCHANGED)
+depends_on: [S13]
+decisions: []             # polish; no new architectural decision (a short note may amend D22)
+blocks: []
+```
+WHAT LANDED (S15, working tree, uncommitted; VERSION still 1.9.0 until /release 1.9.1):
+  - Demo fails CLOSED when the trace can't be loaded (opened as a static file / via an IDE
+    static preview / server down): a pure exported seam `fetchTrace(url, fetchImpl?)` in
+    demo/Visualize.mjs that NEVER throws -- returns {ok:true,data} only on a WELL-SHAPED 200
+    payload (array `trace`, integer `cap>=1`, `opt.hitRate` numeric), else {ok:false,message}
+    on a rejected fetch, a non-OK status, an {error} body, OR a malformed-200 (reviewer nit 1).
+    demo/visuals.html loadTrace() renders TRACE_SERVER_HINT into #status (replacing
+    "loading...") -- "run npm run demo:serve and open http://localhost:8013/; a static file /
+    IDE preview will not work: /trace.json is a dynamic route" -- with the underlying detail
+    in [...]. The render path is UNCHANGED (still draws strictly from dump()).
+  - Docs: README "Watch the policies" gains the Node-server caveat; a new "Choosing a member"
+    subsection (+TOC) maps workload -> member honestly (no invented numbers, ends on "measure
+    your own trace with the bench tool"), with TwoQ described accurately as A1in/Am/A1out
+    (reviewer nit 2). One matching caveat line in llms.txt's demo pointer.
+  - PIPELINE (light): coder -> reviewer APPROVED (fail-closed teeth confirmed: fetchTrace
+    cannot throw, 5+1 stubbed tests drive real reject/!ok/{error}/malformed/happy cases;
+    picture still cannot lie; shipped surface untouched) -> both nits folded (malformed-200
+    fail-close + a test; TwoQ doc fix). No separate planner (the brief was spec-level); no qa
+    (the seam is fully unit-tested). Torture N/A -- no hot path touched.
+  - Gates: node --test demo/Demo.test.mjs 30/30; npm test 1077/1077 (shipped suite unchanged);
+    git diff Lru.js/Lru.d.ts/benchmark empty; npm pack --dry-run 8 files, demo/ absent;
+    ASCII-clean, no stray tags.
+GOAL
+  Close the one loose end S13 left and add member-selection guidance. NO shipped runtime
+  code change -- demo/ + docs only. (Motivated by a real miss: opening the demo through
+  WebStorm's static server on :63342 404'd /trace.json and the page hung on a bare
+  "loading..." forever -- off-brand for a fail-closed suite.)
+TASKS
+  1. Demo fail-closed loading state (demo/visuals.html, maybe demo/Visualize.mjs): when the
+     /trace.json fetch REJECTS or returns non-OK (the page was opened as a static file / via
+     an IDE preview / the Node server is down), replace the permanent "loading..." with an
+     ACTIONABLE message -- "This demo needs its Node server: run `npm run demo:serve` and
+     open http://localhost:8013/ (not a static or IDE preview)." Dependency-free; catch the
+     fetch failure and render into the status area.
+  2. README "Watch the policies": state explicitly that the demo MUST run via the Node server
+     (npm run demo:serve -> http://localhost:8013/), NOT a static file / IDE static preview
+     (file:// or WebStorm), because /trace.json is a DYNAMIC route and ES modules need an
+     http origin. One or two sentences. Mirror one line into llms.txt if the demo pointer
+     there needs it.
+  3. (Optional, if in scope) "Choosing a member" decision guide: a short README subsection
+     (or a decisions/ reference) mapping workload -> member -- LiteLru reference/floor; Sieve
+     one-hit-wonder web/CDN; S3Fifo general scan resistance; WTinyLfu skewed/Zipf + frequency;
+     Slru/TwoQ simple scan-resistant baselines; Arc phase-changing / no-knobs -- ending on
+     "measure your own trace with the bench tool; the measured policy is the shipped policy."
+  4. Version sync happens at /release 1.9.1 (user-run): package.json, Lru.js VERSION, llms.txt,
+     the seven test asserts, README table. (This session does NOT move VERSION.)
+ASSERTIONS (falsifiable)
+  - Server down / trace.json 404 -> the page shows the actionable message, NOT a permanent
+    "loading..." (manual browser check; a Demo.test.mjs unit on the error-render path if the
+    DOM branch can be exercised headlessly).
+  - Served correctly, the demo still renders all seven panels and the existing 24 demo tests
+    stay green (regression).
+  - Shipped surface byte-identical: git diff Lru.js / Lru.d.ts / benchmark/Bench.mjs empty;
+    npm test unchanged count; npm pack --dry-run excludes demo/.
+  - ASCII-only, no stray tool-call tags.
+NON-GOALS
+  - No shipped runtime code change; no new member; no new API; no new npm deps.
+  - Not a rewrite of the demo -- a targeted hardening + docs pass.
+PIPELINE NOTE
+  Light: coder (demo fix + docs) -> reviewer (fail-closed error path + shipped surface
+  untouched + the picture still cannot lie) -> qa only if the error path warrants a test.
+  Torture N/A (no hot path touched).
+DONE WHEN
+  the demo fails closed with an actionable message when off-server; the docs say it needs the
+  Node server; member-selection guidance is present; the shipped surface is untouched.
+
 ---
 
 ## 7. Decision-record index (decisions/)

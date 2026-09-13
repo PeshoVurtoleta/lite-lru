@@ -161,6 +161,59 @@ export function summary(engine) {
 }
 
 /* -------------------------------------------------------------------------- *
+ * Trace loading (browser). The /trace.json route is DYNAMIC (computed by
+ * demo/serve.mjs), so it exists ONLY under the Node server. Opened as a static
+ * file, via an IDE static preview (WebStorm et al.), or with the server down,
+ * the fetch REJECTS or returns a non-OK status. We fail CLOSED with an
+ * actionable, dependency-free message instead of hanging on "loading..." (S15).
+ * -------------------------------------------------------------------------- */
+
+/** The actionable message shown when /trace.json cannot be loaded. Rendered into
+ *  the status area in place of "loading...". ASCII-only, no dependency. */
+export const TRACE_SERVER_HINT =
+    'This demo needs its Node server. Run  npm run demo:serve  and open  ' +
+    'http://localhost:8013/  (a static file or IDE preview will not work: ' +
+    '/trace.json is a dynamic route).';
+
+/**
+ * Fetch a trace payload, failing CLOSED. Never throws. Returns
+ * `{ ok:true, data }` on a 2xx JSON body, or `{ ok:false, message }` on a
+ * rejected fetch, a non-OK status, or a server-reported `{ error }` body -- the
+ * message is the actionable hint with the underlying detail appended. `fetchImpl`
+ * defaults to the global `fetch` so a test can inject a stub.
+ *
+ * @param {string} url
+ * @param {(url:string)=>Promise<any>} [fetchImpl]
+ * @returns {Promise<{ok:true,data:any}|{ok:false,message:string}>}
+ */
+export async function fetchTrace(url, fetchImpl) {
+    const f = fetchImpl || (typeof fetch === 'function' ? fetch : null);
+    if (f === null) return { ok: false, message: TRACE_SERVER_HINT + '  [no fetch available]' };
+    try {
+        const resp = await f(url);
+        if (!resp || !resp.ok) throw new Error('server ' + (resp ? resp.status : 'unreachable'));
+        const data = await resp.json();
+        if (data && data.error) throw new Error(data.error);
+        // Fail closed on a well-formed HTTP 200 whose BODY is the wrong shape: ok:true
+        // must guarantee createEngine can consume it (an array `trace`, an integer cap
+        // >= 1, and an `opt` with a numeric hitRate -- exactly serveTrace's payload).
+        // Otherwise the caller would build an engine that throws, and the page would
+        // hang on "loading..." -- the very failure S15 exists to prevent.
+        if (data === null || typeof data !== 'object' ||
+            !Array.isArray(data.trace) ||
+            !Number.isInteger(data.cap) || data.cap < 1 ||
+            data.opt === null || typeof data.opt !== 'object' ||
+            typeof data.opt.hitRate !== 'number') {
+            return { ok: false, message: TRACE_SERVER_HINT + '  [malformed trace payload]' };
+        }
+        return { ok: true, data };
+    } catch (err) {
+        const detail = err && err.message ? String(err.message) : String(err);
+        return { ok: false, message: TRACE_SERVER_HINT + '  [' + detail + ']' };
+    }
+}
+
+/* -------------------------------------------------------------------------- *
  * Node-main: npm run demo. DYNAMICALLY imports Bench.mjs + node:url so the
  * browser (which has no `process`) never touches the node:url path (D22.4).
  * -------------------------------------------------------------------------- */
