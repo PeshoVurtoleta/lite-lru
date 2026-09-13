@@ -79,7 +79,7 @@ LiteMGLRU, meta-policy; distilled into DEBATE items 13-15).
 | README + llms.txt + CHANGELOG + shipped benchmark/trace-replay tool | **built + gated (S9)** |
 | zero-GC TTL (opt-in expiry column) -- cross-cutting | **built + gated (S10)** |
 | zero-GC iteration (keys/entries/values, per-member defined order) -- cross-cutting | **built + gated (S11)** |
-| opt-in stats (hit/miss/evict/writes-per-hit) -- cross-cutting | S12 |
+| opt-in stats (hit/miss/evict; writes-per-hit stays torture-only) -- cross-cutting | **built + gated (S12)** |
 | snapshot / restore (dump/load; SoA columns are the serial form) | later/maybe (DEBATE 11) |
 | LRU-K, LIRS/ClockPro, LFU, MQ/CAR | `DEBATE.md` item 4 (deferred) |
 | CLOCK/ClockPro (out of family), async fetch (-> `lite-lru-fetch`), size-aware (-> `lite-cache-budget`) | `DEBATE.md` items 6/8/11 (out of core) |
@@ -835,26 +835,78 @@ ASSERTIONS
   break-early safe; borrowed-tuple aliasing + retention-nulling pinned.
 
 ===============================================================================
-# S12 -- v1.x -- opt-in stats (hit / miss / evict / writes-per-hit) [cross-cutting]
+# S12 -- v1.5.0 -- opt-in stats (hit / miss / evict / puts) [cross-cutting]
 ===============================================================================
 ```markdown
-status: planned
+version_target: 1.5.0          # renumbered from the placeholder "v1.x" (S10 took
+                               # 1.3.0, S11 took 1.4.0). S7 (2Q/SLRU, target still
+                               # 1.3.0) and S8 (ARC, target still 1.4.0) remain STALE
+                               # + unbuilt -- renumber when one is actually planned.
+status: built + gated (VERSION stays 1.4.0 until /release 1.5.0)
 gc_maxMajor: 0
+gc_maxPauseMs: 4
 alloc_bytes_per_op: 0
-depends_on: [S1]
+leak_cycles: 4096
+depends_on: [S1, S3]
 decisions: [D19]
 ```
+WHAT LANDED (S12, working tree, uncommitted; VERSION still 1.4.0 until /release 1.5.0):
+  - Opt-in `stats:true` across ALL FOUR members on the shared substrate: a per-instance
+    plain-object holder `{hits,misses,evictions,puts}` (plain JS numbers, exact to 2^53 --
+    NOT an Int32Array, which would wrap at 2^31), allocated ONLY when stats is on (`_stats`
+    null off -> zero extra bytes). Every hit/miss/put/eviction increment sits behind ONE
+    monomorphic `this._stats===null` guard in each get/put/_reap (mirrors the D17 TTL
+    off-path). stats-OFF is byte-neutral: writes-per-hit UNCHANGED (LiteLru 0/5/4,
+    Sieve/S3Fifo 0 links + 1 vis, WTinyLfu window-MRU 0), and `new X(n)._stats===null`.
+  - THE COUNTING LAW (D19.2), OUTCOME-based and uniform: get() drives hits/misses (after
+    the lookup resolves); has()/peek() are hit/miss-NEUTRAL; put() at capacity drives
+    exactly one eviction, counted at the single real-victim site (S3Fifo graduation and
+    WTinyLfu window->probation demotion do NOT count; admission-reject counts the CANDIDATE
+    as victim); a stale-TTL get() is a MISS + an EVICTION (the _reap site), no double-count
+    with a later put-site eviction; a stale has()/peek() reap ticks evictions++ but stays
+    hit/miss-neutral. writesPerHit is DELIBERATELY EXCLUDED from the runtime holder -- it
+    stays a member-specific torture-measured property (the counted-subclass harness).
+  - OWNER RULING (outcome-based puts): the reviewer flagged (non-blocking) that puts++ ran
+    BEFORE the store mutation, so a put() that throws (invalid/out-of-range int key under
+    keys:'int', or ttlMs on a non-ttl instance) still ticked puts. Ruled to FIX rather than
+    accept: puts is now counted at the success sites (after the store mutation lands), making
+    all four counters uniformly outcome-based -- honest for a "measure your policy" tool.
+    `_store._ver++` (D18.6) deliberately STAYS before the throw (fail-closed iteration
+    invalidation guards any attempt; puts records a completed operation). A throwing put
+    now counts nothing; a valid insert AND a valid update each count one.
+  - stats() returns the holder BY REFERENCE (borrowed; copy what you keep -- like the S11
+    iteration tuple, but the holder has no back-reference to the instance, so retaining it
+    pins only 4 numbers, not the cache). resetStats() zeroes IN PLACE (same holder
+    identity). FAIL-CLOSED (D19.5): stats()/resetStats() on a non-stats instance throw
+    [lite-lru]; the stats door rejects a bad value ('yes'/1/0/{}/null/false) with a
+    [lite-lru] TypeError + did-you-mean hint (mirrors the `keys` door).
+  - decisions/0019-stats.md (D19.1..D19.5); Lru.d.ts (CacheStats type + stats()/resetStats()
+    on the LiteCache interface AND all four classes + `stats?: true`, borrowed-holder
+    caveat); test/dts-drift.test.js counted surface 12 -> 14; test/Stats.test.js (NEW,
+    four members parameterized: brute-tally parity over the T5 corpus, has/peek-neutral,
+    stale miss+evict, outcome-based puts, degenerate caps 1/2/3, S10 TTL + S11 iteration
+    interop, onEvict-during-put, re-entrant resetStats-in-onEvict, fail-closed doors);
+    test/torture t6 Gate STATS + two t9 controls (stats-double-count, stats-counts-peek,
+    each fails); README + llms.txt Stats sections. NO Bench.mjs change (stats is not a
+    bench member). NO VERSION/test-count doc edits (those move at /release).
+  - Gates: npm test 612/612; test:types (tsc) exit 0; torture "ok"/exit 0 (t6 Gate STATS
+    0.00032 B/op, within the <=1 B/op budget, holder identity + 4-key shape stable);
+    controls "ok"/exit 0. Reviewer APPROVED (hot-path zero-alloc ON + byte-neutral OFF;
+    eviction counted exactly once per real victim across all four distinct paths incl.
+    degenerate caps; borrowed holder pins nothing; fail-closed doors; honest control
+    teeth; S10/S11 interop clean). qa: no defects; all five planner assertions PASS, the
+    owner change CONFIRMED-CLEAN by code read, the two D19.2 edge cases pinned with teeth.
 PURPOSE
-  Opt-in integer counters (hit, miss, eviction, and the writes-per-hit already
-  measured in S1) exposed via a `stats()` snapshot. Off by default; when on, pure
-  integer increments -- zero allocation, no hot-path branch when off. Feeds the
-  "measure your policy" identity (DEBATE items 10/11); no incumbent gives hit-ratio
-  out of the box. `stats()` returns a reused frozen view or plain numbers (no
-  per-call object churn on a hot path -- cold accessor only).
+  Opt-in integer counters (hits, misses, evictions, puts) exposed via a COLD stats()
+  accessor. Off by default; when on, pure integer increments -- zero allocation, no
+  hot-path branch when off. Feeds the "measure your policy" identity (DEBATE items 10/11);
+  no incumbent gives hit-ratio out of the box. stats() returns a reused holder by reference
+  (cold accessor only, no per-call object churn).
 ASSERTIONS
-  stats-off byte-identical to pre-S12 (T6); counters exact vs a brute tally over the
-  T5 corpus; strict-zero T6 with stats on; control (a counter that double-counts)
-  diverges from the tally.
+  stats-off byte-identical to pre-S12 (T6); counters exact vs an independent brute tally
+  over the T5 corpus (all four members); strict-zero T6 with stats on (holder byteLength/
+  identity stable); fail-closed stats() on a non-stats instance; controls (double-count,
+  counts-peek) diverge from the tally and fail.
 
 ---
 

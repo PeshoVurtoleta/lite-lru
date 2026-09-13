@@ -530,4 +530,55 @@ export async function run() {
         process.stderr.write('t6 Gate ITER ' + label + ': ' + gIterA.bytesPerCall.toFixed(5) +
             ' B/op per next() step (' + OPS + ' ops window, prefilled at capacity ' + CAP + ')\n');
     }
+
+    // --- Gate STATS: opt-in runtime counters -- STRICT zero-alloc (decisions/0019) --
+    // (D19) An int-backed cache constructed with `{ stats: true }` churns NEW,
+    // strictly-increasing integer keys from an EMPTY cache. After warm-up every op
+    // puts a fresh key (puts++, evicts the LRU -> evictions++) and gets a still-
+    // resident recent key (hits++). The counter writes go behind the monomorphic
+    // `this._stats === null` guard -- they are plain-number field stores on a fixed
+    // holder, never an allocation. The gate asserts maxMajor 0 + retained <= 1 B/op,
+    // the holder IDENTITY is stable across the whole run (D19.3), and the holder is a
+    // PLAIN object whose key set is EXACTLY the four counter names (D19.4).
+    const stCache = new LiteLru(CAP, { keys: 'int', stats: true });
+    const stHolderBefore = stCache.stats();
+    check(stCache._store._ixSlot !== undefined, () => 't6 Gate STATS: expected int backing');
+    const stIxSlotBytes = stCache._store._ixSlot.buffer.byteLength;
+    const stIxKeyBytes = stCache._store._ixKey.buffer.byteLength;
+    const stSink = new Int32Array(1);
+    let stk = 0;
+    const statsHot = () => {
+        stCache.put(stk, stk & 0xffff);              // fresh key -> puts++, evicts LRU -> evictions++
+        stSink[0] += stCache.get((stk - 2) | 0) | 0; // still-resident recent key -> hits++
+        stk++;
+    };
+    const gst = runOpsGate(statsHot, { ops: OPS, warmup: WARMUP });
+    check(stCache.stats() === stHolderBefore,
+        () => 't6 Gate STATS: the stats() holder identity changed across the run');
+    check(stCache._store._ixSlot.buffer.byteLength === stIxSlotBytes,
+        () => 't6 Gate STATS: _ixSlot.buffer grew ' + stIxSlotBytes + ' -> ' + stCache._store._ixSlot.buffer.byteLength);
+    check(stCache._store._ixKey.buffer.byteLength === stIxKeyBytes,
+        () => 't6 Gate STATS: _ixKey.buffer grew ' + stIxKeyBytes + ' -> ' + stCache._store._ixKey.buffer.byteLength);
+    check(stCache.size === CAP, () => 't6 Gate STATS: churn did not stay at capacity (size ' + stCache.size + ')');
+    // The holder is a PLAIN object with EXACTLY the four counter names (D19.4).
+    const stKeys = Object.keys(stHolderBefore).sort().join(',');
+    check(stKeys === 'evictions,hits,misses,puts',
+        () => 't6 Gate STATS: holder key set is ' + stKeys + ', expected evictions,hits,misses,puts');
+    check(Object.getPrototypeOf(stHolderBefore) === Object.prototype,
+        () => 't6 Gate STATS: holder is not a plain object');
+    // The counters actually advanced (the writes are real, not elided by the engine).
+    check(stHolderBefore.puts > 0 && stHolderBefore.hits > 0 && stHolderBefore.evictions > 0,
+        () => 't6 Gate STATS: counters did not advance (puts/hits/evictions must be > 0)');
+    if (!gst.report.ok) {
+        const g = gst.summary.gc;
+        die('t6 Gate STATS (stats churn) ops gate rejected -- verdict=' + gst.report.verdict +
+            ' source=' + gst.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gsta = runAllocsGate(statsHot, { iterations: 50000, batches: 8 });
+    if (!gsta.ok) {
+        die('t6 Gate STATS (stats churn) retained-alloc gate rejected -- verdict=' + gsta.report.verdict +
+            ' settled=' + gsta.result.settled + ' bytesPerCall=' + gsta.bytesPerCall);
+    }
+    process.stderr.write('t6 Gate STATS: ' + gsta.bytesPerCall.toFixed(5) +
+        ' B/op stats-ON churn (' + OPS + ' ops window, capacity ' + CAP + ')\n');
 }

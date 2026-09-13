@@ -59,6 +59,7 @@ One `LiteCache<K,V>` surface, `get`/`put`/`has`/`peek`/`delete`/`clear`, all O(1
   - [Construction options](#construction-options)
   - [TTL -- opt-in, lazy expiry](#ttl----opt-in-lazy-expiry)
   - [Iteration -- zero-GC keys/values/entries](#iteration----zero-gc-keysvaluesentries)
+  - [Stats -- opt-in runtime counters](#stats----opt-in-runtime-counters)
   - [The bench tool](#the-bench-tool)
   - [Constants](#constants)
 - [Composability](#composability)
@@ -147,6 +148,8 @@ cache.peek(key: K): V | undefined           // read without applying the hit pol
 cache.delete(key: K): boolean               // remove; true if it was present
 cache.clear(): void                         // empty the cache; allocates nothing
 cache.purgeStale(): number                  // evict every currently-expired entry now; returns the count (TTL)
+cache.stats(): CacheStats                   // live counters {hits,misses,evictions,puts}; requires { stats: true }
+cache.resetStats(): void                    // zero the four counters in place; requires { stats: true }
 cache.size: number                          // current entry count, 0 .. capacity (getter)
 cache.capacity: number                      // fixed maximum, set at construction (getter)
 ```
@@ -163,6 +166,7 @@ interface LiteCacheOptions<K, V> {
   keys?: "int";
   ttl?: number;            // opt-in TTL default in ms (Infinity = never); see below
   clock?: () => number;    // injectable clock, defaults to Date.now
+  stats?: true;            // opt into runtime counters; see Stats below
 }
 ```
 
@@ -170,6 +174,7 @@ interface LiteCacheOptions<K, V> {
   - **Reentrancy contract (fires LAST, fail-closed).** `onEvict` fires AFTER the cache is fully consistent -- the newcomer already inserted, the victim already gone. It MUST NOT call `put`/`get`/`delete`/`clear` on the same instance; doing so throws a `[lite-lru]`-tagged `Error` rather than corrupting the intrusive lists mid-eviction. `has` and `peek` ARE allowed from within the callback (they cannot mutate) -- use them to inspect. An expiry reap fires `onEvict` under the same contract.
 - **`keys: "int"`** -- opt into the open-addressed typed-array keyed index for STRICT zero allocation (even the index never allocates -- no pre-fill caveat). Keys MUST be 32-bit signed integers in `[-2147483648, 2147483647]`; a non-integer or out-of-range key throws a `[lite-lru]`-tagged `TypeError` (fail-closed). Values remain arbitrary. Omitted, the default is a JS `Map`: arbitrary keys, honestly AMORTIZED (its internal resize can allocate), byte-identical to the pre-`keys` behavior. An unknown `keys` value throws with a did-you-mean hint.
 - **`ttl` / `clock`** -- opt into time-to-live (see [TTL](#ttl----opt-in-lazy-expiry) below). Both are validated fail-closed at the door.
+- **`stats: true`** -- opt into runtime counters (see [Stats](#stats----opt-in-runtime-counters) below). Any value other than `true` (or omitted) throws a `[lite-lru]`-tagged `TypeError` with a did-you-mean hint.
 
 ### TTL -- opt-in, lazy expiry
 
@@ -221,6 +226,32 @@ for (const v of cache.values()) { /* ... */ }
 - **TTL: skip, don't reap.** Under `ttl`, iteration **skips** stale entries (they are invisible) but does **not** reap them -- a walk performs no structural mutation, so `size` is unchanged by iterating. Use `purgeStale()` to reclaim.
 - **Fail closed on mutation-during-iteration.** A structural mutation (`put`/`delete`/`clear`/eviction/reap) mid-walk makes the next `next()` throw a `[lite-lru]`-tagged `Error` (a single integer version counter, bumped only by mutations, never on the `get` path -- so the hot `get` writes-per-hit are unchanged). A `get()`-induced reorder mid-walk is documented-unsupported (not caught -- catching it would cost a write per hit).
 
+### Stats -- opt-in runtime counters
+
+Stats are **opt-in, zero-cost-when-off, and pay-for-what-you-use** (decisions/0019). A cache constructed without `{ stats: true }` writes **nothing** on the hot path -- byte-identical to the pre-stats build (same writes-per-hit, no holder, no fields). Opt in and you get four exact counters via `stats()`, on every member under the same `LiteCache<K,V>` surface:
+
+```ts
+const cache = new WTinyLfu<number, Buf>(1024, { stats: true });
+// ... run traffic ...
+const s = cache.stats();                 // { hits, misses, evictions, puts }
+const hitRatio = s.hits / (s.hits + s.misses);
+cache.resetStats();                      // zero the four counters in place
+```
+
+```ts
+interface CacheStats { hits: number; misses: number; evictions: number; puts: number; }
+```
+
+- **`hits`** -- a `get(key)` that found a live resident entry. **`misses`** -- a `get(key)` that did not (absent, or stale under TTL). **`evictions`** -- an entry removed by the policy: a capacity eviction on `put`, or a stale reap. **`puts`** -- every `put(...)` call (insert or update).
+- **Exact integers to 2^53.** Plain JS number fields (not an `Int32Array` that would wrap at 2^31). For any realistic cache they never overflow.
+- **`has`/`peek` are hit/miss-neutral.** They are inspections, not accesses -- they never register a hit or a miss. (A stale `has`/`peek` under TTL still reaps the expired entry, which is a genuine eviction and is counted as one.)
+- **A stale-TTL `get` is a MISS and an EVICTION.** It counts one miss and reaps the expired entry in place (one eviction) -- consistent across all four members.
+- **The holder is borrowed (copy what you keep).** `stats()` returns the live per-instance holder **by reference**, not a snapshot -- its counters keep advancing and `resetStats()` zeroes that same object in place (a previously borrowed reference stays valid and reads back zeros). For a point-in-time snapshot, copy it: `const snap = { ...cache.stats() }`.
+- **Fail closed.** `stats()` / `resetStats()` on a cache built without `{ stats: true }` throw a `[lite-lru]`-tagged `Error` (there is no holder -- a caller bug, not a silent return of zeros). `null` is not zero.
+- **`writesPerHit` is not here.** It is a member-specific, out-of-band **measured** number (see below), not a runtime counter -- turning it into one would require a store on every hit, exactly the hot-path write the zero-GC law forbids.
+
+The stats-ON hot path is still strictly zero-alloc: the torture Gate STATS churns `>= 60,000` ops at capacity with `{ stats: true }` and measures **0 B/op**, holder identity stable, holder plain with exactly the four counter names.
+
 ### The bench tool
 
 `Bench.mjs` ships in the tarball as both a runnable and a subpath import. It imports ONLY the cache implementation -- zero runtime deps, no test-only devDeps.
@@ -245,7 +276,7 @@ Run directly, it prints a table; imported, it returns structured results and pri
 
 | Constant  | Value     | Meaning                                                       |
 | --------- | --------- | ------------------------------------------------------------ |
-| `VERSION` | `'1.4.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
+| `VERSION` | `'1.5.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
 
 All four members and `VERSION` are named exports; `LiteLru` is also the default export.
 
@@ -379,7 +410,7 @@ Hit % and % of OPT are deterministic (seeded trace, deterministic policies); `ns
 **143 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
 
 ```bash
-npm test               # 548 node:test cases (all members, laws, TTL, iteration, boundary, dts drift)
+npm test               # 612 node:test cases (all members, laws, TTL, iteration, stats, boundary, dts drift)
 npm run test:types     # tsc: the LiteCache<K,V> surface + one-line-swap type-check
 npm run torture        # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + gated numbers
 npm run torture:controls  # the deliberately-broken variants -- every gate must fail

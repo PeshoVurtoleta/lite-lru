@@ -173,7 +173,28 @@ const ITER_MUTATED_MSG =
     "[lite-lru] cache was structurally mutated during iteration " +
     "(put/delete/clear/evict/reap); an iterator is invalid after any such change";
 
-export const VERSION = "1.4.0";
+/** Fail-closed message for stats()/resetStats() on a non-stats instance (decisions/0019,
+ *  D19.5). Built once, thrown only when the accessor is used on a cache that was not
+ *  constructed with `{ stats: true }` (there is no holder -- a caller bug, not zeros). */
+const STATS_OFF_MSG =
+    "[lite-lru] stats()/resetStats() require the cache to be constructed with " +
+    "{ stats: true }; this instance has no stats configured";
+
+/**
+ * Validate the optional `stats` door and mint the per-instance counter holder
+ * (decisions/0019, D19). Mirrors the `keys` door (decisions/0011): `undefined` -> no
+ * stats (`null`); `true` -> a fresh zeroed holder of plain-number fields (D19.4,
+ * exact to 2^53); any other value fails closed with a did-you-mean hint (D19.5).
+ * Cold: called once per constructor, never on a hot path.
+ */
+function validateStats(stats) {
+    if (stats === undefined) return null;
+    if (stats === true) return { hits: 0, misses: 0, evictions: 0, puts: 0 };
+    throw new TypeError(
+        "[lite-lru] unknown stats option " + String(stats) + " (did you mean true?)");
+}
+
+export const VERSION = "1.5.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -533,6 +554,11 @@ export class LiteLru {
         // executing. A mutating method entered during that window throws. A plain
         // boolean: zero allocation, one predicted-not-taken branch on the hot path.
         this._inOnEvict = false;
+
+        // Opt-in runtime stats (decisions/0019). `null` when off (the default) so the
+        // hot path writes NOTHING; a fresh per-instance holder of plain-number fields
+        // when `{ stats: true }`. The `stats` door fails closed on an unknown value.
+        this._stats = validateStats(options && options.stats);
     }
 
     /** The store factory (decisions/0011), delegating to the shared `newStore` so
@@ -586,11 +612,16 @@ export class LiteLru {
         // Slots are >= 0 and the store returns NIL (-1) for a miss, so `s < 0` is a
         // clean miss test for BOTH backings (do NOT use truthiness: slot 0 is valid).
         const s = this._store.get(key);
-        if (s < 0) return undefined;
+        if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (decisions/0019)
         // TTL gate (decisions/0017, D17.3): a stale hit is a MISS -- no promotion,
         // reaped in place (fires onEvict). Only reached when ttl is configured.
-        if (this._exp !== null && this._exp[s] <= this._clock()) { this._reap(s); return undefined; }
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
+            this._reap(s);
+            return undefined;
+        }
         this._moveToFront(s);
+        if (this._stats !== null) this._stats.hits++; // live hit (decisions/0019)
         return this._vals[s];
     }
 
@@ -613,6 +644,7 @@ export class LiteLru {
             this._vals[existing] = value;
             if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
             this._moveToFront(existing);
+            if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); decisions/0019
             return;
         }
 
@@ -638,12 +670,14 @@ export class LiteLru {
         store.set(key, s);
         this._pushFront(s);
         this._size++;
+        if (this._stats !== null) this._stats.puts++; // successful insert (outcome-based); decisions/0019
 
         // Reentrancy fix (decisions/0002) -- fire onEvict LAST, when the cache is
         // fully consistent (the new entry is inserted, size restored). The guard
         // rejects any mutating reentry; because the cache is already consistent
         // here, that throw leaves it intact.
         if (evicted) {
+            if (this._stats !== null) this._stats.evictions++; // capacity eviction (decisions/0019)
             this._inOnEvict = true;
             try {
                 this._onEvict(evKey, evVal);
@@ -687,6 +721,7 @@ export class LiteLru {
         this._store.delete(evKey);
         this._store.freeSlot(s);
         this._size--;
+        if (this._stats !== null) this._stats.evictions++; // reap = eviction (decisions/0019, D19.2)
         this._inOnEvict = true;
         try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
     }
@@ -732,6 +767,24 @@ export class LiteLru {
         this._head = NIL;
         this._tail = NIL;
         this._size = 0;
+    }
+
+    // --- opt-in runtime stats (decisions/0019, D19): cold accessors -----------
+
+    /** The live stats holder (decisions/0019, D19.3). Returned BY REFERENCE (borrowed --
+     *  copy what you keep, like the S11 iteration tuple); the counters keep advancing in
+     *  the object you hold. Fail closed: throws on an instance built without { stats: true }. */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE (decisions/0019), so a previously-borrowed holder
+     *  stays valid. Fail closed on a non-stats instance. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        const st = this._stats;
+        st.hits = 0; st.misses = 0; st.evictions = 0; st.puts = 0;
     }
 
     // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
@@ -829,6 +882,9 @@ export class Sieve {
 
         this._onEvict = (options && options.onEvict) || NOOP;
         this._inOnEvict = false;
+
+        // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
+        this._stats = validateStats(options && options.stats);
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
@@ -884,11 +940,16 @@ export class Sieve {
     get(key) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
-        if (s < 0) return undefined;
+        if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (decisions/0019)
         // TTL gate (decisions/0017, D17.3): a stale hit is a MISS -- no visited bump,
         // reaped in place. Only reached when ttl is configured.
-        if (this._exp !== null && this._exp[s] <= this._clock()) { this._reap(s); return undefined; }
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
+            this._reap(s);
+            return undefined;
+        }
         this._vis[s] = 1; // the whole hot path: a single byte store
+        if (this._stats !== null) this._stats.hits++; // live hit (decisions/0019)
         return this._vals[s];
     }
 
@@ -911,6 +972,7 @@ export class Sieve {
             this._vals[existing] = value;
             if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
             this._vis[existing] = 1;
+            if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); decisions/0019
             return;
         }
 
@@ -943,10 +1005,12 @@ export class Sieve {
         store.set(key, s);
         this._pushFront(s);
         this._size++;
+        if (this._stats !== null) this._stats.puts++; // successful insert (outcome-based); decisions/0019
 
         // Fire onEvict LAST, cache fully consistent (decisions/0002). The guard
         // rejects any mutating reentry; the cache is already whole here.
         if (evicted) {
+            if (this._stats !== null) this._stats.evictions++; // capacity eviction (decisions/0019)
             this._inOnEvict = true;
             try {
                 this._onEvict(evKey, evVal);
@@ -997,6 +1061,7 @@ export class Sieve {
         this._vis[s] = 0;
         this._store.freeSlot(s);
         this._size--;
+        if (this._stats !== null) this._stats.evictions++; // reap = eviction (decisions/0019, D19.2)
         this._inOnEvict = true;
         try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
     }
@@ -1052,6 +1117,23 @@ export class Sieve {
         this._tail = NIL;
         this._hand = NIL;
         this._size = 0;
+    }
+
+    // --- opt-in runtime stats (decisions/0019, D19): cold accessors -----------
+
+    /** The live stats holder (decisions/0019, D19.3), returned BY REFERENCE (borrowed --
+     *  copy what you keep). Fail closed on an instance built without { stats: true }. */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE (decisions/0019); a borrowed holder stays valid.
+     *  Fail closed on a non-stats instance. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        const st = this._stats;
+        st.hits = 0; st.misses = 0; st.evictions = 0; st.puts = 0;
     }
 
     // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
@@ -1200,6 +1282,9 @@ export class S3Fifo {
 
         this._onEvict = (options && options.onEvict) || NOOP;
         this._inOnEvict = false;
+
+        // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
+        this._stats = validateStats(options && options.stats);
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
@@ -1417,11 +1502,16 @@ export class S3Fifo {
     get(key) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
-        if (s < 0) return undefined;
+        if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (decisions/0019)
         // TTL gate (decisions/0017, D17.3): a stale hit is a MISS -- no visited bump,
         // reaped in place. Only reached when ttl is configured.
-        if (this._exp !== null && this._exp[s] <= this._clock()) { this._reap(s); return undefined; }
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
+            this._reap(s);
+            return undefined;
+        }
         this._vis[s] = 1; // the whole hot path: a single byte store
+        if (this._stats !== null) this._stats.hits++; // live hit (decisions/0019)
         return this._vals[s];
     }
 
@@ -1444,6 +1534,7 @@ export class S3Fifo {
             this._vals[existing] = value;
             if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
             this._vis[existing] = 1;
+            if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); decisions/0019
             return;
         }
 
@@ -1471,9 +1562,11 @@ export class S3Fifo {
         store.set(key, s);
         if (toMain) this._pushMain(s); else this._pushSmall(s);
         this._size = this._sSize + this._mSize;
+        if (this._stats !== null) this._stats.puts++; // successful insert (outcome-based); decisions/0019
 
         // Fire onEvict LAST, cache fully consistent (decisions/0002).
         if (evicted) {
+            if (this._stats !== null) this._stats.evictions++; // capacity eviction (decisions/0019)
             this._inOnEvict = true;
             try {
                 this._onEvict(evKey, evVal);
@@ -1519,6 +1612,7 @@ export class S3Fifo {
         this._vis[s] = 0;
         this._store.freeSlot(s);
         this._size = this._sSize + this._mSize;
+        if (this._stats !== null) this._stats.evictions++; // reap = eviction (decisions/0019, D19.2)
         this._inOnEvict = true;
         try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
     }
@@ -1571,6 +1665,23 @@ export class S3Fifo {
         }
         this._gHead = 0;
         this._gLen = 0;
+    }
+
+    // --- opt-in runtime stats (decisions/0019, D19): cold accessors -----------
+
+    /** The live stats holder (decisions/0019, D19.3), returned BY REFERENCE (borrowed --
+     *  copy what you keep). Fail closed on an instance built without { stats: true }. */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE (decisions/0019); a borrowed holder stays valid.
+     *  Fail closed on a non-stats instance. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        const st = this._stats;
+        st.hits = 0; st.misses = 0; st.evictions = 0; st.puts = 0;
     }
 
     // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
@@ -1762,6 +1873,9 @@ export class WTinyLfu {
 
         this._onEvict = (options && options.onEvict) || NOOP;
         this._inOnEvict = false;
+
+        // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
+        this._stats = validateStats(options && options.stats);
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
@@ -1917,12 +2031,17 @@ export class WTinyLfu {
     get(key) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
-        if (s < 0) return undefined;
+        if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (decisions/0019)
         // TTL gate (decisions/0017, D17.3): a stale hit is a MISS -- no sketch bump, no
         // promotion, reaped in place. Only reached when ttl is configured.
-        if (this._exp !== null && this._exp[s] <= this._clock()) { this._reap(s); return undefined; }
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
+            this._reap(s);
+            return undefined;
+        }
         this._sketchInc(this._hashKey(key, s));
         this._onHit(s);
+        if (this._stats !== null) this._stats.hits++; // live hit (decisions/0019)
         return this._vals[s];
     }
 
@@ -1946,6 +2065,7 @@ export class WTinyLfu {
             if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
             this._sketchInc(this._hashKey(key, existing));
             this._onHit(existing);
+            if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); decisions/0019
             return;
         }
 
@@ -1993,9 +2113,11 @@ export class WTinyLfu {
         // Record the newcomer's own access AFTER the admission decision, so the decision
         // reads the pre-bump sketch (keeps impl and oracle in lockstep).
         this._sketchInc(this._hashKey(key, s));
+        if (this._stats !== null) this._stats.puts++; // successful insert (outcome-based); decisions/0019
 
         // Fire onEvict LAST, cache fully consistent (decisions/0002).
         if (evicted) {
+            if (this._stats !== null) this._stats.evictions++; // capacity eviction (decisions/0019)
             this._inOnEvict = true;
             try { this._onEvict(evKey, evVal); }
             finally { this._inOnEvict = false; }
@@ -2037,6 +2159,7 @@ export class WTinyLfu {
         this._store.delete(evKey);
         this._store.freeSlot(s);
         this._size--;
+        if (this._stats !== null) this._stats.evictions++; // reap = eviction (decisions/0019, D19.2)
         this._inOnEvict = true;
         try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
     }
@@ -2083,6 +2206,23 @@ export class WTinyLfu {
         this._size = 0;
         this._sk.fill(0);
         this._skSize = 0;
+    }
+
+    // --- opt-in runtime stats (decisions/0019, D19): cold accessors -----------
+
+    /** The live stats holder (decisions/0019, D19.3), returned BY REFERENCE (borrowed --
+     *  copy what you keep). Fail closed on an instance built without { stats: true }. */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE (decisions/0019); a borrowed holder stays valid.
+     *  Fail closed on a non-stats instance. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        const st = this._stats;
+        st.hits = 0; st.misses = 0; st.evictions = 0; st.puts = 0;
     }
 
     // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------

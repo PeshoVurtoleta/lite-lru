@@ -17,7 +17,7 @@ function victim(c) {
 }
 
 test('exports: VERSION and both named + default export are LiteLru', async () => {
-    assert.equal(VERSION, '1.4.0');
+    assert.equal(VERSION, '1.5.0');
     const mod = await import('../Lru.js');
     assert.equal(mod.LiteLru, LiteLru);
     assert.equal(mod.default, LiteLru);

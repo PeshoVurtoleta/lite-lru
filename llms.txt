@@ -10,7 +10,7 @@ dependencies, node:test only. Ships a runnable + importable benchmark tool
 (Bench.mjs) with Belady OPT so a caller measures which policy fits their trace
 instead of guessing.
 
-## Status: 1.4.0 - zero-GC iteration across all four members (LiteLru + Sieve + S3Fifo + WTinyLfu): keys()/values()/entries()/[Symbol.iterator] at 0 B/op per step via a hand-written iterator with a reused result + borrowed tuple, a defined per-member order (only LiteLru is true recency), recency-neutral, TTL-skip-without-reap, and fail-closed on mid-walk mutation - on the shared substrate, atop opt-in zero-GC TTL (1.3.0) and the shipped bench + Belady OPT tool
+## Status: 1.5.0 - opt-in zero-GC stats across all four members (LiteLru + Sieve + S3Fifo + WTinyLfu): an opt-in {hits,misses,evictions,puts} counter holder allocated only when stats:true, 0 B/op on the hot path (a single _stats===null guard, stats-OFF byte-identical), uniformly OUTCOME-based (a throwing put counts nothing; has/peek are hit/miss-neutral; a stale-TTL get is a miss + an eviction), exposed via a cold stats() (borrowed holder) + resetStats(), fail-closed on a non-stats instance - atop zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool
 
 The family is the identity from v1.0.0: classic LRU is the reference member +
 differential oracle + honest floor, SIEVE is the headline, and the shipped
@@ -91,6 +91,11 @@ new WTinyLfu(n) and stays type-checked.
 - clear() -> void. Empty the cache; allocates nothing.
 - purgeStale() -> number. Evict every currently-expired entry now (cold, O(size),
   fires onEvict per victim); returns the count. 0 on a cache with no ttl. (TTL)
+- stats() -> CacheStats {hits,misses,evictions,puts}. Live per-instance counters,
+  returned BY REFERENCE (borrowed -- copy what you keep). Requires { stats: true },
+  else throws a [lite-lru] Error (fail-closed). (STATS)
+- resetStats() -> void. Zero the four counters IN PLACE (a borrowed holder stays
+  valid). Requires { stats: true }, else throws (fail-closed). (STATS)
 - size -> number (0 .. capacity, getter). capacity -> number (getter).
 
 ## Construction options
@@ -112,6 +117,34 @@ new WTinyLfu(n) and stays type-checked.
   (_exp === null). Per-entry override via put(key, value, ttlMs).
 - clock (decisions/0017): injectable zero-arg fn returning ms, default Date.now.
   Non-function throws a [lite-lru] TypeError. Only meaningful with ttl.
+- stats: true (decisions/0019): opt into runtime counters (see STATS below). Any
+  value other than true/omitted throws a [lite-lru] TypeError with a did-you-mean
+  hint. Omitted keeps the stats-OFF hot path byte-identical (_stats === null).
+
+## Stats (decisions/0019, D19)
+
+- OPT-IN, zero-cost-when-off, pay-for-what-you-use. { stats: true } mints a fresh
+  per-instance holder {hits,misses,evictions,puts}; omitted -> _stats === null and
+  the hot path writes NOTHING (same writes-per-hit as the pre-stats build). All four
+  members, one LiteCache<K,V> surface.
+- Counting law (D19.2): get -> hits (live resident) or misses (absent OR stale-TTL);
+  put -> one puts always, plus one evictions when a new key is inserted at capacity;
+  a stale-TTL get is a MISS AND an EVICTION (reaped in place). has/peek are hit/miss-
+  NEUTRAL (inspections, not accesses); a stale has/peek still reaps = one eviction.
+  Evictions are counted at exactly two sites: the capacity eviction in put, and _reap.
+- Holder (D19.3): stats() returns the live holder BY REFERENCE (borrowed, like the
+  iteration tuple) -- copy what you keep ({ ...cache.stats() }); resetStats() zeroes
+  the SAME object in place. Holder identity is stable for the instance lifetime.
+- Fields (D19.4): plain JS number fields (exact to 2^53), NOT an Int32Array (2^31
+  wrap). Never overflows for a realistic cache.
+- Fail closed (D19.5): stats()/resetStats() on a non-stats instance throw a
+  [lite-lru] Error (null is not zero); the door rejects any non-true value.
+- writesPerHit is NOT a runtime counter -- it stays a member-specific, gated,
+  out-of-band MEASUREMENT (a runtime counter would need a store per hit).
+- Gated: t6 Gate STATS (>= 60000 ops at capacity, { stats: true }) = 0 B/op, holder
+  identity stable, holder plain with exactly the four names; Stats.test.js brute-tally
+  parity over the T5 corpus (all four members); t9 stats-double-count + stats-counts-
+  peek controls (each diverges from the brute tally and fails).
 
 ## TTL (decisions/0017, D17)
 
@@ -206,7 +239,7 @@ drops LiteLru's body from the bundle (and vice versa). The shared substrate is
 INTERNAL, not an export; there is NO subpath-per-policy. Bench.mjs is a separate
 runnable tool, not a second implementation.
 
-## API (1.4.0)
+## API (1.5.0)
 
 Named exports from @zakkster/lite-lru:
 
@@ -214,7 +247,7 @@ Named exports from @zakkster/lite-lru:
 - Sieve: the SIEVE member.
 - S3Fifo: the S3-FIFO member.
 - WTinyLfu: the W-TinyLFU member.
-- VERSION: '1.4.0'
+- VERSION: '1.5.0'
 
 Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
@@ -223,7 +256,7 @@ Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
 ## Testing
 
-- npm test        -- 548 node:test cases (all four members, recency/SIEVE/S3-FIFO/
+- npm test        -- 612 node:test cases (all four members, recency/SIEVE/S3-FIFO/
   W-TinyLFU laws, TTL laws + fail-closed + purgeStale, degenerate keys/values, dts
   drift, family surface).
 - npm run test:types -- tsc: the LiteCache<K,V> surface + the one-line-swap check.

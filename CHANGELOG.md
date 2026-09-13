@@ -7,6 +7,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.5.0] - 2026-09-13
+
+### Added
+
+- **Opt-in zero-GC stats across all four members** (`LiteLru`, `Sieve`, `S3Fifo`,
+  `WTinyLfu`) behind the same `LiteCache<K,V>` surface: a per-instance counter
+  holder `{ hits, misses, evictions, puts }`, enabled with the `stats: true`
+  construction option and read through a cold `stats()` accessor, with
+  `resetStats()` to zero it in place. The holder is plain JS numbers (exact to
+  2^53, not an `Int32Array` that would wrap at 2^31) and is allocated only when
+  `stats: true`; when off, `_stats` is `null` and no holder exists.
+- `stats()` and `resetStats()` on the `LiteCache<K,V>` interface and all four
+  classes; a `CacheStats` type and the `stats?: true` option in `Lru.d.ts`.
+
+### Changed
+
+- Counting is **uniformly outcome-based**: `get()` drives `hits`/`misses` after the
+  lookup resolves; `put()` drives `puts` only after the store mutation lands (a
+  `put` that throws -- an invalid/out-of-range key under `keys: 'int'`, or `ttlMs`
+  on a non-ttl instance -- counts nothing) and drives exactly one `eviction` per
+  real victim; `has()`/`peek()` are `hit`/`miss`-neutral; a stale-TTL `get()` is a
+  miss and an eviction. `S3Fifo` graduation (SMALL->MAIN) and `WTinyLfu`
+  window->probation demotion are not evictions and are not counted. `writesPerHit`
+  is deliberately excluded from the runtime holder (it stays a torture-measured,
+  member-specific property).
+- Each hot-path increment sits behind a single monomorphic `this._stats === null`
+  guard, so the **stats-OFF hot path is byte-identical** to 1.4.0: writes-per-hit
+  unchanged (`LiteLru` 0/5/4, `Sieve`/`S3Fifo` 0 links + 1 visited byte, `WTinyLfu`
+  window-MRU 0). With stats ON the hot path stays zero-allocation (measured
+  **0.00032 B/op** over a 60,000-op window at capacity 4096; `gc maxMajor 0`,
+  `maxPauseMs 4`; holder byteLength and identity stable).
+- `stats()` returns the holder **by reference** (borrowed -- copy what you keep;
+  it holds no reference back to the cache, so retaining it pins only four numbers).
+- Fail-closed: `stats()`/`resetStats()` on a non-`stats` instance throw a
+  `[lite-lru]` Error; the `stats` option rejects a non-`true` value with a
+  `[lite-lru]` `TypeError` and a did-you-mean hint.
+- Tests: 548 -> 612 node:test cases (adds `test/Stats.test.js`, four members
+  parameterized: brute-tally parity over the fuzz corpus, has/peek-neutrality,
+  outcome-based puts, stale-TTL and iteration interop, degenerate capacities,
+  re-entrant `resetStats()` in `onEvict`, fail-closed doors). Torture adds the
+  `t6 Gate STATS` allocation gate and two `t9` controls (`stats-double-count`,
+  `stats-counts-peek`). `Lru.d.ts` drift-counted surface 12 -> 14. No `Bench.mjs`
+  change (stats is not a bench member).
+
 ## [1.4.0] - 2026-09-13
 
 ### Added

@@ -19,6 +19,24 @@
  */
 
 /**
+ * Opt-in runtime counters (decisions/0019, D19), exposed by `stats()` on a cache
+ * constructed with `{ stats: true }`. Four EXACT integers (plain JS numbers, exact to
+ * 2^53 -- D19.4):
+ *   - `hits`      -- a `get(key)` that found a LIVE resident entry.
+ *   - `misses`    -- a `get(key)` that did not (absent, OR stale under TTL).
+ *   - `evictions` -- an entry removed by the policy: a capacity eviction on `put`, or a
+ *     stale reap. `has`/`peek` are hit/miss-NEUTRAL but a stale `has`/`peek` still reaps,
+ *     which IS an eviction (D19.2).
+ *   - `puts`      -- every `put(...)` call (insert OR update).
+ */
+export interface CacheStats {
+  hits: number;
+  misses: number;
+  evictions: number;
+  puts: number;
+}
+
+/**
  * The uniform cache surface shared by every member of the lite-lru family.
  *
  * Semantics are identical across members; only the INTERNAL eviction policy
@@ -71,6 +89,24 @@ export interface LiteCache<K, V> extends Iterable<[K, V]> {
    * a cache with no `ttl` configured).
    */
   purgeStale(): number;
+  /**
+   * The live runtime counters (decisions/0019, D19). Requires the cache to have been
+   * constructed with `{ stats: true }`; on an instance without stats this throws a
+   * `[lite-lru]`-tagged Error (fail-closed -- null is not zero, D19.5).
+   *
+   * BORROWED HOLDER (D19.3): the returned object is the live, per-instance holder BY
+   * REFERENCE, NOT a snapshot -- its counters keep advancing as the cache is used, and
+   * `resetStats()` zeroes THIS SAME object in place. Copy what you keep for a
+   * point-in-time snapshot: `const snap = { ...cache.stats() }`. The holder identity is
+   * stable for the lifetime of the instance.
+   */
+  stats(): CacheStats;
+  /**
+   * Zero the four runtime counters IN PLACE (decisions/0019, D19.3), so a previously
+   * borrowed `stats()` holder stays valid and reads back zeros. Requires `{ stats: true }`;
+   * throws a `[lite-lru]`-tagged Error on an instance without stats (fail-closed).
+   */
+  resetStats(): void;
   /**
    * Iterate the keys in the member's iteration order (decisions/0018, D18). Zero-GC
    * per step: a hand-written iterator, no generator. The walk is recency-neutral (no
@@ -151,6 +187,14 @@ export interface LiteCacheOptions<K, V> {
    * function, not a per-call closure (zero-GC).
    */
   clock?: () => number;
+  /**
+   * Opt-in runtime stats (decisions/0019, D19). PAY-FOR-WHAT-YOU-USE, mirroring `ttl`:
+   * `true` mints a fresh per-instance counter holder and enables `stats()`/`resetStats()`;
+   * omitting it keeps the stats-OFF hot path byte-identical (no holder, no counter writes
+   * -- `_stats === null`). Any value OTHER than `true` (or omitted) throws a
+   * `[lite-lru]`-tagged TypeError with a did-you-mean hint (fail-closed, D19.5).
+   */
+  stats?: true;
 }
 
 /**
@@ -179,6 +223,11 @@ export class LiteLru<K = unknown, V = unknown> implements LiteCache<K, V> {
   delete(key: K): boolean;
   clear(): void;
   purgeStale(): number;
+  /** Live runtime counters (decisions/0019). BORROWED holder -- copy what you keep;
+   *  throws on an instance built without { stats: true } (fail-closed). */
+  stats(): CacheStats;
+  /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
+  resetStats(): void;
   keys(): IterableIterator<K>;
   values(): IterableIterator<V>;
   entries(): IterableIterator<[K, V]>;
@@ -224,6 +273,11 @@ export class Sieve<K = unknown, V = unknown> implements LiteCache<K, V> {
   delete(key: K): boolean;
   clear(): void;
   purgeStale(): number;
+  /** Live runtime counters (decisions/0019). BORROWED holder -- copy what you keep;
+   *  throws on an instance built without { stats: true } (fail-closed). */
+  stats(): CacheStats;
+  /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
+  resetStats(): void;
   keys(): IterableIterator<K>;
   values(): IterableIterator<V>;
   entries(): IterableIterator<[K, V]>;
@@ -273,6 +327,11 @@ export class S3Fifo<K = unknown, V = unknown> implements LiteCache<K, V> {
   delete(key: K): boolean;
   clear(): void;
   purgeStale(): number;
+  /** Live runtime counters (decisions/0019). BORROWED holder -- copy what you keep;
+   *  throws on an instance built without { stats: true } (fail-closed). */
+  stats(): CacheStats;
+  /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
+  resetStats(): void;
   keys(): IterableIterator<K>;
   values(): IterableIterator<V>;
   entries(): IterableIterator<[K, V]>;
@@ -326,6 +385,11 @@ export class WTinyLfu<K = unknown, V = unknown> implements LiteCache<K, V> {
   delete(key: K): boolean;
   clear(): void;
   purgeStale(): number;
+  /** Live runtime counters (decisions/0019). BORROWED holder -- copy what you keep;
+   *  throws on an instance built without { stats: true } (fail-closed). */
+  stats(): CacheStats;
+  /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
+  resetStats(): void;
   keys(): IterableIterator<K>;
   values(): IterableIterator<V>;
   entries(): IterableIterator<[K, V]>;

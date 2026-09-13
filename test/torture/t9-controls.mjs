@@ -17,12 +17,14 @@
  *   C6 a growing int index buffer             -> validate()'s stability check fails
  *   C7 a SIEVE get that PROMOTES on hit        -> diverges from the sieve oracle
  *   C8 an S3-FIFO get that GRADUATES on touch  -> diverges from the s3fifo oracle
+ *   C-stats-double-count  a put that counts puts twice -> brute-tally parity fails
+ *   C-stats-counts-peek   a peek that credits a hit    -> brute-tally parity fails
  */
 
 import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, wrapWTinyLfu, validate,
-    lruPolicy, check, die,
+    lruPolicy, check, die, makePrng,
 } from './harness.mjs';
 import { makeLruOracle } from './oracles/lru.mjs';
 import { makeFifoOracle } from './oracles/fifo.mjs';
@@ -172,6 +174,62 @@ class StalePromotesLru extends LiteLru {
         this._moveToFront(s);
         return this._vals[s];
     }
+}
+
+/** C-stats-double-count (decisions/0019): a put that increments `puts` TWICE. The
+ *  counting law (D19.2) is exactly one `puts++` per put call; double-counting MUST
+ *  diverge from a brute tally recomputed independently of the instance counters. */
+class DoubleCountPutLru extends LiteLru {
+    put(key, value, ttlMs) {
+        super.put(key, value, ttlMs);
+        if (this._stats !== null) this._stats.puts++; // BUG: a second, spurious puts++
+    }
+}
+
+/** C-stats-counts-peek (decisions/0019): a peek that registers a HIT. peek is hit/miss-
+ *  NEUTRAL (D19.2) -- an inspection is not an access; counting it MUST diverge from the
+ *  brute tally, which never credits a peek. */
+class PeekCountsLru extends LiteLru {
+    peek(key) {
+        const v = super.peek(key);
+        if (this._stats !== null && v !== undefined) this._stats.hits++; // BUG: peek is not a hit
+        return v;
+    }
+}
+
+/**
+ * Brute-tally parity (decisions/0019): drive a mixed get/put/peek/has stream against a
+ * stats cache and INDEPENDENTLY recompute the four counters from OBSERVABLE semantics
+ * (never reading the instance counters to decide). A get on a present key is a hit else
+ * a miss; every put is one `puts`, and a put of an absent key at capacity is one
+ * eviction; peek/has are neutral. Returns true iff `cache.stats()` matches the tally.
+ * Non-TTL only, so `has`/`peek` used to probe presence never perturb anything.
+ */
+function bruteTallyMatches(makeCache, opts) {
+    const prng = makePrng(opts.seed);
+    const cache = makeCache(opts.cap);
+    const ks = opts.keyspace;
+    const exp = { hits: 0, misses: 0, evictions: 0, puts: 0 };
+    for (let i = 0; i < opts.ops; i++) {
+        const kind = prng() % 4;
+        const key = prng() % ks;
+        const val = prng() >>> 0;
+        if (kind === 0) {                 // get: hit iff present (non-TTL: has is pure)
+            if (cache.has(key)) exp.hits++; else exp.misses++;
+            cache.get(key);
+        } else if (kind === 1) {          // put: one puts; an absent key at capacity evicts
+            exp.puts++;
+            if (!cache.has(key) && cache.size === opts.cap) exp.evictions++;
+            cache.put(key, val);
+        } else if (kind === 2) {          // peek: neutral
+            cache.peek(key);
+        } else {                          // has: neutral
+            cache.has(key);
+        }
+    }
+    const st = cache.stats();
+    return st.hits === exp.hits && st.misses === exp.misses &&
+        st.evictions === exp.evictions && st.puts === exp.puts;
 }
 
 const leak = [];
@@ -456,6 +514,32 @@ export function run() {
         for (const k of b.keys()) { void k; }
         if (b.size === bSize) {
             die('t9 C-iter-reap: a reaping walk did NOT change size (the no-reap-on-iterate law is toothless)');
+        }
+    }
+
+    // --- C-stats-double-count (decisions/0019): a put that double-counts -> tally diverges
+    // Non-vacuity: a CORRECT stats cache matches the brute tally exactly. Teeth: a put
+    // that increments `puts` twice MUST diverge from the tally.
+    {
+        const opts = { cap: 8, ops: 5000, seed: 0x57A7C0DE, keyspace: 24 };
+        if (!bruteTallyMatches((cap) => new LiteLru(cap, { stats: true }), opts)) {
+            die('t9 C-stats: a correct stats LiteLru did NOT match the brute tally (the tally is vacuous)');
+        }
+        if (bruteTallyMatches((cap) => new DoubleCountPutLru(cap, { stats: true }), opts)) {
+            die('t9 C-stats-double-count: a put that double-counts `puts` did NOT diverge from the brute tally (no teeth)');
+        }
+    }
+
+    // --- C-stats-counts-peek (decisions/0019): a peek that credits a hit -> tally diverges
+    // peek is hit/miss-neutral (D19.2); a peek that increments `hits` MUST diverge from the
+    // brute tally (which never credits a peek). Same corpus as above.
+    {
+        const opts = { cap: 8, ops: 5000, seed: 0x9EEC0FFE, keyspace: 24 };
+        if (!bruteTallyMatches((cap) => new LiteLru(cap, { stats: true }), opts)) {
+            die('t9 C-stats: a correct stats LiteLru did NOT match the brute tally (the tally is vacuous)');
+        }
+        if (bruteTallyMatches((cap) => new PeekCountsLru(cap, { stats: true }), opts)) {
+            die('t9 C-stats-counts-peek: a peek that credits a hit did NOT diverge from the brute tally (no teeth)');
         }
     }
 }

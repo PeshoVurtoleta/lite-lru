@@ -157,12 +157,12 @@ test('(b) member parity: public class methods in Lru.js === members on class Lit
   assert.deepEqual(diffs, [], diffs.join('; '));
   // the full public surface, pinned by name (regex-derived above, listed here as
   // the intended inventory so a silent add/drop on BOTH sides is still caught).
-  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'purgeStale', 'keys', 'values', 'entries', 'size', 'capacity']) {
+  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'purgeStale', 'stats', 'resetStats', 'keys', 'values', 'entries', 'size', 'capacity']) {
     assert.ok(js.has(nm), 'Lru.js class LiteLru is missing public member ' + nm);
     assert.ok(dts.has(nm), 'Lru.d.ts class LiteLru is missing member ' + nm);
   }
-  assert.equal(js.size, 12, 'expected exactly 12 public members in Lru.js, saw ' + js.size);
-  assert.equal(dts.size, 12, 'expected exactly 12 members in Lru.d.ts, saw ' + dts.size);
+  assert.equal(js.size, 14, 'expected exactly 14 public members in Lru.js, saw ' + js.size);
+  assert.equal(dts.size, 14, 'expected exactly 14 members in Lru.d.ts, saw ' + dts.size);
 });
 
 test('(c) family surface: interface LiteCache + class LiteLru implements LiteCache (moat-pillar 1)', () => {
@@ -179,12 +179,12 @@ test('(d) Sieve surface: Sieve is a named export in BOTH sources, members agree,
   assert.deepEqual(diffs, [], diffs.join('; '));
   // The full public surface -- identical inventory to LiteLru (moat-pillar 1: the
   // uniform LiteCache surface every member satisfies).
-  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'purgeStale', 'keys', 'values', 'entries', 'size', 'capacity']) {
+  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'purgeStale', 'stats', 'resetStats', 'keys', 'values', 'entries', 'size', 'capacity']) {
     assert.ok(js.has(nm), 'Lru.js class Sieve is missing public member ' + nm);
     assert.ok(dts.has(nm), 'Lru.d.ts class Sieve is missing member ' + nm);
   }
-  assert.equal(js.size, 12, 'expected exactly 12 public members in Sieve (Lru.js), saw ' + js.size);
-  assert.equal(dts.size, 12, 'expected exactly 12 members in Sieve (Lru.d.ts), saw ' + dts.size);
+  assert.equal(js.size, 14, 'expected exactly 14 public members in Sieve (Lru.js), saw ' + js.size);
+  assert.equal(dts.size, 14, 'expected exactly 14 members in Sieve (Lru.d.ts), saw ' + dts.size);
   assert.ok(sieveImplementsLiteCache(DTS), 'class Sieve must `implements LiteCache<...>`');
 });
 
@@ -196,12 +196,12 @@ test('(e) S3Fifo surface: S3Fifo is a named export in BOTH sources, members agre
   const diffs = setDiff(js, dts, 'Lru.js', 'Lru.d.ts');
   assert.deepEqual(diffs, [], diffs.join('; '));
   // The full public surface -- identical inventory to LiteLru/Sieve (moat-pillar 1).
-  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'purgeStale', 'keys', 'values', 'entries', 'size', 'capacity']) {
+  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'purgeStale', 'stats', 'resetStats', 'keys', 'values', 'entries', 'size', 'capacity']) {
     assert.ok(js.has(nm), 'Lru.js class S3Fifo is missing public member ' + nm);
     assert.ok(dts.has(nm), 'Lru.d.ts class S3Fifo is missing member ' + nm);
   }
-  assert.equal(js.size, 12, 'expected exactly 12 public members in S3Fifo (Lru.js), saw ' + js.size);
-  assert.equal(dts.size, 12, 'expected exactly 12 members in S3Fifo (Lru.d.ts), saw ' + dts.size);
+  assert.equal(js.size, 14, 'expected exactly 14 public members in S3Fifo (Lru.js), saw ' + js.size);
+  assert.equal(dts.size, 14, 'expected exactly 14 members in S3Fifo (Lru.d.ts), saw ' + dts.size);
   assert.ok(s3fifoImplementsLiteCache(DTS), 'class S3Fifo must `implements LiteCache<...>`');
 });
 
@@ -213,12 +213,12 @@ test('(f) WTinyLfu surface: WTinyLfu is a named export in BOTH sources, members 
   const diffs = setDiff(js, dts, 'Lru.js', 'Lru.d.ts');
   assert.deepEqual(diffs, [], diffs.join('; '));
   // The full public surface -- identical inventory to LiteLru/Sieve/S3Fifo (moat-pillar 1).
-  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'purgeStale', 'keys', 'values', 'entries', 'size', 'capacity']) {
+  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'purgeStale', 'stats', 'resetStats', 'keys', 'values', 'entries', 'size', 'capacity']) {
     assert.ok(js.has(nm), 'Lru.js class WTinyLfu is missing public member ' + nm);
     assert.ok(dts.has(nm), 'Lru.d.ts class WTinyLfu is missing member ' + nm);
   }
-  assert.equal(js.size, 12, 'expected exactly 12 public members in WTinyLfu (Lru.js), saw ' + js.size);
-  assert.equal(dts.size, 12, 'expected exactly 12 members in WTinyLfu (Lru.d.ts), saw ' + dts.size);
+  assert.equal(js.size, 14, 'expected exactly 14 public members in WTinyLfu (Lru.js), saw ' + js.size);
+  assert.equal(dts.size, 14, 'expected exactly 14 members in WTinyLfu (Lru.d.ts), saw ' + dts.size);
   assert.ok(wtinylfuImplementsLiteCache(DTS), 'class WTinyLfu must `implements LiteCache<...>`');
 });
 
