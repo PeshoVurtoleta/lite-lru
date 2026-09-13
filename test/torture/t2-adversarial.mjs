@@ -428,4 +428,65 @@ export function run() {
             }
         }
     }
+
+    // --- N: snapshot at the adversarial STRUCTURAL boundaries (decisions/0021) ---
+    // dump()/restore() must survive the same edges the free-list stresses above hit:
+    // an EMPTY cache, a cap-1 cache, a FULL (at-capacity) cache, and a cache sitting
+    // BELOW capacity after deletes (the free-list boundary -- restore must rebuild the
+    // free stack so size + freeListLength === capacity). Every member, both backings.
+    {
+        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo],
+            ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc]];
+        for (const [name, C] of members) {
+            for (const keys of [undefined, 'int']) {
+                const o = keys ? { keys } : undefined;
+
+                // empty cache
+                {
+                    const c = new C(8, o);
+                    const r = C.restore(structuredClone(c.dump()), o);
+                    check(r.size === 0, () => 't2 N ' + name + ': empty restore size ' + r.size);
+                    check(r._freeListLength() === 8, () => 't2 N ' + name + ': empty restore free list != capacity');
+                    validate(r);
+                }
+                // cap-1 cache, full then reused after restore
+                {
+                    const c = new C(1, o);
+                    c.put(7, 70);
+                    const r = C.restore(structuredClone(c.dump()), o);
+                    check(r.size === 1 && r.get(7) === 70, () => 't2 N ' + name + ': cap-1 restore lost the entry');
+                    r.put(9, 90); // must evict 7 and reuse the sole slot
+                    check(r.size === 1 && r.get(9) === 90, () => 't2 N ' + name + ': cap-1 restore not reusable');
+                    validate(r);
+                }
+                // FULL at capacity, churned so all lists/ghosts/sketch/p are populated
+                {
+                    const c = new C(16, o);
+                    for (let i = 0; i < 60; i++) c.put(i % 24, i);
+                    for (let i = 0; i < 16; i++) c.get((i * 5) % 24);
+                    check(c.size === 16, () => 't2 N ' + name + ': setup not full');
+                    const r = C.restore(structuredClone(c.dump()), o);
+                    check(r.size === 16, () => 't2 N ' + name + ': full restore size ' + r.size);
+                    check(r._freeListLength() === 0, () => 't2 N ' + name + ': full restore free list != 0');
+                    validate(r);
+                }
+                // BELOW capacity after deletes: the free-list boundary
+                {
+                    const c = new C(16, o);
+                    for (let i = 0; i < 16; i++) c.put(i, i * 3);
+                    for (let i = 0; i < 6; i++) c.delete(i * 2); // punch holes -> size 10 of 16
+                    check(c.size === 10, () => 't2 N ' + name + ': hole-punch setup size ' + c.size);
+                    const r = C.restore(structuredClone(c.dump()), o);
+                    check(r.size === 10, () => 't2 N ' + name + ': below-cap restore size ' + r.size);
+                    check(r.size + r._freeListLength() === 16,
+                        () => 't2 N ' + name + ': below-cap restore conservation broken');
+                    validate(r);
+                    // Refill to capacity after restore -- the rebuilt free list must serve.
+                    for (let i = 100; r.size < 16; i++) r.put(i, i);
+                    check(r.size === 16, () => 't2 N ' + name + ': restored cache not refillable to capacity');
+                    validate(r);
+                }
+            }
+        }
+    }
 }

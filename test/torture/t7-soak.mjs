@@ -11,7 +11,7 @@
  * the payload refs). The census is the teeth for that.
  */
 
-import { LiteLru, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../../Lru.js';
 import { createLeakTracker } from '@zakkster/lite-leak';
 import { check, validate, censusOk, settleGc } from './harness.mjs';
 
@@ -277,5 +277,42 @@ export async function run() {
         check(ttlrefs.length > 0, () => 't7 ttl: census sample was empty (nothing to prove)');
         check(censusOk(ttlrefs),
             () => 't7 ttl: an expired/evicted/cleared value is still live -- the _exp column is retaining values');
+    }
+
+    // --- Snapshot soak (decisions/0021): 4096 dump/restore cycles conserve + no leak
+    // Each cycle: churn a member PAST capacity, validate, dump, structuredClone, restore,
+    // validate the restore, confirm size parity, exercise the restored cache, then drop
+    // BOTH caches and the snapshot. The tracker (registered on the original each cycle)
+    // must return to 0 -- neither dump()'s captured value refs nor restore()'s fresh
+    // instance may outlive the cycle. A WeakRef census proves the sampled value objects
+    // (held only via the caches / the snapshot during the cycle) are collectible after
+    // teardown -- a snapshot that pinned values past its own lifetime is a leak.
+    {
+        const snaptracker = createLeakTracker({ name: 'snapshot-soak' });
+        const srefs = [];
+        const MEM = [LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc];
+        for (let cyc = 0; cyc < 4096; cyc++) {
+            const C = MEM[cyc % MEM.length];
+            const cache = new C(CAP, { keys: 'int' });
+            const h = snaptracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
+            for (let i = 0; i < CAP * 2; i++) {
+                const val = { c: cyc, i };
+                cache.put(cyc * 100000 + i, val); // distinct int keys within int32 range
+                if ((cyc & 511) === 0 && (i & 31) === 0) srefs.push(new WeakRef(val));
+            }
+            check(cache.size === CAP, () => 't7 snap: not full mid-life (size ' + cache.size + ')');
+            validate(cache);
+            const restored = C.restore(structuredClone(cache.dump()), { keys: 'int' });
+            check(restored.size === cache.size, () => 't7 snap: restored size drift (cycle ' + cyc + ')');
+            validate(restored);
+            for (let i = 0; i < 8; i++) restored.put(-1 - i, { c: cyc, r: i }); // exercise the restore
+            validate(restored);
+            snaptracker.untrack(h);
+        }
+        check(snaptracker.size() === 0, () => 't7 snap: leak tracker size ' + snaptracker.size() + ' != 0 after churn');
+        await settleGc(6);
+        check(srefs.length > 0, () => 't7 snap: census sample was empty (nothing to prove)');
+        check(censusOk(srefs),
+            () => 't7 snap: a value captured by a dropped snapshot/cache is still live -- a retention leak');
     }
 }

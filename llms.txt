@@ -12,7 +12,7 @@ dependencies, node:test only. Ships a runnable + importable benchmark tool
 (Bench.mjs) with Belady OPT so a caller measures which policy fits their trace
 instead of guessing.
 
-## Status: 1.7.0 - the no-tuning adaptive member Arc (ARC, Megiddo & Modha FAST'03; patent expired): a RECENT list T1 + a FREQUENT list T2 + two bounded keys-only ghosts B1/B2 driving a self-tuning integer p (the T1/T2 split target), as ONE new named export over the shared substrate (NOT a mode flag - D16.1), each hot path monomorphic, on the SAME LiteCache<K,V> surface; a B1 ghost hit raises p, a B2 ghost hit lowers it (D16.3); RESIDENT value capacity stays EXACTLY capacity - only the split adapts (D16.2); bounds |T1|+|B1| <= c and |B1|+|B2| <= c validated; a cap-sized distinct-key scan evicts 0 T2 entries; Gate ARC 0.00176 B/op mixed int churn at capacity 4096 with non-vacuous lane coverage (p-adapt 15173 / B1-hit 7569 / B2-hit 7604 / REPLACE-T2 18926); the shipped Bench.mjs now rosters all seven members - atop the scan-resistant baselines Slru/TwoQ (1.6.0), opt-in zero-GC stats (1.5.0), zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool.
+## Status: 1.8.0 - snapshot / restore across all seven members: a COLD dump() + static restore(snap, opts?) over the shared substrate (the SoA columns ARE the serial form - D21.1), with NO field added to the substrate and NO branch in get/put/has/peek, so the existing hot paths stay byte-identical. A rehydrated cache makes IDENTICAL future eviction decisions vs an un-snapshotted twin: the slot layout is captured verbatim along with every member's future-eviction aux (SIEVE hand + visited bits, S3Fifo/TwoQ/Arc keys-only ghosts, WTinyLfu Count-Min sketch + aging counter, Arc p, _seg tags, _exp when ttl on) - dropping any of it is fail-OPEN and is pinned by t9 controls. restore() is fail-closed via a {f,m,cap,keys,ttl,t} tag: wrong format/member/backing/ttl/capacity, a corrupt/short/missing column (incl. the visited-bit column), an out-of-range or duplicate slot index, and entries > cap all throw [lite-lru] and never truncate (D21.3, capacity law honored). TTL is captured VERBATIM (absolute ms-epoch deadlines, NOT rebased; the capture time t is stamped so a future opt-in rebase needs no format bump - D21.5); a restored stats holder starts fresh (D21.6). Gate SNAP 0.00000 B/op on the restored hot path, dump 26.12 B/entry (<= 96 budget), writes-per-hit 0/5/4 unchanged - atop the no-tuning adaptive member Arc (1.7.0), the scan-resistant baselines Slru/TwoQ (1.6.0), opt-in zero-GC stats (1.5.0), zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool.
 
 The family is the identity from v1.0.0: classic LRU is the reference member +
 differential oracle + honest floor, SIEVE is the headline, and the shipped
@@ -131,6 +131,12 @@ new WTinyLfu(n), new Slru(n), new TwoQ(n) or new Arc(n) and stays type-checked.
   else throws a [lite-lru] Error (fail-closed). (STATS)
 - resetStats() -> void. Zero the four counters IN PLACE (a borrowed holder stays
   valid). Requires { stats: true }, else throws (fail-closed). (STATS)
+- dump() -> CacheSnapshot. Serialize to a plain, structurally-cloneable snapshot
+  (cold, MAY allocate <= 96 B/entry -- no zero-GC claim). Read-only (does not
+  invalidate a live iterator). (SNAPSHOT)
+- static Member.restore(snap, opts?) -> a FRESH instance. Backing/capacity/ttl-
+  presence come FROM the snapshot; opts re-derives onEvict/clock/stats and supplies
+  the ttl default when ttl is on. Fail closed on any mismatch. (SNAPSHOT)
 - size -> number (0 .. capacity, getter). capacity -> number (getter).
 
 ## Construction options
@@ -233,6 +239,42 @@ new WTinyLfu(n), new Slru(n), new TwoQ(n) or new Arc(n) and stays type-checked.
   LiteLru 0/5/4, Sieve/S3Fifo 0 links + 1 vis, WTinyLfu window-MRU 0). A get()-induced
   reorder mid-walk is documented-unsupported (not caught).
 
+## Snapshot / restore (decisions/0021, D21)
+
+- Persist a warm cache and bring it back warm. dump() -> a plain, structurally-
+  cloneable snapshot; Member.restore(snap, opts?) -> a FRESH instance. All seven
+  members, one LiteCache<K,V> surface. COLD: no substrate field, no hot-path branch --
+  a cache that never dumps is byte-identical to the pre-snapshot build.
+- EXACT round-trip (D21.1/D21.4): a restored cache decides FUTURE evictions identically
+  to the un-snapshotted twin fed the same trace. Slots are preserved verbatim, so every
+  member captures ALL policy aux: Sieve's hand + visited bits; S3Fifo/TwoQ's keys-only
+  ghost; W-TinyLFU's Count-Min sketch + aging counter; Arc's adaptive p + both ghosts.
+  Dropping any of these is a fail-OPEN bug (t9 arc-p-dropped / sketch-dropped /
+  ghost-omitted each diverge).
+- Plain graph (D21.1): plain arrays + plain numbers/values, NO typed-array views, so it
+  round-trips through structuredClone (and JSON for JSON-safe keys/values). Object keys
+  clone under structuredClone (new identity) -- documented, not a bug.
+- Tag + fail-closed (D21.3): every snapshot carries { f:'litelru/1', m, cap,
+  keys:'int'|null, ttl:bool, t:captureMs, ... }. restore() throws a [lite-lru] Error on
+  a wrong/absent format tag, a member mismatch, a capacity/keys/ttl conflict vs opts, a
+  corrupt/short/missing field, and entries > cap (REJECT, never truncate -- capacity law
+  3). Restored size <= capacity always. null is not zero.
+- opts (D21.2): backing/capacity/ttl-presence come FROM the snapshot; onEvict/clock/
+  stats are RE-DERIVED from opts (a restored { stats: true } instance starts fresh-
+  zeroed); the ttl DEFAULT is REQUIRED in opts when the snapshot has ttl on.
+- TTL verbatim (D21.5, owner ruling): expiries are captured as ABSOLUTE ms deadlines,
+  NOT rebased -- a restored entry expires exactly when it would have without the
+  snapshot. The tag stamps capture time t so a future opt-in rebase is possible without
+  a format bump (rebase is a non-goal this session).
+- Cost (D21.6): dump budget <= 96 B/entry honest (measured 26.12 for LiteLru at cap
+  4096; no zero-GC claim). A RESTORED cache's hot path is strict zero-alloc (0 B/op),
+  backings never grow, writes-per-hit unchanged. dump() is read-only (no _ver bump), so
+  a walk in progress is not invalidated.
+- Gated: t6 Gate SNAP (0 B/op restored hot path + dump B/entry + writes-per-hit), t5
+  round-trip differential over the 100k corpus (all seven members x both backings x ttl
+  off/on), Snapshot.test.js (round-trip identity + 8 rejections + capacity law + interop
+  + degenerate caps/keys/values), t7 4096 dump/restore cycles, t9 three drop controls.
+
 ## Invariants (suite CLAUDE.md + ROADMAP)
 
 - Zero allocation on every hot path (get/put/delete/has/peek), for ALL members.
@@ -274,7 +316,7 @@ drops LiteLru's body from the bundle (and vice versa). The shared substrate is
 INTERNAL, not an export; there is NO subpath-per-policy. Bench.mjs is a separate
 runnable tool, not a second implementation.
 
-## API (1.7.0)
+## API (1.8.0)
 
 Named exports from @zakkster/lite-lru:
 
@@ -285,7 +327,7 @@ Named exports from @zakkster/lite-lru:
 - Slru: the Segmented-LRU member.
 - TwoQ: the full-2Q member.
 - Arc: the Adaptive Replacement Cache member.
-- VERSION: '1.7.0'
+- VERSION: '1.8.0'
 
 Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
@@ -294,10 +336,10 @@ Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
 ## Testing
 
-- npm test        -- 987 node:test cases (all seven members, recency/SIEVE/S3-FIFO/
+- npm test        -- 1077 node:test cases (all seven members, recency/SIEVE/S3-FIFO/
   W-TinyLFU/Slru/TwoQ laws, TTL laws + fail-closed + purgeStale, stats parity,
-  iteration order, degenerate keys/values + degenerate caps 1..4, dts drift,
-  family surface).
+  iteration order, snapshot/restore round-trip + fail-closed, degenerate keys/values
+  + degenerate caps 1..4, dts drift, family surface).
 - npm run test:types -- tsc: the LiteCache<K,V> surface + the one-line-swap check.
 - npm run torture -- @zakkster/lite-leak + lite-gc-profiler, --expose-gc: prints
   "ok"; tiers t0/t1/t2/t5/t6/t7/t8/t9 (t8 = the Belady OPT gate).

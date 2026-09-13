@@ -927,4 +927,103 @@ export async function run() {
     }
     process.stderr.write('t6 Gate STATS: ' + gsta.bytesPerCall.toFixed(5) +
         ' B/op stats-ON churn (' + OPS + ' ops window, capacity ' + CAP + ')\n');
+
+    // --- Gate SNAP: snapshot/restore (decisions/0021, D21) ----------------------
+    // dump()/restore() are COLD and off the hot body -- no substrate field, no hot-path
+    // branch. This gate proves FOUR things:
+    //   (1) dump() honors its honest <= 96 B/entry budget (measured; no zero-GC claim).
+    //   (2) writes-per-hit is UNCHANGED by the snapshot code (0/5/4 -- same as Gate 3),
+    //       i.e. adding dump/restore perturbed no hot path.
+    //   (3) a RESTORED cache's hot path is STRICT zero-alloc (get re-hit + int insert/evict
+    //       churn), with every backing byteLength invariant across the window.
+    // Restore rebuilds a fresh instance; if it left the free list / index in a state that
+    // forced a grow-on-next-op, this gate's byteLength checks would catch it.
+    {
+        // (1) dump budget. A full int-backed cache; measure retained bytes across many
+        // dumps held live, divided by (dumps * entries).
+        const full = new LiteLru(CAP, { keys: 'int' });
+        for (let i = 0; i < CAP; i++) full.put(i, i * 3 + 1);
+        check(full.size === CAP, () => 't6 Gate SNAP: dump-budget pre-fill did not reach capacity');
+        globalThis.gc(); globalThis.gc();
+        const heapBefore = process.memoryUsage().heapUsed;
+        const held = [];
+        const DUMPS = 40;
+        for (let i = 0; i < DUMPS; i++) held.push(full.dump());
+        globalThis.gc(); globalThis.gc();
+        const heapAfter = process.memoryUsage().heapUsed;
+        const bytesPerEntry = (heapAfter - heapBefore) / (DUMPS * CAP);
+        check(held.length === DUMPS && held[0].m === 'LiteLru' && held[0].list.slots.length === CAP,
+            () => 't6 Gate SNAP: dump did not capture the full cache');
+        check(bytesPerEntry <= 96,
+            () => 't6 Gate SNAP: dump measured ' + bytesPerEntry.toFixed(2) + ' B/entry (> 96 budget)');
+        held.length = 0;
+
+        // (2) writes-per-hit unchanged (0/5/4) -- the snapshot code added no hot-path cost.
+        const NW = 8;
+        const cw1 = new CountedLru(NW); for (let i = 0; i < NW; i++) cw1.put(i, i);
+        cw1.resetWrites(); cw1.get(NW - 1);
+        check(cw1.writes() === LRU_WRITES_HEAD_REHIT,
+            () => 't6 Gate SNAP: head re-hit wrote ' + cw1.writes() + ', expected ' + LRU_WRITES_HEAD_REHIT);
+        const cw2 = new CountedLru(NW); for (let i = 0; i < NW; i++) cw2.put(i, i);
+        cw2.resetWrites(); cw2.get(4);
+        check(cw2.writes() === LRU_WRITES_INTERIOR_REHIT,
+            () => 't6 Gate SNAP: interior re-hit wrote ' + cw2.writes() + ', expected ' + LRU_WRITES_INTERIOR_REHIT);
+        const cw3 = new CountedLru(NW); for (let i = 0; i < NW; i++) cw3.put(i, i);
+        cw3.resetWrites(); cw3.get(0);
+        check(cw3.writes() === LRU_WRITES_TAIL_REHIT,
+            () => 't6 Gate SNAP: tail re-hit wrote ' + cw3.writes() + ', expected ' + LRU_WRITES_TAIL_REHIT);
+
+        // (3a) restored cache: get() re-hit hot loop is zero-alloc, backings invariant.
+        const rc = LiteLru.restore(full.dump(), { keys: 'int' });
+        check(rc.size === CAP, () => 't6 Gate SNAP: restored size ' + rc.size + ' != capacity');
+        const rcNext = rc._next.buffer.byteLength;
+        const rcPrev = rc._prev.buffer.byteLength;
+        const rcSlot = rc._store._ixSlot.buffer.byteLength;
+        const rcKey = rc._store._ixKey.buffer.byteLength;
+        const snapSink = new Int32Array(1);
+        const rcGetHot = (i) => { snapSink[0] += rc.get(i & MASK) | 0; };
+        const gr = runOpsGate(rcGetHot, { ops: OPS, warmup: WARMUP });
+        check(rc._next.buffer.byteLength === rcNext && rc._prev.buffer.byteLength === rcPrev,
+            () => 't6 Gate SNAP: restored _next/_prev grew under the get loop');
+        check(rc._store._ixSlot.buffer.byteLength === rcSlot && rc._store._ixKey.buffer.byteLength === rcKey,
+            () => 't6 Gate SNAP: restored int index buffers grew under the get loop');
+        if (!gr.report.ok) {
+            const g = gr.summary.gc;
+            die('t6 Gate SNAP (restored get re-hit) ops gate rejected -- verdict=' + gr.report.verdict +
+                ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+        }
+        const gra = runAllocsGate(rcGetHot, { iterations: 50000, batches: 8 });
+        if (!gra.ok) {
+            die('t6 Gate SNAP (restored get re-hit) retained-alloc gate rejected -- verdict=' + gra.report.verdict +
+                ' settled=' + gra.result.settled + ' bytesPerCall=' + gra.bytesPerCall);
+        }
+
+        // (3b) restored int cache: fresh-key insert+evict churn is zero-alloc and the
+        // rebuilt free list + index never grow (the restore path did not corrupt them).
+        const rc2 = LiteLru.restore(full.dump(), { keys: 'int' });
+        const rc2Next = rc2._next.buffer.byteLength;
+        const rc2Slot = rc2._store._ixSlot.buffer.byteLength;
+        const rc2Key = rc2._store._ixKey.buffer.byteLength;
+        let rk = CAP;
+        const rcChurn = () => { rc2.put(rk, rk & 0xffff); rk++; };
+        const grc = runOpsGate(rcChurn, { ops: OPS, warmup: WARMUP });
+        check(rc2._next.buffer.byteLength === rc2Next,
+            () => 't6 Gate SNAP: restored churn grew _next');
+        check(rc2._store._ixSlot.buffer.byteLength === rc2Slot && rc2._store._ixKey.buffer.byteLength === rc2Key,
+            () => 't6 Gate SNAP: restored churn grew the int index buffers');
+        check(rc2.size === CAP, () => 't6 Gate SNAP: restored churn drifted from capacity (' + rc2.size + ')');
+        if (!grc.report.ok) {
+            const g = grc.summary.gc;
+            die('t6 Gate SNAP (restored churn) ops gate rejected -- verdict=' + grc.report.verdict +
+                ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+        }
+        const grca = runAllocsGate(rcChurn, { iterations: 50000, batches: 8 });
+        if (!grca.ok) {
+            die('t6 Gate SNAP (restored churn) retained-alloc gate rejected -- verdict=' + grca.report.verdict +
+                ' settled=' + grca.result.settled + ' bytesPerCall=' + grca.bytesPerCall);
+        }
+        process.stderr.write('t6 Gate SNAP: ' + gra.bytesPerCall.toFixed(5) +
+            ' B/op restored get re-hit, ' + grca.bytesPerCall.toFixed(5) + ' B/op restored churn; dump ' +
+            bytesPerEntry.toFixed(2) + ' B/entry (<= 96), writes-per-hit 0/5/4 unchanged (capacity ' + CAP + ')\n');
+    }
 }

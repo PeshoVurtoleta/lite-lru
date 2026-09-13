@@ -24,7 +24,7 @@
 import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, wrapWTinyLfu,
-    wrapSlru, wrapTwoQ, wrapArc, validate,
+    wrapSlru, wrapTwoQ, wrapArc, validate, runRoundTrip,
     lruPolicy, check, die, makePrng,
 } from './harness.mjs';
 import { makeLruOracle } from './oracles/lru.mjs';
@@ -722,6 +722,57 @@ export function run() {
         }
         if (bruteTallyMatches((cap) => new PeekCountsLru(cap, { stats: true }), opts)) {
             die('t9 C-stats-counts-peek: a peek that credits a hit did NOT diverge from the brute tally (no teeth)');
+        }
+    }
+
+    // --- C-snap-* (decisions/0021, D21): a restore that DROPS aux state MUST diverge ---
+    // from the un-snapshotted twin (the round-trip differential). Dropping aux state is a
+    // fail-OPEN correctness bug: the restored cache would make DIFFERENT future eviction
+    // decisions. Three controls, one per kind of dropped aux; each runs the SAME
+    // differential the t5 snapshot gate uses. Non-vacuity: the CORRECT restore agrees.
+    {
+        const cfg = { cap: 64, pre: 40000, ops: 60000, keyspace: 200, seed: 0x5ADC0DE };
+
+        // arc-p-dropped: restore forgets the adaptive integer `p` (pins it to 0). REPLACE's
+        // victim choice then drifts from the twin (whose p was preserved).
+        class PDroppedArc extends Arc {
+            static restore(snap, opts) { const inst = Arc.restore(snap, opts); inst._p = 0; return inst; }
+        }
+        // sketch-dropped: restore leaves the Count-Min sketch zeroed (drops frequency
+        // history). Admission then differs from the twin (whose sketch was preserved).
+        class SketchDroppedWTinyLfu extends WTinyLfu {
+            static restore(snap, opts) {
+                const copy = Object.assign({}, snap, { sk: new Array(snap.sk.length).fill(0), skSize: 0 });
+                return WTinyLfu.restore(copy, opts);
+            }
+        }
+        // ghost-omitted: restore drops the keys-only ghost. A ghost re-sighting that the
+        // twin admits straight to MAIN instead enters SMALL -> the victim drifts.
+        class GhostOmittedS3Fifo extends S3Fifo {
+            static restore(snap, opts) {
+                const copy = Object.assign({}, snap, { ghost: [] });
+                return S3Fifo.restore(copy, opts);
+            }
+        }
+
+        const controls = [
+            { name: 'arc-p-dropped', broken: { Ctor: PDroppedArc, wrap: wrapArc }, real: { Ctor: Arc, wrap: wrapArc } },
+            { name: 'sketch-dropped', broken: { Ctor: SketchDroppedWTinyLfu, wrap: wrapWTinyLfu }, real: { Ctor: WTinyLfu, wrap: wrapWTinyLfu } },
+            { name: 'ghost-omitted', broken: { Ctor: GhostOmittedS3Fifo, wrap: wrapS3Fifo }, real: { Ctor: S3Fifo, wrap: wrapS3Fifo } },
+        ];
+        for (const ctl of controls) {
+            // Non-vacuity: the CORRECT round-trip agrees with the twin (also proven in t5).
+            const okr = runRoundTrip(ctl.real, cfg);
+            if (!okr.ok) {
+                die('t9 C-snap-' + ctl.name + ': the CORRECT round-trip diverged (' + okr.why +
+                    ') -- the differential is vacuous');
+            }
+            // Teeth: dropping the aux state MUST diverge from the twin.
+            const br = runRoundTrip(ctl.broken, cfg);
+            if (br.ok) {
+                die('t9 C-snap-' + ctl.name + ': a restore that drops the aux state did NOT diverge ' +
+                    'from the twin (the round-trip differential is toothless)');
+            }
         }
     }
 }

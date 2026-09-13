@@ -26,6 +26,18 @@
  *
  * Zero dependency on the profiler so `node --test` can import it without pulling
  * the torture peers. Throws an Error naming the first violation, or returns void.
+ *
+ * SNAPSHOT/RESTORE (decisions/0021, D21): NO new conservation term is warranted.
+ * `restore()` reconstructs a fully-consistent instance -- it rebuilds the free stack,
+ * relinks every intrusive list, re-stamps the segment/queue tags + visited bits + the
+ * `_exp` column, and replays the ghosts -- so the SAME terms already assert its
+ * correctness: `size + freeListLength === capacity`, `index.size === size`, list
+ * reciprocity, the per-member segment/ghost/sketch/`p` bounds, and (under ttl) the
+ * `_exp` free-slot-Infinity + fixed-buffer terms. A snapshot that would violate any of
+ * these on load is rejected fail-closed inside `restore()` before it returns (D21.3),
+ * and the torture t2/t5/t7 tiers run `validate()` on every restored cache. So the
+ * invariant is unchanged; this note records that "no new term" is a decision, not an
+ * oversight.
  */
 
 const NIL = -1;

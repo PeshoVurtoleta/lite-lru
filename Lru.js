@@ -212,7 +212,7 @@ function validateStats(stats) {
         "[lite-lru] unknown stats option " + String(stats) + " (did you mean true?)");
 }
 
-export const VERSION = "1.7.0";
+export const VERSION = "1.8.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -302,6 +302,20 @@ class SlotStore {
         this._free = 0;
         if (this._exp !== null) this._exp.fill(Infinity); // reset expiries (decisions/0017)
         this.clearIndex();
+    }
+
+    /** Rebuild the free stack over the slots NOT marked occupied (decisions/0021, D21).
+     *  COLD -- used only by `restore()`, never on a hot path -- so it may take an
+     *  `occupied` Uint8Array. Threads the free list highest-slot-first so the head pops
+     *  the lowest free slot first (mirrors the constructor's 0 -> 1 -> ... order). Frees
+     *  read Infinity in `_exp` because `restore` only ever writes occupied slots. */
+    rebuildFreeList(occupied) {
+        const cap = this._capacity, next = this._next;
+        let head = NIL;
+        for (let s = cap - 1; s >= 0; s--) {
+            if (occupied[s] === 0) { next[s] = head; head = s; }
+        }
+        this._free = head;
     }
 }
 
@@ -522,6 +536,277 @@ class CacheIterator {
 function iterKeys(cache) { return new CacheIterator(cache, ITER_KEYS, cache._iterHeads()); }
 function iterValues(cache) { return new CacheIterator(cache, ITER_VALUES, cache._iterHeads()); }
 function iterEntries(cache) { return new CacheIterator(cache, ITER_ENTRIES, cache._iterHeads()); }
+
+/* -------------------------------------------------------------------------- *
+ * Snapshot / restore -- the shared COLD (dump/restore) machinery (decisions/0021,
+ * D21). INTERNAL, never an export. dump() and restore() NEVER touch the hot body:
+ * no field is added to the substrate, and get/put/has/peek gain NO branch. Every
+ * function here is cold -- it MAY allocate (the honest <= 96 B/entry dump budget).
+ *
+ * A snapshot is a plain, structurally-cloneable object graph (plain arrays + plain
+ * numbers/values, NO typed-array views), tagged fail-closed with:
+ *   { f:'litelru/1', m:<member>, cap, keys:'int'|null, ttl:<bool>, t:<captureMs>, ... }
+ * plus per-member resident lists (walked in the member's iteration order, one
+ * ordered `slots`/`k`/`v`(/`e`/`vis`) column set per intrusive list) and per-member
+ * aux state (Sieve hand, S3Fifo/TwoQ/Arc ghosts, W-TinyLFU sketch, Arc `p`).
+ *
+ * D21.1 -- EXACT round-trip: restore reconstructs the SAME slot layout, links, per-
+ * slot aux bits, and verbatim aux state, so a restored cache makes IDENTICAL future
+ * eviction decisions vs an un-snapshotted twin fed the same trace. Preserving slots
+ * verbatim is what keeps W-TinyLFU's slot-hashed object-key frequency exact.
+ * -------------------------------------------------------------------------- */
+
+/** The snapshot format tag (decisions/0021, D21.3). A version bump here is the ONLY
+ *  compatible way to change the on-the-wire shape; restore rejects any other value. */
+const SNAP_FORMAT = "litelru/1";
+
+/** Fail-closed prefix for every restore rejection (decisions/0021, D21.3). "null is
+ *  not zero": a corrupt/mismatched snapshot is a caller bug, never a silent empty cache. */
+const SNAP_BAD = "[lite-lru] cannot restore snapshot: ";
+
+/** Base tag for a dump (decisions/0021, D21.3). `keys` is the backing kind ('int' for
+ *  the open-addressed typed-array index, else null for the Map backing), `ttl` records
+ *  whether an `_exp` column exists, and `t` stamps capture time (D21 TTL-verbatim note). */
+function snapBase(cache, member) {
+    return {
+        f: SNAP_FORMAT,
+        m: member,
+        cap: cache._capacity,
+        keys: (typeof cache._store.checkStable === "function") ? "int" : null,
+        ttl: cache._exp !== null,
+        t: cache._clock(),
+    };
+}
+
+/** Capture one intrusive list (head -> _next -> NIL) as aligned plain arrays: the
+ *  ordered `slots`, keys `k`, values `v`, plus `e` (expiry) when ttl is on and `vis`
+ *  (visited byte) when the member has a `_vis` column. Cold; MAY allocate (D21). */
+function snapList(cache, head, withVis) {
+    const next = cache._next, keys = cache._keys, vals = cache._vals, exp = cache._exp;
+    const slots = [], k = [], v = [];
+    const e = exp !== null ? [] : null;
+    const vis = withVis ? [] : null;
+    for (let s = head; s !== NIL; s = next[s]) {
+        slots.push(s); k.push(keys[s]); v.push(vals[s]);
+        if (e !== null) e.push(exp[s]);
+        if (vis !== null) vis.push(cache._vis[s]);
+    }
+    const o = { slots, k, v };
+    if (e !== null) o.e = e;
+    if (vis !== null) o.vis = vis;
+    return o;
+}
+
+/** Capture the S3-FIFO / TwoQ keys-only ghost FIFO oldest -> newest (decisions/0013,
+ *  0015). KEYS only, never values (retention hygiene). Cold. */
+function snapGhostRing(cache) {
+    const out = [];
+    const cap = cache._ghostCap, len = cache._gLen, head = cache._gHead;
+    if (cap === 0 || len === 0) return out;
+    if (cache._ghostInt) {
+        const mask = cache._gRingMask;
+        for (let i = 0; i < len; i++) out.push(cache._gRing[(head + i) & mask]);
+    } else {
+        for (let i = 0; i < len; i++) out.push(cache._gRingArr[(head + i) % cap]);
+    }
+    return out;
+}
+
+/** Capture an ArcGhost (B1/B2) oldest -> newest (decisions/0016). KEYS only. Cold. */
+function snapArcGhost(g) {
+    const out = [];
+    if (g._cap === 0 || g._len === 0) return out;
+    if (g._int) {
+        const mask = g._ringMask;
+        for (let i = 0; i < g._len; i++) out.push(g._ring[(g._head + i) & mask]);
+    } else {
+        for (let i = 0; i < g._len; i++) out.push(g._ringArr[(g._head + i) % g._cap]);
+    }
+    return out;
+}
+
+/** Validate + reject a snapshot's shared tag, cross-check it against the restore opts,
+ *  and return the capacity (decisions/0021, D21.3). Fail closed (throws a
+ *  `[lite-lru]`-tagged Error) on: a non-object; a wrong/absent format tag `f`; a member
+ *  mismatch `m`; a bad capacity; a bad keys/ttl flag; a capacity/keys/ttl conflict with
+ *  an opt actually passed; and a missing ttl option when the snapshot needs one. */
+function snapRead(snap, member, opts) {
+    if (snap === null || typeof snap !== "object") {
+        throw new Error(SNAP_BAD + "snapshot must be a plain object, got " + String(snap));
+    }
+    if (snap.f !== SNAP_FORMAT) {
+        throw new Error(SNAP_BAD + "format tag f must be '" + SNAP_FORMAT + "', got " + String(snap.f));
+    }
+    if (snap.m !== member) {
+        throw new Error(SNAP_BAD + "member mismatch: snapshot is " + String(snap.m) + ", restoring " + member);
+    }
+    const cap = snap.cap;
+    if (!Number.isInteger(cap) || cap < 1) {
+        throw new Error(SNAP_BAD + "capacity must be an integer >= 1, got " + String(cap));
+    }
+    if (snap.keys !== "int" && snap.keys !== null) {
+        throw new Error(SNAP_BAD + "keys backing must be 'int' or null, got " + String(snap.keys));
+    }
+    if (typeof snap.ttl !== "boolean") {
+        throw new Error(SNAP_BAD + "ttl flag must be a boolean, got " + String(snap.ttl));
+    }
+    const o = opts || {};
+    if (o.capacity !== undefined && o.capacity !== cap) {
+        throw new Error(SNAP_BAD + "capacity opt (" + String(o.capacity) + ") conflicts with the snapshot (" + cap + ")");
+    }
+    if (o.keys !== undefined && ((o.keys === "int") !== (snap.keys === "int"))) {
+        throw new Error(SNAP_BAD + "keys opt (" + String(o.keys) + ") conflicts with the snapshot backing (" + String(snap.keys) + ")");
+    }
+    if (snap.ttl) {
+        if (o.ttl === undefined) {
+            throw new Error(SNAP_BAD + "snapshot has ttl on; restore requires a { ttl } option (the future default is not encoded)");
+        }
+    } else if (o.ttl !== undefined) {
+        throw new Error(SNAP_BAD + "a { ttl } option was given but the snapshot has ttl off (presence mismatch)");
+    }
+    return cap;
+}
+
+/** Build the constructor options for a fresh restore target from the snapshot tag +
+ *  the passed opts (decisions/0021, D21.2): backing + ttl-presence come FROM the
+ *  snapshot; onEvict/clock/stats are RE-DERIVED from opts; stats starts fresh-zeroed. */
+function snapOpts(snap, opts) {
+    const o = opts || {};
+    const c = {};
+    if (snap.keys === "int") c.keys = "int";
+    if (snap.ttl) c.ttl = o.ttl;             // required (validated in snapRead); sets the future default
+    if (o.clock !== undefined) c.clock = o.clock;
+    if (o.onEvict !== undefined) c.onEvict = o.onEvict;
+    if (o.stats !== undefined) c.stats = o.stats;
+    return c;
+}
+
+/** Validate one captured list's shape (decisions/0021, D21.3). Rejects a malformed /
+ *  short / column-length-mismatched list, an exp column present iff ttl, a `vis` column
+ *  present iff `withVis` (with each byte 0/1), and any slot index out of [0, cap).
+ *  `withVis` is driven off the SAME per-member roster that WRITES vis (snapCheckOccupy's
+ *  pairs), so a missing/short/non-binary vis column fails closed instead of coercing to
+ *  0 -- "null is not zero". Returns the list length. */
+function snapCheckList(list, cap, ttl, label, withVis) {
+    if (list === null || typeof list !== "object" ||
+        !Array.isArray(list.slots) || !Array.isArray(list.k) || !Array.isArray(list.v)) {
+        throw new Error(SNAP_BAD + "malformed list '" + label + "'");
+    }
+    const n = list.slots.length;
+    if (list.k.length !== n || list.v.length !== n) {
+        throw new Error(SNAP_BAD + "list '" + label + "' column length mismatch");
+    }
+    if (ttl) {
+        if (!Array.isArray(list.e) || list.e.length !== n) {
+            throw new Error(SNAP_BAD + "ttl snapshot list '" + label + "' missing/short exp column");
+        }
+    } else if (list.e !== undefined) {
+        throw new Error(SNAP_BAD + "non-ttl snapshot list '" + label + "' carries an exp column");
+    }
+    if (withVis) {
+        if (!Array.isArray(list.vis) || list.vis.length !== n) {
+            throw new Error(SNAP_BAD + "list '" + label + "' missing/short visited (vis) column");
+        }
+        for (let i = 0; i < n; i++) {
+            const b = list.vis[i];
+            if (b !== 0 && b !== 1) {
+                throw new Error(SNAP_BAD + "list '" + label + "' vis[" + i + "] = " + String(b) + " (must be 0 or 1)");
+            }
+        }
+    } else if (list.vis !== undefined) {
+        throw new Error(SNAP_BAD + "list '" + label + "' carries a visited (vis) column it must not");
+    }
+    for (let i = 0; i < n; i++) {
+        const s = list.slots[i];
+        if (!Number.isInteger(s) || s < 0 || s >= cap) {
+            throw new Error(SNAP_BAD + "list '" + label + "' slot " + String(s) + " out of range [0," + cap + ")");
+        }
+    }
+    return n;
+}
+
+/** Mark every captured list's slots occupied, rejecting a duplicate slot (which would
+ *  corrupt) and a total that exceeds capacity -- capacity law 3, REJECT never truncate
+ *  (decisions/0021, D21.3). Returns the occupied Uint8Array for rebuildFreeList. */
+function snapOccupied(cap, lists) {
+    const occ = new Uint8Array(cap);
+    let total = 0;
+    for (let li = 0; li < lists.length; li++) {
+        const slots = lists[li].slots;
+        for (let i = 0; i < slots.length; i++) {
+            const s = slots[i];
+            if (occ[s] !== 0) throw new Error(SNAP_BAD + "duplicate slot " + s + " across lists");
+            occ[s] = 1; total++;
+        }
+    }
+    if (total > cap) {
+        throw new Error(SNAP_BAD + "resident entries (" + total + ") exceed capacity (" + cap + ")");
+    }
+    return occ;
+}
+
+/** Write one captured list's payload + keyed index into its (preserved) slots
+ *  (decisions/0021, D21.1). Sets `_vis` when the list carries it. Does NOT link -- see
+ *  snapLink -- and does NOT set the segment tag -- see snapSeg. Cold. */
+function snapWriteList(cache, list) {
+    const store = cache._store, keys = cache._keys, vals = cache._vals, exp = cache._exp;
+    const slots = list.slots, k = list.k, v = list.v, e = list.e, vis = list.vis;
+    for (let i = 0; i < slots.length; i++) {
+        const s = slots[i];
+        keys[s] = k[i];
+        vals[s] = v[i];
+        if (exp !== null && e !== undefined) exp[s] = e[i];
+        if (vis !== undefined) cache._vis[s] = vis[i];
+        store.set(k[i], s);
+    }
+}
+
+/** Thread one intrusive list through _prev/_next in the captured order and return its
+ *  { head, tail } endpoints (decisions/0021, D21.1). Cold. */
+function snapLink(cache, slots) {
+    const next = cache._next, prev = cache._prev;
+    const n = slots.length;
+    let head = NIL, tail = NIL;
+    for (let i = 0; i < n; i++) {
+        const s = slots[i];
+        prev[s] = i === 0 ? NIL : slots[i - 1];
+        next[s] = i === n - 1 ? NIL : slots[i + 1];
+        if (i === 0) head = s;
+        tail = s;
+    }
+    return { head, tail };
+}
+
+/** Stamp a constant segment/queue tag on one list's slots (decisions/0021, D21.1). The
+ *  tag is constant per list (all T1 slots are ARC_T1, etc.), so it is set here rather
+ *  than captured per entry. Cold. */
+function snapSeg(cache, col, slots, val) {
+    const arr = cache[col];
+    for (let i = 0; i < slots.length; i++) arr[slots[i]] = val;
+}
+
+/** Validate every captured list then mark occupancy in ONE cold pass (decisions/0021),
+ *  returning the occupied Uint8Array. `pairs` is [[list, label, withVis], ...], where
+ *  `withVis` MUST match whether that member's dump() emitted a vis column for the list. */
+function snapCheckOccupy(cap, ttl, pairs) {
+    const lists = [];
+    for (let i = 0; i < pairs.length; i++) {
+        snapCheckList(pairs[i][0], cap, ttl, pairs[i][1], pairs[i][2] === true);
+        lists.push(pairs[i][0]);
+    }
+    return snapOccupied(cap, lists);
+}
+
+/** Restore one captured list into a fresh cache in ONE cold pass (decisions/0021,
+ *  D21.1): write payload + keyed index into the preserved slots, stamp the constant
+ *  segment/queue tag (when `segCol` is non-null), thread the intrusive links, and return
+ *  the list's { head, tail, size }. */
+function snapRestoreList(cache, list, segCol, segVal) {
+    snapWriteList(cache, list);
+    if (segCol !== null) snapSeg(cache, segCol, list.slots, segVal);
+    const ends = snapLink(cache, list.slots);
+    return { head: ends.head, tail: ends.tail, size: list.slots.length };
+}
 
 /* -------------------------------------------------------------------------- *
  * LiteLru -- a THIN doubly-linked-list POLICY over the store.
@@ -822,6 +1107,31 @@ export class LiteLru {
     entries() { return iterEntries(this); }
     /** Iterable protocol: identical to entries() (matches Map). */
     [Symbol.iterator]() { return iterEntries(this); }
+
+    // --- snapshot / restore (decisions/0021, D21): COLD, may allocate --------
+
+    /** Serialize this cache to a plain, structurally-cloneable snapshot (decisions/0021).
+     *  COLD (never a hot path); MAY allocate (budget <= 96 B/entry). Captures the recency
+     *  DLL in MRU..LRU order + values (+ per-entry expiry when ttl is on). */
+    dump() {
+        const snap = snapBase(this, "LiteLru");
+        snap.list = snapList(this, this._head, false);
+        return snap;
+    }
+
+    /** Reconstruct a FRESH LiteLru from a snapshot (decisions/0021). Fail closed on any
+     *  tag/shape/capacity/keys/ttl mismatch. `opts` re-derives onEvict/clock/stats (and
+     *  the required ttl DEFAULT when the snapshot has ttl on); backing + ttl-presence +
+     *  capacity come FROM the snapshot. */
+    static restore(snap, opts) {
+        const cap = snapRead(snap, "LiteLru", opts);
+        const inst = new LiteLru(cap, snapOpts(snap, opts));
+        const occ = snapCheckOccupy(cap, snap.ttl, [[snap.list, "list"]]);
+        const L = snapRestoreList(inst, snap.list, null, 0);
+        inst._head = L.head; inst._tail = L.tail; inst._size = L.size;
+        inst._store.rebuildFreeList(occ);
+        return inst;
+    }
 
     // --- test/debug only (never call on a hot path) ---------------------------
 
@@ -1164,6 +1474,35 @@ export class Sieve {
     values() { return iterValues(this); }
     entries() { return iterEntries(this); }
     [Symbol.iterator]() { return iterEntries(this); }
+
+    // --- snapshot / restore (decisions/0021, D21): COLD, may allocate --------
+
+    /** Serialize to a plain snapshot (decisions/0021): the FIFO ring newest..oldest +
+     *  values (+ per-entry expiry when ttl is on) + each entry's visited bit + the
+     *  parked hand slot. COLD; may allocate. */
+    dump() {
+        const snap = snapBase(this, "Sieve");
+        snap.list = snapList(this, this._head, true);
+        snap.hand = this._hand;
+        return snap;
+    }
+
+    /** Reconstruct a FRESH Sieve from a snapshot (decisions/0021). Fail closed on any
+     *  mismatch, and on a hand that does not reference a resident slot. */
+    static restore(snap, opts) {
+        const cap = snapRead(snap, "Sieve", opts);
+        const inst = new Sieve(cap, snapOpts(snap, opts));
+        const occ = snapCheckOccupy(cap, snap.ttl, [[snap.list, "list", true]]);
+        const L = snapRestoreList(inst, snap.list, null, 0);
+        inst._head = L.head; inst._tail = L.tail; inst._size = L.size;
+        const hand = snap.hand;
+        if (hand !== NIL && (!Number.isInteger(hand) || hand < 0 || hand >= cap || occ[hand] === 0)) {
+            throw new Error(SNAP_BAD + "sieve hand " + String(hand) + " does not reference a resident slot");
+        }
+        inst._hand = hand;
+        inst._store.rebuildFreeList(occ);
+        return inst;
+    }
 
     // --- test/debug only (never call on a hot path) ---------------------------
 
@@ -1714,6 +2053,45 @@ export class S3Fifo {
     entries() { return iterEntries(this); }
     [Symbol.iterator]() { return iterEntries(this); }
 
+    // --- snapshot / restore (decisions/0021, D21): COLD, may allocate --------
+
+    /** Serialize to a plain snapshot (decisions/0021): the MAIN + SMALL rings (each
+     *  newest..oldest) + values (+ expiry) + per-entry visited bits, AND the keys-only
+     *  ghost FIFO (oldest..newest). Dropping the ghost is a fail-OPEN admission bug, so
+     *  it is captured. COLD; may allocate. */
+    dump() {
+        const snap = snapBase(this, "S3Fifo");
+        snap.main = snapList(this, this._mHead, true);
+        snap.small = snapList(this, this._sHead, true);
+        snap.ghost = snapGhostRing(this);
+        return snap;
+    }
+
+    /** Reconstruct a FRESH S3Fifo from a snapshot (decisions/0021). Fail closed on any
+     *  mismatch. The ghost is replayed oldest..newest so its FIFO order (and thus future
+     *  admission) is exact. */
+    static restore(snap, opts) {
+        const cap = snapRead(snap, "S3Fifo", opts);
+        const inst = new S3Fifo(cap, snapOpts(snap, opts));
+        if (!Array.isArray(snap.ghost)) throw new Error(SNAP_BAD + "s3fifo snapshot missing ghost array");
+        if (snap.ghost.length > inst._ghostCap) {
+            throw new Error(SNAP_BAD + "s3fifo ghost (" + snap.ghost.length + ") exceeds ghostCap (" + inst._ghostCap + ")");
+        }
+        const occ = snapCheckOccupy(cap, snap.ttl, [[snap.main, "main", true], [snap.small, "small", true]]);
+        const M = snapRestoreList(inst, snap.main, "_q", Q_MAIN);
+        inst._mHead = M.head; inst._mTail = M.tail; inst._mSize = M.size;
+        const S = snapRestoreList(inst, snap.small, "_q", Q_SMALL);
+        inst._sHead = S.head; inst._sTail = S.tail; inst._sSize = S.size;
+        inst._size = inst._sSize + inst._mSize;
+        const gInt = typeof inst._store._ck === "function";
+        for (let i = 0; i < snap.ghost.length; i++) {
+            if (gInt) inst._store._ck(snap.ghost[i]); // fail closed on a non-int ghost key (D21.3, NIT2)
+            inst._ghostAdd(snap.ghost[i]);
+        }
+        inst._store.rebuildFreeList(occ);
+        return inst;
+    }
+
     // --- test/debug only (never call on a hot path) ---------------------------
 
     /** Free-stack length, delegated to the store (conservation invariant). */
@@ -2255,6 +2633,48 @@ export class WTinyLfu {
     entries() { return iterEntries(this); }
     [Symbol.iterator]() { return iterEntries(this); }
 
+    // --- snapshot / restore (decisions/0021, D21): COLD, may allocate --------
+
+    /** Serialize to a plain snapshot (decisions/0021): the WINDOW + PROTECTED + PROBATION
+     *  segments (each MRU..LRU) + values (+ expiry), AND the Count-Min sketch `_sk` (as a
+     *  plain number array) with its aging counter `_skSize` VERBATIM. Dropping the sketch
+     *  silently changes admission = fail-OPEN, so it is captured. COLD; may allocate. */
+    dump() {
+        const snap = snapBase(this, "WTinyLfu");
+        snap.window = snapList(this, this._wHead, false);
+        snap.prot = snapList(this, this._ptHead, false);
+        snap.prob = snapList(this, this._prHead, false);
+        snap.sk = Array.from(this._sk);
+        snap.skSize = this._skSize;
+        return snap;
+    }
+
+    /** Reconstruct a FRESH WTinyLfu from a snapshot (decisions/0021). Fail closed on any
+     *  mismatch, incl. a sketch of the wrong length. The sketch + aging counter are
+     *  restored VERBATIM so future admission decisions are exact. */
+    static restore(snap, opts) {
+        const cap = snapRead(snap, "WTinyLfu", opts);
+        const inst = new WTinyLfu(cap, snapOpts(snap, opts));
+        if (!Array.isArray(snap.sk) || snap.sk.length !== inst._sk.length) {
+            throw new Error(SNAP_BAD + "wtinylfu sketch length mismatch (expected " + inst._sk.length + ")");
+        }
+        if (!Number.isInteger(snap.skSize) || snap.skSize < 0) {
+            throw new Error(SNAP_BAD + "wtinylfu skSize invalid: " + String(snap.skSize));
+        }
+        const occ = snapCheckOccupy(cap, snap.ttl, [[snap.window, "window"], [snap.prot, "prot"], [snap.prob, "prob"]]);
+        const W = snapRestoreList(inst, snap.window, "_seg", SEG_WINDOW);
+        inst._wHead = W.head; inst._wTail = W.tail; inst._wSize = W.size;
+        const PT = snapRestoreList(inst, snap.prot, "_seg", SEG_PROTECTED);
+        inst._ptHead = PT.head; inst._ptTail = PT.tail; inst._ptSize = PT.size;
+        const PR = snapRestoreList(inst, snap.prob, "_seg", SEG_PROBATION);
+        inst._prHead = PR.head; inst._prTail = PR.tail; inst._prSize = PR.size;
+        inst._size = inst._wSize + inst._prSize + inst._ptSize;
+        inst._sk.set(snap.sk);
+        inst._skSize = snap.skSize;
+        inst._store.rebuildFreeList(occ);
+        return inst;
+    }
+
     // --- test/debug only (never call on a hot path) ---------------------------
 
     /** Free-stack length, delegated to the store (conservation invariant). */
@@ -2605,6 +3025,32 @@ export class Slru {
     values() { return iterValues(this); }
     entries() { return iterEntries(this); }
     [Symbol.iterator]() { return iterEntries(this); }
+
+    // --- snapshot / restore (decisions/0021, D21): COLD, may allocate --------
+
+    /** Serialize to a plain snapshot (decisions/0021): the PROTECTED + PROBATION segments
+     *  (each MRU..LRU) + values (+ expiry) + per-entry visited bits (the promote-on-2nd-hit
+     *  state). COLD; may allocate. */
+    dump() {
+        const snap = snapBase(this, "Slru");
+        snap.prot = snapList(this, this._protHead, true);
+        snap.prob = snapList(this, this._probHead, true);
+        return snap;
+    }
+
+    /** Reconstruct a FRESH Slru from a snapshot (decisions/0021). Fail closed on any mismatch. */
+    static restore(snap, opts) {
+        const cap = snapRead(snap, "Slru", opts);
+        const inst = new Slru(cap, snapOpts(snap, opts));
+        const occ = snapCheckOccupy(cap, snap.ttl, [[snap.prot, "prot", true], [snap.prob, "prob", true]]);
+        const PT = snapRestoreList(inst, snap.prot, "_seg", SLRU_PROTECTED);
+        inst._protHead = PT.head; inst._protTail = PT.tail; inst._protSize = PT.size;
+        const PR = snapRestoreList(inst, snap.prob, "_seg", SLRU_PROBATION);
+        inst._probHead = PR.head; inst._probTail = PR.tail; inst._probSize = PR.size;
+        inst._size = inst._probSize + inst._protSize;
+        inst._store.rebuildFreeList(occ);
+        return inst;
+    }
 
     // --- test/debug only (never call on a hot path) ---------------------------
 
@@ -3085,6 +3531,43 @@ export class TwoQ {
     values() { return iterValues(this); }
     entries() { return iterEntries(this); }
     [Symbol.iterator]() { return iterEntries(this); }
+
+    // --- snapshot / restore (decisions/0021, D21): COLD, may allocate --------
+
+    /** Serialize to a plain snapshot (decisions/0021): the Am + A1in queues (each
+     *  newest..oldest) + values (+ expiry), AND the keys-only A1out ghost FIFO
+     *  (oldest..newest). Dropping the ghost is a fail-OPEN admission bug. COLD; may allocate. */
+    dump() {
+        const snap = snapBase(this, "TwoQ");
+        snap.am = snapList(this, this._amHead, false);
+        snap.a1in = snapList(this, this._a1Head, false);
+        snap.ghost = snapGhostRing(this);
+        return snap;
+    }
+
+    /** Reconstruct a FRESH TwoQ from a snapshot (decisions/0021). Fail closed on any
+     *  mismatch. The ghost is replayed oldest..newest so its FIFO order is exact. */
+    static restore(snap, opts) {
+        const cap = snapRead(snap, "TwoQ", opts);
+        const inst = new TwoQ(cap, snapOpts(snap, opts));
+        if (!Array.isArray(snap.ghost)) throw new Error(SNAP_BAD + "twoq snapshot missing ghost array");
+        if (snap.ghost.length > inst._ghostCap) {
+            throw new Error(SNAP_BAD + "twoq ghost (" + snap.ghost.length + ") exceeds ghostCap (" + inst._ghostCap + ")");
+        }
+        const occ = snapCheckOccupy(cap, snap.ttl, [[snap.am, "am"], [snap.a1in, "a1in"]]);
+        const AM = snapRestoreList(inst, snap.am, "_seg", TWOQ_AM);
+        inst._amHead = AM.head; inst._amTail = AM.tail; inst._amSize = AM.size;
+        const A1 = snapRestoreList(inst, snap.a1in, "_seg", TWOQ_A1IN);
+        inst._a1Head = A1.head; inst._a1Tail = A1.tail; inst._a1Size = A1.size;
+        inst._size = inst._a1Size + inst._amSize;
+        const gInt = typeof inst._store._ck === "function";
+        for (let i = 0; i < snap.ghost.length; i++) {
+            if (gInt) inst._store._ck(snap.ghost[i]); // fail closed on a non-int ghost key (D21.3, NIT2)
+            inst._ghostAdd(snap.ghost[i]);
+        }
+        inst._store.rebuildFreeList(occ);
+        return inst;
+    }
 
     // --- test/debug only (never call on a hot path) ---------------------------
 
@@ -3660,6 +4143,60 @@ export class Arc {
     values() { return iterValues(this); }
     entries() { return iterEntries(this); }
     [Symbol.iterator]() { return iterEntries(this); }
+
+    // --- snapshot / restore (decisions/0021, D21): COLD, may allocate --------
+
+    /** Serialize to a plain snapshot (decisions/0021): the T2 + T1 lists (each MRU..LRU)
+     *  + values (+ expiry), the adaptive integer `p`, AND BOTH keys-only ghosts B1/B2
+     *  (each oldest..newest). Dropping `p` or a ghost is a fail-OPEN adaptation bug, so
+     *  all three are captured. COLD; may allocate. */
+    dump() {
+        const snap = snapBase(this, "Arc");
+        snap.t2 = snapList(this, this._t2Head, false);
+        snap.t1 = snapList(this, this._t1Head, false);
+        snap.p = this._p;
+        snap.b1 = snapArcGhost(this._b1);
+        snap.b2 = snapArcGhost(this._b2);
+        return snap;
+    }
+
+    /** Reconstruct a FRESH Arc from a snapshot (decisions/0021). Fail closed on any
+     *  mismatch, a `p` out of [0,cap], or a ghost that would break a conservation bound
+     *  (|T1|+|B1| <= c, |B1|+|B2| <= c). Ghosts are replayed oldest..newest. */
+    static restore(snap, opts) {
+        const cap = snapRead(snap, "Arc", opts);
+        const inst = new Arc(cap, snapOpts(snap, opts));
+        const occ = snapCheckOccupy(cap, snap.ttl, [[snap.t2, "t2"], [snap.t1, "t1"]]);
+        if (!Number.isInteger(snap.p) || snap.p < 0 || snap.p > cap) {
+            throw new Error(SNAP_BAD + "arc p out of [0," + cap + "]: " + String(snap.p));
+        }
+        if (!Array.isArray(snap.b1) || !Array.isArray(snap.b2)) {
+            throw new Error(SNAP_BAD + "arc snapshot missing a ghost array (b1/b2)");
+        }
+        if (snap.b1.length + snap.b2.length > cap) {
+            throw new Error(SNAP_BAD + "arc |B1|+|B2| (" + (snap.b1.length + snap.b2.length) + ") exceeds capacity (" + cap + ")");
+        }
+        if (snap.t1.slots.length + snap.b1.length > cap) {
+            throw new Error(SNAP_BAD + "arc |T1|+|B1| (" + (snap.t1.slots.length + snap.b1.length) + ") exceeds capacity (" + cap + ")");
+        }
+        const T2 = snapRestoreList(inst, snap.t2, "_seg", ARC_T2);
+        inst._t2Head = T2.head; inst._t2Tail = T2.tail; inst._t2Size = T2.size;
+        const T1 = snapRestoreList(inst, snap.t1, "_seg", ARC_T1);
+        inst._t1Head = T1.head; inst._t1Tail = T1.tail; inst._t1Size = T1.size;
+        inst._size = inst._t1Size + inst._t2Size;
+        inst._p = snap.p;
+        const gInt = typeof inst._store._ck === "function";
+        for (let i = 0; i < snap.b1.length; i++) {
+            if (gInt) inst._store._ck(snap.b1[i]); // fail closed on a non-int ghost key (D21.3, NIT2)
+            inst._b1.addMRU(snap.b1[i]);
+        }
+        for (let i = 0; i < snap.b2.length; i++) {
+            if (gInt) inst._store._ck(snap.b2[i]);
+            inst._b2.addMRU(snap.b2[i]);
+        }
+        inst._store.rebuildFreeList(occ);
+        return inst;
+    }
 
     // --- test/debug only (never call on a hot path) ---------------------------
 

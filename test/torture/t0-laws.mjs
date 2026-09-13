@@ -610,4 +610,75 @@ export function run() {
         check(c.size === 1, () => 't0 ITER TTL: purgeStale did not reclaim (size ' + c.size + ')');
         validate(c);
     }
+
+    // --- Snapshot / restore laws (decisions/0021, D21) --------------------------
+    const SNAP = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo],
+        ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc]];
+
+    // SN1: round-trip identity. Build a churned mid-life state, dump, structuredClone,
+    // restore, and assert dump==dump (fixed point) AND identical order/values/size via an
+    // independent walk. Every member, both backings.
+    for (const [name, C] of SNAP) {
+        for (const keys of [undefined, 'int']) {
+            const c = new C(20, keys ? { keys } : undefined);
+            for (let i = 0; i < 60; i++) c.put(i % 30, i * 7);
+            for (let i = 0; i < 20; i++) c.get((i * 3) % 30); // scramble policy state
+            validate(c);
+            const snap = c.dump();
+            const r = C.restore(structuredClone(snap), keys ? { keys } : undefined);
+            validate(r);
+            check(r.size === c.size, () => 't0 SN1 ' + name + ': restored size ' + r.size + ' != ' + c.size);
+            const a = collectPairs(c.entries()), b = collectPairs(r.entries());
+            check(a.length === b.length, () => 't0 SN1 ' + name + ': entries length drift');
+            for (let i = 0; i < a.length; i++) {
+                check(Object.is(a[i][0], b[i][0]) && Object.is(a[i][1], b[i][1]),
+                    () => 't0 SN1 ' + name + ': entries[' + i + '] drift after restore');
+            }
+        }
+    }
+
+    // SN2: dump() during a walk is READ-ONLY -- it does NOT bump _ver, so the live
+    // iterator keeps stepping (D21 iteration interop). A structural mutation WOULD throw.
+    {
+        const c = new LiteLru(8);
+        for (let i = 0; i < 8; i++) c.put(i, i);
+        const it = c.entries();
+        it.next();
+        const verBefore = c._store._ver;
+        c.dump(); // read-only
+        check(c._store._ver === verBefore, () => 't0 SN2: dump() bumped _ver (not read-only)');
+        let stepped = 0;
+        for (let r = it.next(); !r.done; r = it.next()) stepped++;
+        check(stepped > 0, () => 't0 SN2: the iterator did not continue after a dump() mid-walk');
+    }
+
+    // SN3: TTL verbatim (D21). A restored entry expires at the SAME absolute deadline it
+    // would have without the snapshot (expiries are captured verbatim, NOT rebased).
+    {
+        let now = 0; const clock = () => now;
+        const c = new LiteLru(8, { ttl: 100, clock });
+        c.put('x', 1);           // exp = 100
+        c.put('y', 2, 50);       // exp = 50
+        now = 40;
+        const r = LiteLru.restore(structuredClone(c.dump()), { ttl: 100, clock });
+        now = 60; // past y's deadline (50), before x's (100)
+        check(r.get('y') === undefined, () => 't0 SN3: restored short-ttl entry did not expire at its verbatim deadline');
+        check(r.get('x') === 1, () => 't0 SN3: restored default-ttl entry expired too early (rebased?)');
+        now = 120;
+        check(r.get('x') === undefined, () => 't0 SN3: restored default-ttl entry did not expire by its verbatim deadline');
+        validate(r);
+    }
+
+    // SN4: fresh stats (D21). A restored instance requested with { stats: true } starts
+    // with fresh zeroed counters (the holder is NOT captured).
+    {
+        const c = new LiteLru(8, { stats: true });
+        for (let i = 0; i < 12; i++) c.put(i, i);
+        c.get(11); c.get(999);
+        const r = LiteLru.restore(structuredClone(c.dump()), { stats: true });
+        const st = r.stats();
+        check(st.hits === 0 && st.misses === 0 && st.evictions === 0 && st.puts === 0,
+            () => 't0 SN4: restored stats are not fresh-zeroed');
+        validate(r);
+    }
 }

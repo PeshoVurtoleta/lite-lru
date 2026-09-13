@@ -80,7 +80,7 @@ LiteMGLRU, meta-policy; distilled into DEBATE items 13-15).
 | zero-GC TTL (opt-in expiry column) -- cross-cutting | **built + gated (S10)** |
 | zero-GC iteration (keys/entries/values, per-member defined order) -- cross-cutting | **built + gated (S11)** |
 | opt-in stats (hit/miss/evict; writes-per-hit stays torture-only) -- cross-cutting | **built + gated (S12)** |
-| snapshot / restore (dump/load; SoA columns are the serial form) | later/maybe (DEBATE 11) |
+| snapshot / restore (dump/load; SoA columns are the serial form) | **built + gated (S14)** |
 | LRU-K, LIRS/ClockPro, LFU, MQ/CAR | `DEBATE.md` item 4 (deferred) |
 | CLOCK/ClockPro (out of family), async fetch (-> `lite-lru-fetch`), size-aware (-> `lite-cache-budget`) | `DEBATE.md` items 6/8/11 (out of core) |
 | Belady OPT reference (offline harness normalization) | **built + gated (S9, t8 gate + Bench.mjs)** |
@@ -951,6 +951,96 @@ ASSERTIONS
   identity stable); fail-closed stats() on a non-stats instance; controls (double-count,
   counts-peek) diverge from the tally and fail.
 
+===============================================================================
+# S14 -- v1.8.0 -- snapshot / restore (dump / restore) [cross-cutting]
+===============================================================================
+```markdown
+version_target: 1.8.0
+status: built + gated (VERSION stays 1.7.0 until /release 1.8.0)
+gc_maxMajor: 0
+gc_maxPauseMs: 4
+alloc_bytes_per_op: 0   # EXISTING hot paths only; dump/restore are cold + bounded
+leak_cycles: 4096
+depends_on: [S3, S4, S5, S6, S7, S8, S10]
+decisions: [D21]
+```
+WHAT LANDED (S14, working tree, uncommitted; VERSION still 1.7.0 until /release 1.8.0):
+  - Cross-cutting COLD `dump()` + static `restore(snap, opts?)` across ALL SEVEN
+    members over the shared substrate. NO SlotStore field added, NO branch in
+    get/put/has/peek -- the existing hot paths are byte-identical (Gate SNAP proves
+    it). dump() returns a plain structural graph (SoA order flattened per list; plain
+    arrays + values, no typed-array views pinning the backing), COLD + bounded at
+    ~26 B/entry (<= 96 budget); restore() targets a FRESH instance.
+  - THE SERIAL FORM (D21.1): slot layout captured VERBATIM (per-list order + values +
+    per-slot aux) rather than replayed via put -- replay cannot reproduce the SIEVE
+    hand/visited, S3Fifo/TwoQ/Arc ghosts, the WTinyLfu sketch, or Arc's `p`, and
+    WTinyLfu hashes object keys by slot index. Every member captures its future-
+    eviction-steering aux: Sieve hand + `_vis`; S3Fifo/TwoQ keys-only ghost rings +
+    `_vis`; WTinyLfu `_sk` + aging counter; Slru/WTinyLfu/Arc `_seg`; Arc `_p` +
+    B1/B2 (ArcGhost); `_exp` when ttl on. Dropping any of these is fail-OPEN -- pinned
+    by t9 controls (arc-p-dropped / sketch-dropped / ghost-omitted).
+  - FAIL-CLOSED (D21.3): every snapshot carries `{f:'litelru/1', m, cap, keys, ttl, t}`;
+    restore throws a [lite-lru]-tagged Error on wrong/absent format tag, member
+    mismatch, non-object snap, capacity/keys/ttl conflict (both ttl directions),
+    corrupt/short/missing field, a missing/short/non-binary `vis` column (reviewer
+    blocker) or a stray `vis` on a non-vis member, entries.length > cap (REJECT, never
+    truncate -- law 3), and out-of-range/duplicate slot indices (checked before any
+    link, so an in-range-but-inconsistent snapshot cannot corrupt the free list/index).
+    "null is not zero": a missing/0 field never reads as valid. keys:'int' ghost keys
+    are validated through `_store._ck` (no membership-index pollution).
+  - D21.2 restore re-derives onEvict/clock/stats from opts (restored stats start fresh-
+    zeroed; ttl default REQUIRED in opts when ttl on); cap/keys/ttl-presence come FROM
+    the snapshot. D21.5 (owner ruling): `_exp` captured VERBATIM (absolute ms-epoch
+    deadlines, NOT rebased -- a restore-later mass-expires, documented honestly); the
+    `t` capture stamp leaves a future opt-in rebase possible without a format bump
+    (rebase itself a NON-GOAL). D21.6: dump() is read-only (no `_ver` bump; safe mid-walk);
+    stats holder not captured.
+  - decisions/0021-snapshot-restore.md (D21.1..D21.6); Lru.d.ts (`CacheSnapshot` type +
+    `dump()` on LiteCache + all seven classes + `static restore()` per class; dts-drift
+    counted instance surface 14 -> 15, statics excluded); test/torture harness
+    `runRoundTrip` (dump->clone->restore fixed-point leg + restored-vs-twin future-
+    eviction differential leg) wired into t5 over the 100k corpus (7 members x {Map,int}
+    x {ttl off,on}); t0 round-trip laws, t2 adversarial (empty/cap-1/full/free-list
+    boundary), t6 Gate SNAP, t7 4096 dump/restore cycles + value census, t9 three
+    controls; test/Snapshot.test.js (NEW boundary suite). NO Bench.mjs change (snapshot
+    is a cross-cutting feature, not a bench member). NO VERSION/test-count doc edits.
+  - PIPELINE: reviewer REJECTED once -- a fail-OPEN on the `vis` visited-bit column
+    (missing/short vis silently coerced to 0, changing future evictions without a throw);
+    coder fixed (validate vis exactly like the `e` column, driven off the per-member dump
+    roster so it cannot drift) + two folded nits (ghost-key int validation; dts-drift
+    message spacing); reviewer re-reviewed APPROVED. qa found NO code defect but closed a
+    member-specific fail-closed COVERAGE gap (Arc `p`/ghost-sum bounds, WTinyLfu sketch
+    length/skSize, S3Fifo/TwoQ ghost-cap rejections were untested -- all throw correctly,
+    now pinned) + gave the future-eviction differential leg its own independent teeth +
+    added hand-derived post-restore structural assertions (Arc phase-change T1/T2/p/B1/B2,
+    WTinyLfu 4-bit sketch saturation, S3Fifo SMALL/MAIN/ghost trace).
+  - Gates: npm test 1077/1077 (was 987 at 1.7.0; +79 Snapshot.test.js round + 4 blocker-
+    fix regressions + 7 qa additions -> the reported 1077); test:types (tsc) clean;
+    torture "ok"/exit 0 (Gate SNAP 0.00000 B/op restored get re-hit + churn, dump
+    26.12 B/entry, writes-per-hit 0/5/4 unchanged); controls "ok"/exit 0.
+PURPOSE
+  Persist and rehydrate a WARM cache across a restart, or hand it to a worker -- the last
+  table-stakes gap vs the incumbents (DEBATE item 11). The SoA columns ARE the serial
+  form, so dump/restore is a cold walk over the existing layout with zero cost to the hot
+  path when unused. Restore is EXACT: a rehydrated cache makes identical FUTURE eviction
+  decisions vs an un-snapshotted twin -- so a snapshot is a true continuation, not a lossy
+  warm-up. Fail-closed on every corruption/mismatch; TTL deadlines are honest (absolute,
+  not silently extended).
+THE DECISION (decisions/0021-snapshot-restore.md)
+  Surface (cold dump()/static restore(), fresh instance); what each member captures vs
+  re-derives (the fail-open aux-loss tension owned up front); the fail-closed tag + the
+  rejection matrix + the capacity law on load; TTL verbatim vs rebase (verbatim, D21.5);
+  off-path byte-identity. All resolved D21.1..D21.6, each with the rejected alternative.
+ASSERTIONS
+  dump->restore->dump fixed point AND 0 divergent evictions vs a twin over T5, all seven
+  members x both backings x +/- ttl; every rejection case throws [lite-lru], no silent
+  truncation; size <= capacity on load; ttl-verbatim / stats-reset / dump-read-only
+  interop; strict-zero T6 on the existing hot paths (dump/restore cold + bounded);
+  controls (dropped p / sketch / ghost) diverge and fail.
+DONE WHEN
+  all seven members round-trip exactly + fail closed on every corruption; the existing
+  hot paths stay byte-identical; controls fail
+
 ---
 
 ## 7. Decision-record index (decisions/)
@@ -969,13 +1059,14 @@ ASSERTIONS
 | D18 | zero-GC iteration (borrowed-tuple hand-written iterator) | 0018 (S11) |
 | D19 | opt-in stats (integer counters; off by default) | 0019 (S12) |
 | D20 | Belady OPT reference in the bench tool (offline only; brute-force correctness gate) | 0020 (S9) |
+| D21 | snapshot / restore (cold dump()/static restore(); slot-verbatim serial form; fail-closed tag; TTL captured verbatim + capture-time stamp) | 0021 (S14) |
 | (law) | bit-packing (if any) INLINED, never a `lite-fastbit32`/package runtime dep (item 15) | 0012 (S4) |
 
 Deferred / out-of-core (get a decision record only if `DEBATE.md` promotes them):
 LRU-K, LIRS/ClockPro, LFU, MQ/CAR (deferred members, item 4); CLOCK/ClockPro (out
 of family -> on-demand standalone, item 6); async fetch (-> `lite-lru-fetch`, item
 11); size/cost-aware (-> `lite-cache-budget`, item 8); SharedArrayBuffer/cross-
-worker (future separate package, item 11); snapshot/restore (later, item 11).
+worker (future separate package, item 11). (snapshot/restore SHIPPED as S14/D21.)
 FIFO-reinsertion / lazy-promotion is a PRINCIPLE embodied by SIEVE/S3-FIFO, not a
 member (item 12). V2 EXPERIMENTAL research (item 14, RESEARCH.md): LiteMGLRU
 (userspace Multi-Gen LRU) and the self-measuring meta-policy.

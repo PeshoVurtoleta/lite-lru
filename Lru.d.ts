@@ -37,6 +37,33 @@ export interface CacheStats {
 }
 
 /**
+ * A plain, structurally-cloneable snapshot of a cache (decisions/0021, D21), produced
+ * by `dump()` and consumed by the static `restore()`. It is a plain object graph --
+ * plain arrays + plain numbers/values, NO typed-array views -- so it round-trips through
+ * `structuredClone` (and, for JSON-safe keys/values, through JSON). The shape is
+ * member-specific; the shared, fail-closed tag is always present:
+ *
+ *   - `f`    -- the format tag, `"litelru/1"`. `restore()` rejects any other value.
+ *   - `m`    -- the member name (`"LiteLru"` | `"Sieve"` | ...). A mismatch fails closed.
+ *   - `cap`  -- the capacity the snapshot was taken at (drives the restored capacity).
+ *   - `keys` -- the keyed-index backing: `"int"` or `null`.
+ *   - `ttl`  -- whether an expiry column was present.
+ *   - `t`    -- capture time in ms (D21: TTL expiries are captured VERBATIM, absolute).
+ *
+ * Treat it as opaque: do not hand-edit it. `restore()` validates every field and throws
+ * a `[lite-lru]`-tagged Error on any corruption (null is not zero).
+ */
+export interface CacheSnapshot {
+  f: "litelru/1";
+  m: string;
+  cap: number;
+  keys: "int" | null;
+  ttl: boolean;
+  t: number;
+  [field: string]: unknown;
+}
+
+/**
  * The uniform cache surface shared by every member of the lite-lru family.
  *
  * Semantics are identical across members; only the INTERNAL eviction policy
@@ -107,6 +134,23 @@ export interface LiteCache<K, V> extends Iterable<[K, V]> {
    * throws a `[lite-lru]`-tagged Error on an instance without stats (fail-closed).
    */
   resetStats(): void;
+  /**
+   * Serialize this cache to a plain, structurally-cloneable snapshot (decisions/0021,
+   * D21). COLD -- never a hot path -- and MAY allocate (an honest <= 96 B/entry budget;
+   * there is no zero-GC claim on `dump()`). The result is a plain object graph (plain
+   * arrays + plain numbers/values, no typed-array views), tagged with the member, the
+   * capacity, the keyed-index backing, whether ttl was on, and the capture time.
+   *
+   * It captures ENOUGH to make a restored cache decide FUTURE evictions identically to
+   * an un-snapshotted twin fed the same trace: every member's resident order + values,
+   * plus its aux state (Sieve's hand + visited bits; S3Fifo/TwoQ's keys-only ghost;
+   * W-TinyLFU's Count-Min sketch; Arc's adaptive `p` and both ghosts). Under `ttl` the
+   * per-entry expiries are captured VERBATIM (absolute ms deadlines, NOT rebased).
+   *
+   * Restore with the static `restore()` on the SAME member class. A walk in progress is
+   * unaffected -- `dump()` is read-only and does not invalidate a live iterator.
+   */
+  dump(): CacheSnapshot;
   /**
    * Iterate the keys in the member's iteration order (decisions/0018, D18). Zero-GC
    * per step: a hand-written iterator, no generator. The walk is recency-neutral (no
@@ -216,6 +260,16 @@ export class LiteLru<K = unknown, V = unknown> implements LiteCache<K, V> {
    * @param options  optional `onEvict` hook (see `LiteCacheOptions`).
    */
   constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  /**
+   * Reconstruct a FRESH `LiteLru` from a `dump()` snapshot (decisions/0021, D21). The
+   * backing, capacity and ttl-presence come FROM the snapshot; `opts` re-derives the
+   * cold construction options NOT encoded in it -- `onEvict`, `clock`, `stats` (a
+   * restored instance starts with fresh zeroed stats) -- and MUST supply the `ttl`
+   * default when the snapshot has ttl on (the future default is not encoded). Fail
+   * closed: a wrong member/format tag, a capacity/keys/ttl conflict, a corrupt or short
+   * field, or more entries than capacity all throw a `[lite-lru]`-tagged Error.
+   */
+  static restore<K = unknown, V = unknown>(snap: CacheSnapshot, opts?: LiteCacheOptions<K, V>): LiteLru<K, V>;
   get(key: K): V | undefined;
   put(key: K, value: V, ttlMs?: number): void;
   has(key: K): boolean;
@@ -228,6 +282,9 @@ export class LiteLru<K = unknown, V = unknown> implements LiteCache<K, V> {
   stats(): CacheStats;
   /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
   resetStats(): void;
+  /** Serialize to a plain, structurally-cloneable snapshot (decisions/0021). COLD, may
+   *  allocate (honest <= 96 B/entry; no zero-GC claim). Restore with the static restore(). */
+  dump(): CacheSnapshot;
   keys(): IterableIterator<K>;
   values(): IterableIterator<V>;
   entries(): IterableIterator<[K, V]>;
@@ -266,6 +323,10 @@ export class Sieve<K = unknown, V = unknown> implements LiteCache<K, V> {
    * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
    */
   constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  /** Reconstruct a FRESH `Sieve` from a `dump()` snapshot (decisions/0021). Backing/
+   *  capacity/ttl-presence come from the snapshot; `opts` re-derives onEvict/clock/stats
+   *  and supplies the ttl default when ttl is on. Fail closed on any mismatch. */
+  static restore<K = unknown, V = unknown>(snap: CacheSnapshot, opts?: LiteCacheOptions<K, V>): Sieve<K, V>;
   get(key: K): V | undefined;
   put(key: K, value: V, ttlMs?: number): void;
   has(key: K): boolean;
@@ -278,6 +339,9 @@ export class Sieve<K = unknown, V = unknown> implements LiteCache<K, V> {
   stats(): CacheStats;
   /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
   resetStats(): void;
+  /** Serialize to a plain, structurally-cloneable snapshot (decisions/0021). COLD, may
+   *  allocate (honest <= 96 B/entry; no zero-GC claim). Restore with the static restore(). */
+  dump(): CacheSnapshot;
   keys(): IterableIterator<K>;
   values(): IterableIterator<V>;
   entries(): IterableIterator<[K, V]>;
@@ -320,6 +384,9 @@ export class S3Fifo<K = unknown, V = unknown> implements LiteCache<K, V> {
    * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
    */
   constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  /** Reconstruct a FRESH `S3Fifo` from a `dump()` snapshot (decisions/0021), incl. the
+   *  keys-only ghost (dropping it is a fail-OPEN admission bug). Fail closed on any mismatch. */
+  static restore<K = unknown, V = unknown>(snap: CacheSnapshot, opts?: LiteCacheOptions<K, V>): S3Fifo<K, V>;
   get(key: K): V | undefined;
   put(key: K, value: V, ttlMs?: number): void;
   has(key: K): boolean;
@@ -332,6 +399,9 @@ export class S3Fifo<K = unknown, V = unknown> implements LiteCache<K, V> {
   stats(): CacheStats;
   /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
   resetStats(): void;
+  /** Serialize to a plain, structurally-cloneable snapshot (decisions/0021). COLD, may
+   *  allocate (honest <= 96 B/entry; no zero-GC claim). Restore with the static restore(). */
+  dump(): CacheSnapshot;
   keys(): IterableIterator<K>;
   values(): IterableIterator<V>;
   entries(): IterableIterator<[K, V]>;
@@ -378,6 +448,10 @@ export class WTinyLfu<K = unknown, V = unknown> implements LiteCache<K, V> {
    * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
    */
   constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  /** Reconstruct a FRESH `WTinyLfu` from a `dump()` snapshot (decisions/0021), incl. the
+   *  Count-Min sketch VERBATIM (dropping it silently changes admission = fail-OPEN). Fail
+   *  closed on any mismatch. */
+  static restore<K = unknown, V = unknown>(snap: CacheSnapshot, opts?: LiteCacheOptions<K, V>): WTinyLfu<K, V>;
   get(key: K): V | undefined;
   put(key: K, value: V, ttlMs?: number): void;
   has(key: K): boolean;
@@ -390,6 +464,9 @@ export class WTinyLfu<K = unknown, V = unknown> implements LiteCache<K, V> {
   stats(): CacheStats;
   /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
   resetStats(): void;
+  /** Serialize to a plain, structurally-cloneable snapshot (decisions/0021). COLD, may
+   *  allocate (honest <= 96 B/entry; no zero-GC claim). Restore with the static restore(). */
+  dump(): CacheSnapshot;
   keys(): IterableIterator<K>;
   values(): IterableIterator<V>;
   entries(): IterableIterator<[K, V]>;
@@ -430,6 +507,9 @@ export class Slru<K = unknown, V = unknown> implements LiteCache<K, V> {
    * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
    */
   constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  /** Reconstruct a FRESH `Slru` from a `dump()` snapshot (decisions/0021), incl. each
+   *  entry's promote-on-2nd-hit visited bit. Fail closed on any mismatch. */
+  static restore<K = unknown, V = unknown>(snap: CacheSnapshot, opts?: LiteCacheOptions<K, V>): Slru<K, V>;
   get(key: K): V | undefined;
   put(key: K, value: V, ttlMs?: number): void;
   has(key: K): boolean;
@@ -442,6 +522,9 @@ export class Slru<K = unknown, V = unknown> implements LiteCache<K, V> {
   stats(): CacheStats;
   /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
   resetStats(): void;
+  /** Serialize to a plain, structurally-cloneable snapshot (decisions/0021). COLD, may
+   *  allocate (honest <= 96 B/entry; no zero-GC claim). Restore with the static restore(). */
+  dump(): CacheSnapshot;
   keys(): IterableIterator<K>;
   values(): IterableIterator<V>;
   entries(): IterableIterator<[K, V]>;
@@ -484,6 +567,9 @@ export class TwoQ<K = unknown, V = unknown> implements LiteCache<K, V> {
    * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
    */
   constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  /** Reconstruct a FRESH `TwoQ` from a `dump()` snapshot (decisions/0021), incl. the
+   *  keys-only A1out ghost (dropping it is a fail-OPEN admission bug). Fail closed on mismatch. */
+  static restore<K = unknown, V = unknown>(snap: CacheSnapshot, opts?: LiteCacheOptions<K, V>): TwoQ<K, V>;
   get(key: K): V | undefined;
   put(key: K, value: V, ttlMs?: number): void;
   has(key: K): boolean;
@@ -496,6 +582,9 @@ export class TwoQ<K = unknown, V = unknown> implements LiteCache<K, V> {
   stats(): CacheStats;
   /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
   resetStats(): void;
+  /** Serialize to a plain, structurally-cloneable snapshot (decisions/0021). COLD, may
+   *  allocate (honest <= 96 B/entry; no zero-GC claim). Restore with the static restore(). */
+  dump(): CacheSnapshot;
   keys(): IterableIterator<K>;
   values(): IterableIterator<V>;
   entries(): IterableIterator<[K, V]>;
@@ -538,6 +627,10 @@ export class Arc<K = unknown, V = unknown> implements LiteCache<K, V> {
    * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
    */
   constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  /** Reconstruct a FRESH `Arc` from a `dump()` snapshot (decisions/0021), incl. the
+   *  adaptive integer `p` and BOTH ghosts B1/B2 (dropping either is a fail-OPEN adaptation
+   *  bug). Fail closed on any mismatch or ghost-bound violation. */
+  static restore<K = unknown, V = unknown>(snap: CacheSnapshot, opts?: LiteCacheOptions<K, V>): Arc<K, V>;
   get(key: K): V | undefined;
   put(key: K, value: V, ttlMs?: number): void;
   has(key: K): boolean;
@@ -550,6 +643,9 @@ export class Arc<K = unknown, V = unknown> implements LiteCache<K, V> {
   stats(): CacheStats;
   /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
   resetStats(): void;
+  /** Serialize to a plain, structurally-cloneable snapshot (decisions/0021). COLD, may
+   *  allocate (honest <= 96 B/entry; no zero-GC claim). Restore with the static restore(). */
+  dump(): CacheSnapshot;
   keys(): IterableIterator<K>;
   values(): IterableIterator<V>;
   entries(): IterableIterator<[K, V]>;

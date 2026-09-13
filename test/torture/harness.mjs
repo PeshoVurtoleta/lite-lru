@@ -648,3 +648,130 @@ export class CountedWTinyLfu extends WTinyLfu {
 
 /** W-TinyLFU window-MRU re-hit baseline (measured): the one 0-relink fast path. */
 export const WTINYLFU_WRITES_WINDOW_MRU_REHIT = 0;
+
+/* -------------------------------------------------------------------------- *
+ * Snapshot / restore round-trip differential (decisions/0021, D21).
+ *
+ * The teeth for dump()/restore(): (1) dump -> restore -> dump is deep-equal (the
+ * snapshot is a fixed point), and (2) a restored cache and the un-snapshotted TWIN
+ * it was reconstructed from make IDENTICAL future decisions -- same returned value,
+ * same live size, AND same next-eviction victim after every op of a shared future
+ * trace. Dropping any aux state (Arc's p, W-TinyLFU's sketch, a ghost) is a fail-OPEN
+ * correctness bug the future-eviction leg catches.
+ *
+ * The original cache IS the twin: dump() is read-only (it does not bump _ver or move
+ * anything), so the snapshotted state and the post-dump original are identical, and
+ * restore() targets a FRESH instance. Both are then driven in lockstep.
+ * -------------------------------------------------------------------------- */
+
+/** Every member paired with its Ctor + uniform driver wrapper (victim()). */
+export const SNAP_MEMBERS = [
+    { name: 'LiteLru', Ctor: LiteLru, wrap: wrapLru },
+    { name: 'Sieve', Ctor: Sieve, wrap: wrapSieve },
+    { name: 'S3Fifo', Ctor: S3Fifo, wrap: wrapS3Fifo },
+    { name: 'WTinyLfu', Ctor: WTinyLfu, wrap: wrapWTinyLfu },
+    { name: 'Slru', Ctor: Slru, wrap: wrapSlru },
+    { name: 'TwoQ', Ctor: TwoQ, wrap: wrapTwoQ },
+    { name: 'Arc', Ctor: Arc, wrap: wrapArc },
+];
+
+/** Structural deep-equality for two snapshots, IGNORING the capture-time field `t`
+ *  (which legitimately differs between dumps). Object.is at the leaves so Infinity /
+ *  NaN / -0 are compared exactly (the TTL-verbatim expiries live here). */
+export function snapDeepEq(a, b) {
+    if (Array.isArray(a)) {
+        if (!Array.isArray(b) || a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) if (!snapDeepEq(a[i], b[i])) return false;
+        return true;
+    }
+    if (a !== null && typeof a === 'object') {
+        if (b === null || typeof b !== 'object' || Array.isArray(b)) return false;
+        const ka = Object.keys(a).filter((k) => k !== 't');
+        const kb = Object.keys(b).filter((k) => k !== 't');
+        if (ka.length !== kb.length) return false;
+        for (let i = 0; i < ka.length; i++) {
+            const k = ka[i];
+            if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+            if (!snapDeepEq(a[k], b[k])) return false;
+        }
+        return true;
+    }
+    return Object.is(a, b);
+}
+
+/**
+ * Run the round-trip differential for one member.
+ * @param {{name,Ctor,wrap}} member
+ * @param {{cap,pre,ops,seed,keyspace,keys?,ttl?}} opts
+ * @returns {{ok:true} | {ok:false, why, i?, ...}}
+ */
+export function runRoundTrip(member, opts) {
+    const prng = makePrng(opts.seed);
+    const ttl = opts.ttl;
+    const vclock = { now: 0 };
+    const cfn = ttl !== undefined ? () => vclock.now : undefined;
+    const cacheOpts = {};
+    if (opts.keys) cacheOpts.keys = opts.keys;
+    if (ttl !== undefined) { cacheOpts.ttl = ttl; cacheOpts.clock = cfn; }
+    const hasOpts = Object.keys(cacheOpts).length > 0;
+    const ctorOpts = hasOpts ? cacheOpts : undefined;
+    const ks = opts.keyspace;
+
+    const orig = new member.Ctor(opts.cap, ctorOpts);
+
+    // Build-up churn: reach a rich mid-life state (all lists + ghosts + sketch + p).
+    for (let i = 0; i < opts.pre; i++) {
+        if (ttl !== undefined) vclock.now += prng() % 3;
+        const kind = prng() % 5;
+        const key = prng() % ks;
+        const val = prng() >>> 0;
+        let ttlMs;
+        if (ttl !== undefined && kind === OP_PUT) {
+            const pick = prng() % 4;
+            ttlMs = pick === 0 ? undefined : pick === 1 ? Infinity : 1 + (prng() % 6);
+        }
+        applyOp(member.wrap(orig), kind, key, val, ttlMs);
+    }
+
+    // dump -> structuredClone (prove it round-trips as a plain graph) -> restore.
+    const snap1 = orig.dump();
+    let clone;
+    try { clone = structuredClone(snap1); }
+    catch (e) { return { ok: false, why: 'structuredClone-threw', err: String(e) }; }
+    let restored;
+    try { restored = member.Ctor.restore(clone, ctorOpts); }
+    catch (e) { return { ok: false, why: 'restore-threw', err: String(e) }; }
+
+    // dump -> restore -> dump is a fixed point.
+    if (!snapDeepEq(snap1, restored.dump())) {
+        return { ok: false, why: 'dump-redump-diff' };
+    }
+    if (restored.size !== orig.size) {
+        return { ok: false, why: 'size-after-restore', real: restored.size, oracle: orig.size };
+    }
+
+    // Future-eviction differential: same trace to the TWIN (orig) and the RESTORED.
+    const dOrig = member.wrap(orig);
+    const dRest = member.wrap(restored);
+    for (let i = 0; i < opts.ops; i++) {
+        if (ttl !== undefined) vclock.now += prng() % 3;
+        const kind = prng() % 5;
+        const key = prng() % ks;
+        const val = prng() >>> 0;
+        let ttlMs;
+        if (ttl !== undefined && kind === OP_PUT) {
+            const pick = prng() % 4;
+            ttlMs = pick === 0 ? undefined : pick === 1 ? Infinity : 1 + (prng() % 6);
+        }
+        const rv = applyOp(dRest, kind, key, val, ttlMs);
+        const ov = applyOp(dOrig, kind, key, val, ttlMs);
+        if (!Object.is(rv, ov)) return { ok: false, why: 'value', i, kind, key, real: rv, oracle: ov };
+        if (dRest.size() !== dOrig.size()) {
+            return { ok: false, why: 'size', i, kind, key, real: dRest.size(), oracle: dOrig.size() };
+        }
+        const rvic = dRest.victim();
+        const ovic = dOrig.victim();
+        if (!Object.is(rvic, ovic)) return { ok: false, why: 'victim', i, kind, key, real: rvic, oracle: ovic };
+    }
+    return { ok: true };
+}

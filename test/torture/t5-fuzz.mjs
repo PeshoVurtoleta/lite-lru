@@ -21,6 +21,7 @@ import {
     arcPolicy, arcIntPolicy,
     lruTtlPolicy, sieveTtlPolicy, s3fifoTtlPolicy, wtinylfuTtlPolicy,
     slruTtlPolicy, twoqTtlPolicy, arcTtlPolicy,
+    SNAP_MEMBERS, runRoundTrip,
     SEED, die,
 } from './harness.mjs';
 
@@ -155,4 +156,46 @@ export function run() {
     fuzzPolicy(slruTtlPolicy, ttlConfigs);
     fuzzPolicy(twoqTtlPolicy, ttlConfigs);
     fuzzPolicy(arcTtlPolicy, ttlConfigs);
+
+    // The SNAPSHOT proof (decisions/0021): for EVERY member, on BOTH backings, ttl OFF
+    // and ttl ON, over the 100k corpus -- dump -> restore -> dump is a fixed point AND a
+    // restored cache decides FUTURE evictions identically to the un-snapshotted twin
+    // (same value + size + victim after every op). Dropping any aux state (Arc's p,
+    // W-TinyLFU's sketch, a ghost, a visited bit, the TTL _exp column) diverges here.
+    const snapConfigs = [
+        { cap: 1, keyspace: 4, salt: 0x5a01 },     // degenerate cap-1
+        { cap: 8, keyspace: 24, salt: 0x5a02 },
+        { cap: 64, keyspace: 200, salt: 0x5a03 },
+        { cap: 256, keyspace: 300, salt: 0x5a04 }, // high hit rate
+    ];
+    for (let mi = 0; mi < SNAP_MEMBERS.length; mi++) {
+        const member = SNAP_MEMBERS[mi];
+        for (let ci = 0; ci < snapConfigs.length; ci++) {
+            const cfg = snapConfigs[ci];
+            // Four lanes: default/int backing x ttl off/on. `pre` builds a rich state,
+            // `ops` drives the shared future trace. Total corpus per lane = pre + ops.
+            const lanes = [
+                { keys: undefined, ttl: undefined },
+                { keys: 'int', ttl: undefined },
+                { keys: undefined, ttl: 8 },
+                { keys: 'int', ttl: 8 },
+            ];
+            for (let li = 0; li < lanes.length; li++) {
+                const lane = lanes[li];
+                const seed = (SEED ^ cfg.salt ^ (mi << 8) ^ (li << 4)) >>> 0 || 1;
+                const r = runRoundTrip(member, {
+                    cap: cfg.cap, pre: 40000, ops: 60000, seed,
+                    keyspace: cfg.keyspace, keys: lane.keys, ttl: lane.ttl,
+                });
+                if (!r.ok) {
+                    die('t5 snapshot ' + member.name + ' diverged (' + r.why + '): real=' +
+                        String(r.real) + ' oracle=' + String(r.oracle) +
+                        (r.err ? ' err=' + r.err : '') + ' at op ' + String(r.i) +
+                        ' cap=' + cfg.cap + ' keyspace=' + cfg.keyspace +
+                        ' keys=' + String(lane.keys) + ' ttl=' + String(lane.ttl) +
+                        '\n  replay: TORTURE_SEED=' + SEED + ' node --expose-gc test/torture.mjs');
+                }
+            }
+        }
+    }
 }

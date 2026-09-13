@@ -7,6 +7,53 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.8.0] - 2026-09-13
+
+### Added
+
+- **Snapshot / restore across all seven members** (decisions/0021, D21): a COLD
+  `dump()` instance method and a static `restore(snap, opts?)` on `LiteLru`, `Sieve`,
+  `S3Fifo`, `WTinyLfu`, `Slru`, `TwoQ`, and `Arc`. `dump()` returns a plain structural
+  object (the SoA columns are the serial form, D21.1); `restore()` builds a FRESH
+  instance. No field is added to the substrate and no branch is added to
+  `get`/`put`/`has`/`peek`, so the existing hot paths stay byte-identical.
+  - The serial form captures the slot layout verbatim plus every member's
+    future-eviction aux state, so a restored cache makes identical future eviction
+    decisions versus an un-snapshotted twin: the SIEVE hand + visited bits; the
+    S3Fifo/TwoQ/Arc keys-only ghost rings; the WTinyLfu Count-Min sketch + aging
+    counter; the Arc adaptive `p`; the `_seg` tags; and the `_exp` TTL column when ttl
+    is on (D21.1).
+  - Fail-closed via a `{f:'litelru/1', m, cap, keys, ttl, t}` tag (D21.3): a wrong or
+    absent format tag, a member mismatch, a non-object snapshot, a capacity/keys/ttl
+    conflict (both ttl directions), a corrupt/short/missing column (including the
+    visited-bit column), an out-of-range or duplicate slot index, and
+    `entries.length > cap` each throw a `[lite-lru]`-tagged Error; a snapshot is never
+    silently truncated or coerced, and restored size is `<= capacity`.
+  - TTL is captured verbatim -- absolute ms-epoch deadlines, not rebased; the capture
+    time `t` is stamped, so a restored-later cache expires on the real deadline and a
+    future opt-in rebase needs no format change (D21.5). A restored `stats` holder
+    starts fresh, and `keys:'int'` ghost keys are validated on restore (D21.6).
+- **`CacheSnapshot` type** on the `.d.ts`; `dump(): CacheSnapshot` on the
+  `LiteCache<K,V>` interface and all seven classes, plus `static restore(...)` per
+  class (dts-drift counted instance surface 14 -> 15; statics excluded).
+- **`decisions/0021-snapshot-restore.md`** (D21.1..D21.6) and **`test/Snapshot.test.js`**
+  (the snapshot boundary suite). Torture additions: a `runRoundTrip` differential
+  (dump -> clone -> restore fixed point, plus a restored-vs-twin future-eviction leg)
+  wired into t5 over the 100k-op corpus for 7 members x {Map, int} x {ttl off, on}; t0
+  round-trip laws; t2 adversarial (empty / cap-1 / full / free-list boundary); `Gate
+  SNAP` in t6; 4096 dump/restore cycles in t7; and three t9 controls (arc-p-dropped,
+  sketch-dropped, ghost-omitted), each diverging and exiting non-zero.
+
+### Changed
+
+- Three-place version sync to 1.8.0 (`package.json`, the `VERSION` constant, `llms.txt`).
+- Test suite 987 -> 1077 node:test cases (snapshot round-trip + the fail-closed
+  rejection matrix + hand-derived post-restore structural assertions for
+  Arc/WTinyLfu/S3Fifo). Gate SNAP: 0.00000 B/op on the restored hot path, dump
+  26.12 B/entry (<= 96 budget); the `get`/`put`/`has`/`peek` writes-per-hit numbers
+  (LiteLru 0/5/4, Sieve/S3Fifo 0 links + 1 visited byte, WTinyLfu window-MRU 0) are
+  unchanged -- dump/restore are cold-only.
+
 ## [1.7.0] - 2026-09-13
 
 ### Added

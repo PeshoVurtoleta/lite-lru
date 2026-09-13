@@ -65,6 +65,7 @@ One `LiteCache<K,V>` surface, `get`/`put`/`has`/`peek`/`delete`/`clear`, all O(1
   - [TTL -- opt-in, lazy expiry](#ttl----opt-in-lazy-expiry)
   - [Iteration -- zero-GC keys/values/entries](#iteration----zero-gc-keysvaluesentries)
   - [Stats -- opt-in runtime counters](#stats----opt-in-runtime-counters)
+  - [Snapshot -- dump / restore](#snapshot----dump--restore)
   - [The bench tool](#the-bench-tool)
   - [Constants](#constants)
 - [Composability](#composability)
@@ -161,6 +162,8 @@ cache.clear(): void                         // empty the cache; allocates nothin
 cache.purgeStale(): number                  // evict every currently-expired entry now; returns the count (TTL)
 cache.stats(): CacheStats                   // live counters {hits,misses,evictions,puts}; requires { stats: true }
 cache.resetStats(): void                    // zero the four counters in place; requires { stats: true }
+cache.dump(): CacheSnapshot                 // serialize to a plain, structurally-cloneable snapshot (cold, may allocate)
+Member.restore(snap, opts?): Member<K, V>   // STATIC: reconstruct a fresh instance from a snapshot (fail-closed)
 cache.size: number                          // current entry count, 0 .. capacity (getter)
 cache.capacity: number                      // fixed maximum, set at construction (getter)
 ```
@@ -266,6 +269,29 @@ interface CacheStats { hits: number; misses: number; evictions: number; puts: nu
 
 The stats-ON hot path is still strictly zero-alloc: the torture Gate STATS churns `>= 60,000` ops at capacity with `{ stats: true }` and measures **0 B/op**, holder identity stable, holder plain with exactly the four counter names.
 
+### Snapshot -- dump / restore
+
+Persist a warm cache and bring it back **warm** (decisions/0021). `dump()` serializes the whole cache to a plain, structurally-cloneable object; the static `restore()` reconstructs a fresh instance that keeps making the **same** eviction decisions -- no cold start. All seven members, one `LiteCache<K,V>` surface. It is **cold**: no substrate field, no hot-path branch, so a cache that never dumps is byte-identical to the pre-snapshot build.
+
+```ts
+const cache = new WTinyLfu<number, string>(1024);
+// ... a day of traffic warms the window, the SLRU segments and the frequency sketch ...
+
+const snap = cache.dump();                 // a plain object graph: arrays + numbers/values
+await fs.writeFile('cache.json', JSON.stringify(snap));   // or structuredClone to a worker
+
+// later, in a fresh process:
+const raw = JSON.parse(await fs.readFile('cache.json', 'utf8'));
+const warm = WTinyLfu.restore(raw);        // same residents, same sketch, same decisions
+```
+
+- **Exact round-trip.** A restored cache decides FUTURE evictions identically to the un-snapshotted twin fed the same trace. Every member captures ALL policy state: Sieve's hand + visited bits; S3-FIFO/2Q's keys-only ghost; W-TinyLFU's Count-Min sketch + aging counter; ARC's adaptive `p` and both ghosts. Dropping any of these would be a fail-OPEN correctness bug (three torture controls -- `arc-p-dropped`, `sketch-dropped`, `ghost-omitted` -- prove each diverges).
+- **A plain graph.** Plain arrays + plain numbers/values, no typed-array views, so it round-trips through `structuredClone` and (for JSON-safe keys/values) through JSON. NOTE: object keys are cloned by `structuredClone` (new identity) -- documented, not a bug; pass the `dump()` result directly to `restore()` to keep object-key identity.
+- **Cold, honest budget.** `dump()` MAY allocate -- there is NO zero-GC claim on it. The budget is `<= 96 bytes/entry` (measured 26.12 B/entry for `LiteLru` at capacity 4096). A **restored** cache's hot path is strict zero-alloc again (0 B/op), and `dump()` is read-only -- it does not invalidate a walk in progress.
+- **`opts` re-derives what a snapshot can't hold.** Backing, capacity and TTL-presence come FROM the snapshot; `restore(snap, opts?)` re-derives `onEvict` / `clock` / `stats` (a restored `{ stats: true }` instance starts fresh-zeroed) and REQUIRES the `ttl` default when the snapshot has TTL on.
+- **TTL is verbatim.** Per-entry expiries are captured as ABSOLUTE deadlines and are NOT rebased -- a restored entry expires exactly when it would have without the snapshot.
+- **Fail closed.** `restore()` throws a `[lite-lru]`-tagged `Error` on a wrong/absent format tag, a member mismatch, a capacity/keys/TTL conflict with `opts`, a corrupt or short field, or a snapshot whose residents exceed capacity (REJECT -- never silently truncate; restored size is always `<= capacity`). `null` is not zero.
+
 ### The bench tool
 
 `Bench.mjs` ships in the tarball as both a runnable and a subpath import. It imports ONLY the cache implementation -- zero runtime deps, no test-only devDeps.
@@ -290,7 +316,7 @@ Run directly, it prints a table; imported, it returns structured results and pri
 
 | Constant  | Value     | Meaning                                                       |
 | --------- | --------- | ------------------------------------------------------------ |
-| `VERSION` | `'1.7.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
+| `VERSION` | `'1.8.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
 
 All seven members and `VERSION` are named exports; `LiteLru` is also the default export.
 
@@ -421,10 +447,10 @@ Hit % and % of OPT are deterministic (seeded trace, deterministic policies); `ns
 
 ## Testing
 
-**143 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
+**1077 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
 
 ```bash
-npm test               # 987 node:test cases (all members, laws, TTL, iteration, stats, boundary, dts drift)
+npm test               # 1077 node:test cases (all members, laws, TTL, iteration, stats, snapshot round-trip, boundary, dts drift)
 npm run test:types     # tsc: the LiteCache<K,V> surface + one-line-swap type-check
 npm run torture        # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + gated numbers
 npm run torture:controls  # the deliberately-broken variants -- every gate must fail
