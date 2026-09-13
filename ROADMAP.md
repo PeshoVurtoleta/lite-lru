@@ -78,7 +78,7 @@ LiteMGLRU, meta-policy; distilled into DEBATE items 13-15).
 | ARC (flagged -- stresses the fixed-capacity law) | S8 |
 | README + llms.txt + CHANGELOG + shipped benchmark/trace-replay tool | **built + gated (S9)** |
 | zero-GC TTL (opt-in expiry column) -- cross-cutting | **built + gated (S10)** |
-| zero-GC iteration (keys/entries/values, recency order) -- cross-cutting | S11 |
+| zero-GC iteration (keys/entries/values, per-member defined order) -- cross-cutting | **built + gated (S11)** |
 | opt-in stats (hit/miss/evict/writes-per-hit) -- cross-cutting | S12 |
 | snapshot / restore (dump/load; SoA columns are the serial form) | later/maybe (DEBATE 11) |
 | LRU-K, LIRS/ClockPro, LFU, MQ/CAR | `DEBATE.md` item 4 (deferred) |
@@ -757,26 +757,82 @@ ASSERTIONS
   on; oracle extended with a virtual clock; control (a ttl that never expires) fails.
 
 ===============================================================================
-# S11 -- v1.x -- zero-GC iteration (keys / entries / values) [cross-cutting]
+# S11 -- v1.4.0 -- zero-GC iteration (keys / entries / values) [cross-cutting]
 ===============================================================================
 ```markdown
-status: planned
+version_target: 1.4.0
+status: built + gated (VERSION stays 1.3.0 until /release 1.4.0)
 gc_maxMajor: 0
+gc_maxPauseMs: 4
 alloc_bytes_per_op: 0
 depends_on: [S3]
 decisions: [D18]
 ```
+WHAT LANDED (S11, working tree, uncommitted; VERSION still 1.3.0 until /release 1.4.0):
+  - keys()/values()/entries()/[Symbol.iterator] on ALL FOUR members over the shared
+    substrate, at ZERO allocation per step (measured 0.00000 B/op per next(), all four,
+    >=10k steps prefilled at capacity 4096). ONE shared hand-written CacheIterator (NO
+    generator -- a generator allocates an IteratorResult per yield); a reused
+    {value,done} result + a borrowed [k,v] tuple, both mutated in place; the iterator
+    OBJECT is allocated once per call (cold), never per step.
+  - PER-MEMBER ITERATION ORDER (D18.1), defined + pinned -- NOT a universal "recency
+    order" (only LiteLru is true recency): LiteLru _head.._tail (MRU..LRU); Sieve
+    _head.._tail (FIFO newest->oldest); S3Fifo main (_mHead.._mTail) THEN small
+    (_sHead.._sTail), the keys-only ghost EXCLUDED; WTinyLfu window THEN protected THEN
+    probation (_wHead/_ptHead/_prHead .._..Tail), each MRU..LRU. A small per-member
+    _iterHeads() roster the shared iterator walks (mirrors validate()'s list roster).
+  - [Symbol.iterator] === entries() (matches Map); Iterable<[K,V]>. Recency-neutral
+    (D18.4): a walk applies no promote / visited bump / sketch bump / segment relink.
+  - TTL (D18.5, S10 interop): a walk SKIPS stale entries (invisible) but does NOT reap
+    them -- no structural mutation mid-walk; size unchanged by iterating; purgeStale()
+    stays the reclaim path.
+  - FAIL-CLOSED mutation (D18.6): a single integer SlotStore._ver, bumped ONLY by
+    put/delete/clear/_reap/_evict (NEVER on the get/has/peek hit path). The iterator
+    captures _ver at construction; next() throws a [lite-lru] Error on a mid-walk
+    structural mutation. The get writes-per-hit baselines are UNCHANGED (LiteLru 0/5/4,
+    Sieve/S3Fifo 0 links + 1 vis, WTinyLfu window-MRU 0). A get()-induced access-order
+    reorder mid-walk is documented-unsupported (not caught -- catching it would cost a
+    hot-GET write).
+  - RETENTION HARDENING (reviewer-found, owner-applied): the terminal next() (done)
+    nulls the reused result value AND the borrowed tuple's slots, so a drained-but-
+    retained iterator pins nothing ("null is not zero"). Consequence, documented: a bare
+    [...cache.entries()] / Array.from(cache) with no map fn reads all-[undefined,
+    undefined] (N refs to the one nulled tuple) -- it fails LOUDLY, on-law. Only a
+    copying map materializes: Array.from(cache.entries(), ([k,v])=>[k,v]). keys()/values()
+    yield scalars, so their spreads materialize correctly.
+  - RULING (owner): the qa-found "Array.from(cache) materializes" claim in the original
+    brief was WRONG -- borrowed-tuple + default iterator aliases, and after the retention
+    nulling reads all-undefined. The zero-alloc borrowed-tuple design + the retention
+    hardening both STAND (they are the fail-closed / zero-retention choice); the DOCS
+    were corrected (README/llms.txt/Lru.d.ts/0018) and the MEASURED behaviour is pinned
+    as regression tests. This is the honest cost of zero-alloc iteration (lru-cache's
+    iterators allocate and so avoid the trap; ours do not allocate and so carry it).
+  - decisions/0018-iteration.md (D18.1..D18.6); Lru.d.ts (LiteCache extends
+    Iterable<[K,V]> + 4 signatures on the interface and all four classes, borrowed-tuple
+    caveat); test/dts-drift.test.js counted surface 9 -> 12 ([Symbol.iterator] and
+    _iterHeads stay invisible to classMembers); test/torture t0 iterationOrder laws +
+    t6 Gate ITER + 3 t9 controls (generator-allocs / promotes-on-walk / reaps-mid-walk,
+    each fails); test/Iteration.test.js (+119 node:test cases, four members
+    parameterized); README + llms.txt Iteration sections. NO Bench.mjs change (iteration
+    is not a bench member).
+  - Gates: npm test 548/548 (429 + 119); test:types (tsc) exit 0; torture "ok"/exit 0
+    (t6 Gate ITER 0.00000 B/op all four); controls "ok"/exit 0. Reviewer APPROVED
+    (roster correctness incl. degenerate caps 1/2/3 + empty; _ver fail-open complete
+    across every eviction path; TTL skip-no-reap; the iterStep control is honest, not
+    decorative). ASCII-only clean.
 PURPOSE
-  Iterate the cache in recency order (MRU..LRU) with ZERO per-step allocation,
-  reusing the hand-written-iterator + borrowed-tuple pattern from
-  lite-binary-reader S12 (a generator allocates an IteratorResult per yield -- the
-  trap). lru-cache's iterators allocate; ours will not. `keys()`, `values()`,
-  `entries()`, and `[Symbol.iterator]`; the yielded entry pair is BORROWED and
-  reused -- documented (copy what you keep; `Array.from(cache)` materializes).
+  Iterate the cache with ZERO per-step allocation, reusing the hand-written-iterator +
+  borrowed-tuple pattern from lite-binary-reader S12 (a generator allocates an
+  IteratorResult per yield -- the trap). lru-cache's iterators allocate; ours do not.
+  `keys()`, `values()`, `entries()`, and `[Symbol.iterator]`; the yielded entry pair is
+  BORROWED and reused -- copy what you keep (only a copying Array.from map materializes;
+  a bare entries spread reads all-undefined). Order is DEFINED PER MEMBER (D18.1), not a
+  single global recency order -- only LiteLru is true MRU..LRU.
 ASSERTIONS
-  0 B/op per step (torture gate, generator control for teeth); recency-order
-  correct vs the oracle; iteration does NOT change recency (a read-only walk);
-  break-early safe; borrowed-tuple aliasing pinned.
+  0 B/op per step (torture gate, retaining-generator control for teeth); each member's
+  documented order correct vs an independent roster oracle; iteration does NOT change
+  recency (a read-only walk); TTL stale-skip-without-reap; fail-closed on mutation;
+  break-early safe; borrowed-tuple aliasing + retention-nulling pinned.
 
 ===============================================================================
 # S12 -- v1.x -- opt-in stats (hit / miss / evict / writes-per-hit) [cross-cutting]

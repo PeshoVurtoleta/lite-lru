@@ -10,7 +10,7 @@ dependencies, node:test only. Ships a runnable + importable benchmark tool
 (Bench.mjs) with Belady OPT so a caller measures which policy fits their trace
 instead of guessing.
 
-## Status: 1.3.0 - opt-in zero-GC TTL across all four members (LiteLru + Sieve + S3Fifo + WTinyLfu): a lazy expiry column allocated only when ttl is used, injectable clock, per-put override, and purgeStale() - on the shared substrate, with the shipped bench + Belady OPT tool
+## Status: 1.4.0 - zero-GC iteration across all four members (LiteLru + Sieve + S3Fifo + WTinyLfu): keys()/values()/entries()/[Symbol.iterator] at 0 B/op per step via a hand-written iterator with a reused result + borrowed tuple, a defined per-member order (only LiteLru is true recency), recency-neutral, TTL-skip-without-reap, and fail-closed on mid-walk mutation - on the shared substrate, atop opt-in zero-GC TTL (1.3.0) and the shipped bench + Belady OPT tool
 
 The family is the identity from v1.0.0: classic LRU is the reference member +
 differential oracle + honest floor, SIEVE is the headline, and the shipped
@@ -132,6 +132,39 @@ new WTinyLfu(n) and stays type-checked.
 - vs lru-cache: lazy TTL only (no autopurge timer thread), no async fetch, no
   size-aware maxSize.
 
+## Iteration (decisions/0018, D18)
+
+- Every member is iterable: keys() -> IterableIterator<K>, values() ->
+  IterableIterator<V>, entries() -> IterableIterator<[K,V]>, and [Symbol.iterator]
+  === entries() (matches Map). Part of the uniform LiteCache<K,V> surface.
+- Zero-GC per step: NO generators (a generator allocates an IteratorResult per
+  yield). One hand-written iterator reuses a single {value,done} result mutated in
+  place; the iterator object is allocated once per keys()/values()/entries() call
+  (cold), never per step. Gated: >=10,000 next() steps at capacity = 0 B/op per step
+  on all four members. Honest pitch: our iterators allocate nothing per step,
+  lru-cache's allocate. Never "lock-free".
+- Per-member ORDER (only LiteLru is true recency): LiteLru MRU->LRU (recency);
+  Sieve newest->oldest (FIFO insertion, NOT recency); S3Fifo MAIN newest->oldest
+  THEN SMALL newest->oldest (ghost EXCLUDED, keys-only); WTinyLfu WINDOW THEN
+  PROTECTED THEN PROBATION, each MRU->LRU (three segments concatenated).
+- Borrowed-tuple caveat: entries()/[Symbol.iterator] yield ONE REUSED [k,v] array,
+  mutated in place -- copy what you keep. Only a copying map materializes:
+  Array.from(cache.entries(), ([k,v])=>[k,v]) or a manual per-step copy. A plain
+  [...cache.entries()] / Array.from(cache) with NO map fn collects N references to the
+  SAME reused tuple, which the completed walk then nulls (retention hardening,
+  decisions/0018) -- so every element reads [undefined, undefined], NOT the data. Bare
+  spread of entries is a bug; copy. keys()/values() yield the scalar directly, so
+  [...cache.keys()] / [...cache.values()] materialize correctly (no aliasing hazard).
+- Recency-neutral (like peek): a walk applies no promote / visited bump / sketch
+  bump / segment relink, so it does not change the next eviction victim.
+- TTL: iteration SKIPS stale entries (invisible) but does NOT reap them -- no
+  structural mutation, so size is unchanged by a walk; use purgeStale() to reclaim.
+- Fail closed: a structural mutation (put/delete/clear/evict/reap) mid-walk makes the
+  next step throw a [lite-lru] Error (a single integer _ver on SlotStore, bumped only
+  by mutations, NEVER on the get path -- so get writes-per-hit are unchanged:
+  LiteLru 0/5/4, Sieve/S3Fifo 0 links + 1 vis, WTinyLfu window-MRU 0). A get()-induced
+  reorder mid-walk is documented-unsupported (not caught).
+
 ## Invariants (suite CLAUDE.md + ROADMAP)
 
 - Zero allocation on every hot path (get/put/delete/has/peek), for ALL members.
@@ -173,7 +206,7 @@ drops LiteLru's body from the bundle (and vice versa). The shared substrate is
 INTERNAL, not an export; there is NO subpath-per-policy. Bench.mjs is a separate
 runnable tool, not a second implementation.
 
-## API (1.3.0)
+## API (1.4.0)
 
 Named exports from @zakkster/lite-lru:
 
@@ -181,7 +214,7 @@ Named exports from @zakkster/lite-lru:
 - Sieve: the SIEVE member.
 - S3Fifo: the S3-FIFO member.
 - WTinyLfu: the W-TinyLFU member.
-- VERSION: '1.3.0'
+- VERSION: '1.4.0'
 
 Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
@@ -190,7 +223,7 @@ Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
 ## Testing
 
-- npm test        -- 429 node:test cases (all four members, recency/SIEVE/S3-FIFO/
+- npm test        -- 548 node:test cases (all four members, recency/SIEVE/S3-FIFO/
   W-TinyLFU laws, TTL laws + fail-closed + purgeStale, degenerate keys/values, dts
   drift, family surface).
 - npm run test:types -- tsc: the LiteCache<K,V> surface + the one-line-swap check.

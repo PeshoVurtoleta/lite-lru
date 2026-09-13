@@ -15,8 +15,56 @@
  * corrupt structure still fails the tier.
  */
 
-import { LiteLru, S3Fifo, WTinyLfu } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../../Lru.js';
 import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu } from './harness.mjs';
+
+const NIL = -1;
+
+/** INDEPENDENT expected iteration order (decisions/0018, D18.1): walk each documented
+ *  head field -> _next -> NIL, concatenated, skipping stale entries (D18.5). Deliberately
+ *  does NOT call the cache's _iterHeads(), so a bug in the roster is caught. */
+function walkExpected(c, heads) {
+    const ks = [], vs = [];
+    const exp = c._exp;
+    const now = c._clock ? c._clock() : 0;
+    for (let h = 0; h < heads.length; h++) {
+        for (let s = heads[h]; s !== NIL; s = c._next[s]) {
+            if (exp !== null && exp !== undefined && exp[s] <= now) continue; // D18.5 -- skip stale
+            ks.push(c._keys[s]);
+            vs.push(c._vals[s]);
+        }
+    }
+    return { ks, vs };
+}
+
+/** Drain an iterator that yields scalars into an array. */
+function collectScalars(it) { const a = []; for (let r = it.next(); !r.done; r = it.next()) a.push(r.value); return a; }
+/** Drain an entries()/[Symbol.iterator] iterator, COPYING the borrowed [k,v] tuple. */
+function collectPairs(it) { const a = []; for (let r = it.next(); !r.done; r = it.next()) a.push([r.value[0], r.value[1]]); return a; }
+function eqArr(a, b) { if (a.length !== b.length) return false; for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false; return true; }
+
+/** The iteration-order law for one member (decisions/0018): keys()/values()/entries()/
+ *  [Symbol.iterator] all match the documented roster walk, and a walk is read-only. */
+function checkIterOrder(label, c, heads) {
+    const want = walkExpected(c, heads);
+    check(eqArr(collectScalars(c.keys()), want.ks),
+        () => 't0 ITER ' + label + ': keys() order != documented roster walk');
+    check(eqArr(collectScalars(c.values()), want.vs),
+        () => 't0 ITER ' + label + ': values() order != documented roster walk');
+    const pairs = collectPairs(c.entries());
+    check(pairs.length === want.ks.length, () => 't0 ITER ' + label + ': entries() length mismatch');
+    for (let i = 0; i < pairs.length; i++) {
+        check(Object.is(pairs[i][0], want.ks[i]) && Object.is(pairs[i][1], want.vs[i]),
+            () => 't0 ITER ' + label + ': entries()[' + i + '] != (key,value) roster');
+    }
+    const sym = collectPairs(c[Symbol.iterator]());
+    check(eqArr(sym.map((p) => p[0]), want.ks) && eqArr(sym.map((p) => p[1]), want.vs),
+        () => 't0 ITER ' + label + ': [Symbol.iterator] != entries()');
+    // D18.4 recency-neutral / D18.5 no-reap: a full walk does not change size.
+    const sizeBefore = c.size;
+    for (const k of c.keys()) { void k; }
+    check(c.size === sizeBefore, () => 't0 ITER ' + label + ': a walk changed size (not read-only)');
+}
 
 const CAP = 16;
 const KEYSPACE = 40;
@@ -269,6 +317,67 @@ export function run() {
         c.put(4, 4, Infinity); // ordinary LRU eviction: tail (1) leaves
         check(!c.has(1), () => 't0 TTL T3: LRU tail was not evicted at capacity');
         check(c.size === 3, () => 't0 TTL T3: size drifted from capacity');
+        validate(c);
+    }
+
+    // --- Iteration order laws (decisions/0018, D18.1/D18.4/D18.5) ----------------
+    // keys()/values()/entries()/[Symbol.iterator] walk the documented per-member roster
+    // (head -> _next -> NIL per list, concatenated), match an INDEPENDENT manual walk of
+    // the documented head fields, and are read-only (size unchanged by a walk).
+
+    // I1 LiteLru -- one recency DLL, MRU (head) -> LRU (tail).
+    {
+        const c = new LiteLru(16);
+        for (let i = 0; i < 40; i++) c.put(i % 24, i); // churn past capacity + updates
+        for (let i = 0; i < 10; i++) c.get((i * 7) % 24); // scramble recency
+        checkIterOrder('lru', c, [c._head]);
+        validate(c);
+    }
+
+    // I2 Sieve -- one FIFO ring, newest (head) -> oldest (tail).
+    {
+        const c = new Sieve(16);
+        for (let i = 0; i < 40; i++) c.put(i % 24, i);
+        for (let i = 0; i < 10; i++) c.get((i * 5) % 24); // set visited bits (no relink)
+        checkIterOrder('sieve', c, [c._head]);
+        validate(c);
+    }
+
+    // I3 S3Fifo -- MAIN (_mHead..) THEN SMALL (_sHead..); ghost EXCLUDED.
+    {
+        const c = new S3Fifo(20); // smallCap 2, mainCap 18
+        for (let i = 0; i < 20; i++) c.put(i, i); // all in SMALL, at capacity
+        c.get(0); c.get(1); // prove some -> they graduate to MAIN on the next eviction
+        for (let i = 100; i < 110; i++) c.put(i, i); // force eviction sweeps -> populate MAIN
+        check(c._mHead !== NIL, () => 't0 ITER s3fifo: MAIN empty (setup did not exercise both rings)');
+        check(c._sHead !== NIL, () => 't0 ITER s3fifo: SMALL empty (setup invalid)');
+        checkIterOrder('s3fifo', c, [c._mHead, c._sHead]);
+        validate(c);
+    }
+
+    // I4 WTinyLfu -- WINDOW (_wHead..) THEN PROTECTED (_ptHead..) THEN PROBATION (_prHead..).
+    {
+        const c = new WTinyLfu(20); // window 1, protected 15, probation 4
+        for (let i = 0; i < 20; i++) c.put(i, i); // fill; window sheds overflow to probation
+        for (let i = 0; i < 20; i++) c.get(i); // promote probation hits into protected
+        check(c._ptHead !== NIL, () => 't0 ITER wtinylfu: PROTECTED empty (setup invalid)');
+        checkIterOrder('wtinylfu', c, [c._wHead, c._ptHead, c._prHead]);
+        validate(c);
+    }
+
+    // I5 TTL-skip WITHOUT reap (D18.5): a walk sees only live entries, but leaves the
+    // stale ones resident (size unchanged); purgeStale() is the reclamation path.
+    {
+        let now = 0; const clock = () => now;
+        const c = new LiteLru(8, { ttl: 10, clock });
+        c.put('a', 1); c.put('b', 2, Infinity); c.put('c', 3); // b never expires
+        now = 20; // a and c are stale, b is live
+        const ks = collectScalars(c.keys());
+        check(ks.length === 1 && ks[0] === 'b',
+            () => 't0 ITER TTL: stale entries not skipped (got [' + ks.join(',') + '])');
+        check(c.size === 3, () => 't0 ITER TTL: iteration REAPED stale entries (size ' + c.size + ', expected 3)');
+        c.purgeStale(); // the reclamation path (not iteration)
+        check(c.size === 1, () => 't0 ITER TTL: purgeStale did not reclaim (size ' + c.size + ')');
         validate(c);
     }
 }

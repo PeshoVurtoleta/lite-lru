@@ -161,7 +161,19 @@ function expiryFor(clock, ttl, ttlMs) {
     return clock() + ttlMs;
 }
 
-export const VERSION = "1.3.0";
+/** Iteration modes (decisions/0018, D18.2). The ONE shared hand-written iterator
+ *  branches on these instead of shipping three near-identical walkers. */
+const ITER_KEYS = 0;
+const ITER_VALUES = 1;
+const ITER_ENTRIES = 2;
+
+/** Fail-closed message for mutation-during-iteration (decisions/0018, D18.6). Built
+ *  once, thrown only when a walk observes a structural mutation (a bumped `_ver`). */
+const ITER_MUTATED_MSG =
+    "[lite-lru] cache was structurally mutated during iteration " +
+    "(put/delete/clear/evict/reap); an iterator is invalid after any such change";
+
+export const VERSION = "1.4.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -202,6 +214,12 @@ class SlotStore {
         for (let i = 0; i < capacity; i++) this._next[i] = i + 1;
         this._next[capacity - 1] = NIL;
         this._free = 0; // head of the free-slot stack
+
+        // Structural-mutation version (decisions/0018, D18.6). A monotone integer bumped
+        // ONLY by structural mutations (put/delete/clear/_reap/_evict on the composing
+        // policy), NEVER on the get/has/peek read path. An iterator captures it at
+        // construction and re-checks it in next() to fail closed on mutation-mid-walk.
+        this._ver = 0;
     }
 
     /** Pop a fresh slot off the free stack. Caller must know one exists
@@ -386,6 +404,87 @@ function newStore(capacity, keys, hasTtl) {
 }
 
 /* -------------------------------------------------------------------------- *
+ * CacheIterator -- the ONE shared, hand-written, zero-GC iterator every member
+ * composes (decisions/0018, D18). INTERNAL, never an export.
+ *
+ * D18.2 -- NO generators: a generator allocates an IteratorResult per yield. This
+ * reuses a SINGLE `{value,done}` result object across every next() call; `entries`
+ * additionally reuses a BORROWED 2-element `[key,value]` tuple (copy what you keep;
+ * `Array.from`/a manual copy materializes -- a plain spread aliases the last pair).
+ * `keys`/`values` yield the scalar directly. The iterator OBJECT itself is allocated
+ * ONCE per keys()/values()/entries() call (cold), never per step.
+ *
+ * The walk is uniform: a per-member ROSTER of head slots (mirrors how validate()'s
+ * activeListsOf enumerates the intrusive lists), each walked head -> _next -> NIL.
+ * D18.4 recency-neutral: the walk applies NO promote / visited bump / sketch bump /
+ * segment relink (exactly like peek). D18.5 TTL: a stale slot is SKIPPED (invisible)
+ * but never reaped -- iteration performs no structural mutation, so `size` is
+ * unchanged by a walk (use purgeStale() to reclaim). D18.6 fail-closed: the store's
+ * `_ver` is captured here and re-checked in next(); any structural mutation bumps it
+ * and the next step throws.
+ * -------------------------------------------------------------------------- */
+
+class CacheIterator {
+    constructor(cache, mode, heads) {
+        this._store = cache._store;
+        this._ver = cache._store._ver;   // D18.6 -- captured once, re-checked per step
+        this._nextCol = cache._next;
+        this._keysCol = cache._keys;
+        this._valsCol = cache._vals;
+        this._exp = cache._exp;          // ttl expiry column; null when ttl is off (D17)
+        this._clock = cache._clock;
+        this._mode = mode;
+        this._heads = heads;             // roster of head slots (built once per call, cold)
+        this._hi = 0;                    // index into the roster
+        this._slot = NIL;                // current slot; NIL -> advance to the next head
+        this._result = { value: undefined, done: false }; // reused across every next()
+        this._pair = mode === ITER_ENTRIES ? [undefined, undefined] : null; // borrowed tuple
+    }
+
+    next() {
+        // D18.6 -- fail closed on a structural mutation observed mid-walk.
+        if (this._store._ver !== this._ver) throw new Error(ITER_MUTATED_MSG);
+        const res = this._result;
+        const nextCol = this._nextCol, keys = this._keysCol, exp = this._exp, heads = this._heads;
+        let s = this._slot;
+        for (;;) {
+            if (s === NIL) {
+                if (this._hi >= heads.length) {
+                    res.value = undefined; res.done = true;
+                    // D18.2 -- an exhausted iterator must pin NOTHING (null is not zero):
+                    // release the borrowed tuple's refs so a retained-but-drained iterator
+                    // holds no key/value. Cold: once per walk, zero per-step cost.
+                    const p = this._pair;
+                    if (p !== null) { p[0] = undefined; p[1] = undefined; }
+                    return res;
+                }
+                s = heads[this._hi++]; // start the next roster list (may itself be NIL/empty)
+                continue;
+            }
+            const nx = nextCol[s];
+            // D18.5 -- SKIP a stale entry (invisible to iteration); NEVER reap it here.
+            if (exp !== null && exp[s] <= this._clock()) { s = nx; continue; }
+            this._slot = nx;
+            const mode = this._mode;
+            if (mode === ITER_KEYS) res.value = keys[s];
+            else if (mode === ITER_VALUES) res.value = this._valsCol[s];
+            else { const p = this._pair; p[0] = keys[s]; p[1] = this._valsCol[s]; res.value = p; }
+            res.done = false;
+            return res;
+        }
+    }
+
+    [Symbol.iterator]() { return this; }
+}
+
+/** Build a keys/values/entries iterator over a member (decisions/0018). The roster is
+ *  the member's `_iterHeads()`; the shared CacheIterator does the rest. Cold (called
+ *  once per keys()/values()/entries()); never a hot path. */
+function iterKeys(cache) { return new CacheIterator(cache, ITER_KEYS, cache._iterHeads()); }
+function iterValues(cache) { return new CacheIterator(cache, ITER_VALUES, cache._iterHeads()); }
+function iterEntries(cache) { return new CacheIterator(cache, ITER_ENTRIES, cache._iterHeads()); }
+
+/* -------------------------------------------------------------------------- *
  * LiteLru -- a THIN doubly-linked-list POLICY over the store.
  * -------------------------------------------------------------------------- */
 
@@ -507,6 +606,7 @@ export class LiteLru {
         let expiresAt;
         if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
+        this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                  // update-in-place + promote
@@ -580,6 +680,7 @@ export class LiteLru {
     /** Reap an expired slot in place (decisions/0017): unlink, drop from the index,
      *  free the slot, and fire onEvict LAST via the 0002 guard (cache consistent). */
     _reap(s) {
+        this._store._ver++; // D18.6 -- a reap is a structural mutation; invalidate iterators
         const evKey = this._keys[s];
         const evVal = this._vals[s];
         this._detach(s);
@@ -615,6 +716,7 @@ export class LiteLru {
         const store = this._store;
         const s = store.get(key);
         if (s < 0) return false;
+        store._ver++; // D18.6 -- a real delete is a structural mutation; invalidate iterators
         this._detach(s);
         store.delete(key);
         store.freeSlot(s);
@@ -625,11 +727,30 @@ export class LiteLru {
     /** Empty the cache. Rebuilds the free list; allocates nothing. O(capacity). */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
         this._store.reset();
         this._head = NIL;
         this._tail = NIL;
         this._size = 0;
     }
+
+    // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
+
+    /** The per-member iteration ROSTER (decisions/0018, D18.1). LiteLru is one recency
+     *  DLL walked MRU (head) -> LRU (tail): the ONLY member whose order is true recency. */
+    _iterHeads() { return [this._head]; }
+
+    /** Keys in iteration order (decisions/0018). Zero-GC per step; yields the key
+     *  scalar directly. Recency-neutral (D18.4); skips stale entries (D18.5). */
+    keys() { return iterKeys(this); }
+    /** Values in iteration order (decisions/0018). Zero-GC per step; yields the value
+     *  directly. Recency-neutral (D18.4); skips stale entries (D18.5). */
+    values() { return iterValues(this); }
+    /** [key, value] pairs in iteration order (decisions/0018). Zero-GC per step: the
+     *  yielded 2-element tuple is BORROWED and reused -- copy what you keep. */
+    entries() { return iterEntries(this); }
+    /** Iterable protocol: identical to entries() (matches Map). */
+    [Symbol.iterator]() { return iterEntries(this); }
 
     // --- test/debug only (never call on a hot path) ---------------------------
 
@@ -783,6 +904,7 @@ export class Sieve {
         let expiresAt;
         if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
+        this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                 // update-in-place + mark visited
@@ -862,6 +984,7 @@ export class Sieve {
      *  unlink, drop from the index, zero the visited byte, free the slot, and fire
      *  onEvict LAST via the 0002 guard (cache consistent). */
     _reap(s) {
+        this._store._ver++; // D18.6 -- a reap is a structural mutation; invalidate iterators
         const evKey = this._keys[s];
         const evVal = this._vals[s];
         if (this._hand === s) {
@@ -902,6 +1025,7 @@ export class Sieve {
         const store = this._store;
         const s = store.get(key);
         if (s < 0) return false;
+        store._ver++; // D18.6 -- a real delete is a structural mutation; invalidate iterators
         // Repair the hand BEFORE detaching (its links are read here): move toward
         // the head, else toward the tail, else NIL when this was the only slot.
         if (this._hand === s) {
@@ -921,6 +1045,7 @@ export class Sieve {
      *  Allocates nothing. O(capacity). */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
         this._store.reset();
         this._vis.fill(0);
         this._head = NIL;
@@ -928,6 +1053,17 @@ export class Sieve {
         this._hand = NIL;
         this._size = 0;
     }
+
+    // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
+
+    /** The per-member iteration ROSTER (decisions/0018, D18.1). SIEVE is one FIFO ring
+     *  walked newest (head) -> oldest (tail) -- FIFO insertion order, NOT recency. */
+    _iterHeads() { return [this._head]; }
+
+    keys() { return iterKeys(this); }
+    values() { return iterValues(this); }
+    entries() { return iterEntries(this); }
+    [Symbol.iterator]() { return iterEntries(this); }
 
     // --- test/debug only (never call on a hot path) ---------------------------
 
@@ -1240,6 +1376,7 @@ export class S3Fifo {
      * whenever `_sSize < smallCap` -- so neither branch reads an empty ring here.
      */
     _evict() {
+        this._store._ver++; // D18.6 -- eviction sweep mutates the rings; invalidate iterators
         const vis = this._vis;
         for (;;) {
             if (this._sSize >= this._smallCap) {
@@ -1300,6 +1437,7 @@ export class S3Fifo {
         let expiresAt;
         if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
+        this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                 // update-in-place + mark visited
@@ -1373,6 +1511,7 @@ export class S3Fifo {
      *  drop from the index, zero the visited byte, free the slot, and fire onEvict LAST
      *  via the 0002 guard. A reap is NOT an eviction, so it is never ghosted (like delete). */
     _reap(s) {
+        this._store._ver++; // D18.6 -- a reap is a structural mutation; invalidate iterators
         const evKey = this._keys[s];
         const evVal = this._vals[s];
         this._detach(s);
@@ -1407,6 +1546,7 @@ export class S3Fifo {
         const store = this._store;
         const s = store.get(key);
         if (s < 0) return false;
+        store._ver++; // D18.6 -- a real delete is a structural mutation; invalidate iterators
         this._detach(s);
         store.delete(key);
         this._vis[s] = 0;
@@ -1419,6 +1559,7 @@ export class S3Fifo {
      *  and the ghost. Allocates nothing. O(capacity). */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
         this._store.reset();
         this._vis.fill(0);
         this._sHead = NIL; this._sTail = NIL; this._sSize = 0;
@@ -1431,6 +1572,18 @@ export class S3Fifo {
         this._gHead = 0;
         this._gLen = 0;
     }
+
+    // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
+
+    /** The per-member iteration ROSTER (decisions/0018, D18.1): MAIN (newest->oldest)
+     *  THEN SMALL (newest->oldest). The keys-only GHOST is EXCLUDED (it holds no
+     *  resident entry). NOT recency order -- two FIFO rings concatenated. */
+    _iterHeads() { return [this._mHead, this._sHead]; }
+
+    keys() { return iterKeys(this); }
+    values() { return iterValues(this); }
+    entries() { return iterEntries(this); }
+    [Symbol.iterator]() { return iterEntries(this); }
 
     // --- test/debug only (never call on a hot path) ---------------------------
 
@@ -1785,6 +1938,7 @@ export class WTinyLfu {
         let expiresAt;
         if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
+        this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                 // update-in-place + bump + promote
@@ -1876,6 +2030,7 @@ export class WTinyLfu {
      *  the index, free the slot, and fire onEvict LAST via the 0002 guard. The sketch is
      *  untouched (frequency history persists), same as delete. */
     _reap(s) {
+        this._store._ver++; // D18.6 -- a reap is a structural mutation; invalidate iterators
         const evKey = this._keys[s];
         const evVal = this._vals[s];
         this._detach(s);
@@ -1908,6 +2063,7 @@ export class WTinyLfu {
         const store = this._store;
         const s = store.get(key);
         if (s < 0) return false;
+        store._ver++; // D18.6 -- a real delete is a structural mutation; invalidate iterators
         this._detach(s);
         store.delete(key);
         store.freeSlot(s);
@@ -1919,6 +2075,7 @@ export class WTinyLfu {
      *  the frequency sketch. Allocates nothing. O(capacity). */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
         this._store.reset();
         this._wHead = NIL; this._wTail = NIL; this._wSize = 0;
         this._prHead = NIL; this._prTail = NIL; this._prSize = 0;
@@ -1927,6 +2084,18 @@ export class WTinyLfu {
         this._sk.fill(0);
         this._skSize = 0;
     }
+
+    // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
+
+    /** The per-member iteration ROSTER (decisions/0018, D18.1): WINDOW (MRU->LRU) THEN
+     *  PROTECTED (MRU->LRU) THEN PROBATION (MRU->LRU). Three segments concatenated --
+     *  NOT global recency order. */
+    _iterHeads() { return [this._wHead, this._ptHead, this._prHead]; }
+
+    keys() { return iterKeys(this); }
+    values() { return iterValues(this); }
+    entries() { return iterEntries(this); }
+    [Symbol.iterator]() { return iterEntries(this); }
 
     // --- test/debug only (never call on a hot path) ---------------------------
 

@@ -58,6 +58,7 @@ One `LiteCache<K,V>` surface, `get`/`put`/`has`/`peek`/`delete`/`clear`, all O(1
   - [The members](#the-members)
   - [Construction options](#construction-options)
   - [TTL -- opt-in, lazy expiry](#ttl----opt-in-lazy-expiry)
+  - [Iteration -- zero-GC keys/values/entries](#iteration----zero-gc-keysvaluesentries)
   - [The bench tool](#the-bench-tool)
   - [Constants](#constants)
 - [Composability](#composability)
@@ -194,6 +195,32 @@ cache.purgeStale(); // OPTIONAL: evict every currently-expired entry now, return
 
 **vs `lru-cache`.** This is deliberately narrower and cheaper: **lazy TTL only** (no `ttlAutopurge` timer thread), **no async `fetch`/`fetchMethod`**, and **no size-aware `maxSize`/`sizeCalculation`**. If you need clairvoyant fetch coalescing or byte-budgeted caches, reach for `lru-cache`. If you need a zero-GC fixed-capacity cache with optional lazy TTL and no background work, this is the smaller tool.
 
+### Iteration -- zero-GC keys/values/entries
+
+Every member is iterable: `keys()`, `values()`, `entries()` and `[Symbol.iterator]` (== `entries()`, matching `Map`), all part of the uniform `LiteCache<K,V>` surface (decisions/0018).
+
+```ts
+for (const [k, v] of cache) { /* ... */ }        // [Symbol.iterator] === entries()
+for (const k of cache.keys()) { /* ... */ }
+for (const v of cache.values()) { /* ... */ }
+```
+
+**Our iterators allocate nothing per step; `lru-cache`'s allocate.** There is no generator anywhere (a generator allocates an `IteratorResult` object per `yield`). Instead a single hand-written iterator reuses one `{ value, done }` result, mutated in place, across every `next()`. The gate proves it: `>= 10,000` `next()` steps at capacity measure **0 B/op per step** on all four members. (Not "lock-free" -- just zero per-step allocation.)
+
+**Per-member iteration order** (only `LiteLru` is true recency):
+
+| Member | Order | Note |
+| --- | --- | --- |
+| `LiteLru` | MRU -> LRU | true recency order |
+| `Sieve` | newest -> oldest | FIFO insertion order, NOT recency |
+| `S3Fifo` | MAIN newest->oldest, THEN SMALL newest->oldest | two FIFO rings; the keys-only ghost is excluded |
+| `WTinyLfu` | WINDOW, THEN PROTECTED, THEN PROBATION (each MRU->LRU) | three segments concatenated, not one global order |
+
+- **Borrowed-tuple caveat (`entries()` / `[Symbol.iterator]`).** The yielded `[key, value]` tuple is **borrowed and reused** across steps -- read it (or copy it) before the next step. **Only a copying map materializes:** `Array.from(cache.entries(), ([k, v]) => [k, v])` or a manual per-step `[k, v]` copy. A plain `[...cache.entries()]` / `Array.from(cache)` with **no map function** collects N references to the *same* reused tuple, which the completed walk then nulls -- so every element reads `[undefined, undefined]`, not the data. A bare spread of `entries()` is a bug; copy the pair. `keys()` and `values()` yield the scalar directly, so `[...cache.keys()]` and `[...cache.values()]` **do** materialize correctly (no aliasing hazard).
+- **Recency-neutral.** A walk is a read, like `peek`: it applies no promotion / visited bump / sketch bump / segment relink, so iterating does not change the next eviction victim.
+- **TTL: skip, don't reap.** Under `ttl`, iteration **skips** stale entries (they are invisible) but does **not** reap them -- a walk performs no structural mutation, so `size` is unchanged by iterating. Use `purgeStale()` to reclaim.
+- **Fail closed on mutation-during-iteration.** A structural mutation (`put`/`delete`/`clear`/eviction/reap) mid-walk makes the next `next()` throw a `[lite-lru]`-tagged `Error` (a single integer version counter, bumped only by mutations, never on the `get` path -- so the hot `get` writes-per-hit are unchanged). A `get()`-induced reorder mid-walk is documented-unsupported (not caught -- catching it would cost a write per hit).
+
 ### The bench tool
 
 `Bench.mjs` ships in the tarball as both a runnable and a subpath import. It imports ONLY the cache implementation -- zero runtime deps, no test-only devDeps.
@@ -218,7 +245,7 @@ Run directly, it prints a table; imported, it returns structured results and pri
 
 | Constant  | Value     | Meaning                                                       |
 | --------- | --------- | ------------------------------------------------------------ |
-| `VERSION` | `'1.3.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
+| `VERSION` | `'1.4.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
 
 All four members and `VERSION` are named exports; `LiteLru` is also the default export.
 
@@ -352,7 +379,7 @@ Hit % and % of OPT are deterministic (seeded trace, deterministic policies); `ns
 **143 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
 
 ```bash
-npm test               # 429 node:test cases (all members, laws, TTL, boundary, dts drift)
+npm test               # 548 node:test cases (all members, laws, TTL, iteration, boundary, dts drift)
 npm run test:types     # tsc: the LiteCache<K,V> surface + one-line-swap type-check
 npm run torture        # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + gated numbers
 npm run torture:controls  # the deliberately-broken variants -- every gate must fail

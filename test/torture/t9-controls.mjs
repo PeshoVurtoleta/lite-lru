@@ -357,4 +357,105 @@ export function run() {
         try { validate(c); } catch (e) { threw = true; }
         if (!threw) die('t9 C-growing-_exp: validate() passed a grown _exp buffer (the stability gate is toothless)');
     }
+
+    // --- C-iter-generator (decisions/0018, D18.2): a generator-based iterator that
+    // allocates a fresh result PER STEP. The zero-GC iterStep gate (maxBytesPerCall 1)
+    // MUST reject a per-step-allocating iterator; the hand-written borrowed-result
+    // iterator passes it. (V8 escape-analysis ELIDES a purely transient generator
+    // result, so the reliably-observable broken form RETAINS its per-step allocation --
+    // an instance trail -- which is exactly the per-step growth the gate exists to catch.)
+    {
+        const ICAP = 4096;
+        class GeneratorIterLru extends LiteLru {
+            constructor(cap) { super(cap); this._trail = []; }
+            *keys() {
+                for (let s = this._head; s !== NIL; s = this._next[s]) {
+                    this._trail.push([this._keys[s]]); // BUG: a fresh, retained tuple per step
+                    yield this._keys[s];
+                }
+            }
+        }
+        const gCache = new GeneratorIterLru(ICAP);
+        const rCache = new LiteLru(ICAP);
+        for (let i = 0; i < ICAP; i++) { gCache.put(i, i); rCache.put(i, i); }
+        const isink = new Int32Array(1);
+        let git = gCache.keys();
+        const genStep = () => { let r = git.next(); if (r.done) git = gCache.keys(); isink[0] += r.value | 0; };
+        const gGate = runAllocsGate(genStep, { iterations: 50000, batches: 8 });
+        if (gGate.ok) {
+            die('t9 C-iter-generator: a generator-based iterator that allocates per step PASSED the ' +
+                'iterStep alloc gate (no teeth) -- bytesPerCall=' + gGate.bytesPerCall);
+        }
+        // Non-vacuity: the real hand-written iterator over the SAME body is 0 B/op.
+        let rit = rCache.keys();
+        const realStep = () => { let r = rit.next(); if (r.done) rit = rCache.keys(); isink[0] += r.value | 0; };
+        const rGate = runAllocsGate(realStep, { iterations: 50000, batches: 8 });
+        if (!rGate.ok) {
+            die('t9 C-iter-generator: the hand-written iterator FAILED its own zero-alloc gate (vacuous) -- ' +
+                'verdict=' + rGate.report.verdict + ' settled=' + rGate.result.settled + ' bytesPerCall=' + rGate.bytesPerCall);
+        }
+    }
+
+    // --- C-iter-promote (decisions/0018, D18.4): an iterator that PROMOTES on walk (calls
+    // get() per entry) is NOT recency-neutral. The recency-neutral law -- a full walk
+    // leaves the next eviction victim unchanged -- MUST reject it. Non-vacuity: the real
+    // iterator leaves the victim intact.
+    {
+        class PromotingIterLru extends LiteLru {
+            *keys() {
+                const ks = [];
+                for (let s = this._head; s !== NIL; s = this._next[s]) ks.push(this._keys[s]);
+                for (let i = 0; i < ks.length; i++) { this.get(ks[i]); yield ks[i]; } // BUG: get() promotes
+            }
+        }
+        // Non-vacuity: the correct iterator is recency-neutral.
+        const ok = new LiteLru(8);
+        for (let i = 0; i < 8; i++) ok.put(i, i);
+        const okVictim = wrapLru(ok).victim();
+        for (const k of ok.keys()) { void k; }
+        check(wrapLru(ok).victim() === okVictim,
+            () => 't9 C-iter-promote: the REAL iterator changed the victim (not recency-neutral)');
+        // Teeth: the promoting walk drifts the victim.
+        const b = new PromotingIterLru(8);
+        for (let i = 0; i < 8; i++) b.put(i, i); // victim (LRU tail) = 0
+        const bVictim = wrapLru(b).victim();
+        for (const k of b.keys()) { void k; } // promotes every entry MRU->LRU
+        if (wrapLru(b).victim() === bVictim) {
+            die('t9 C-iter-promote: a promoting walk did NOT change the eviction victim (the recency-neutral law is toothless)');
+        }
+    }
+
+    // --- C-iter-reap (decisions/0018, D18.5): an iterator that REAPS stale entries mid-walk
+    // performs a structural mutation. Iteration must SKIP stale entries WITHOUT reaping
+    // (size is unchanged by a walk); the size-unchanged law MUST reject a reaping walk.
+    // Non-vacuity: the real iterator leaves size intact on an all-stale cache.
+    {
+        class ReapingIterLru extends LiteLru {
+            *keys() {
+                for (let s = this._head; s !== NIL;) {
+                    const nx = this._next[s];
+                    if (this._exp !== null && this._exp[s] <= this._clock()) this._reap(s); // BUG: reap mid-walk
+                    else yield this._keys[s];
+                    s = nx;
+                }
+            }
+        }
+        let now = 0; const clock = () => now;
+        // Non-vacuity: the correct iterator skips stale entries but reaps none.
+        const ok = new LiteLru(8, { ttl: 5, clock });
+        for (let i = 0; i < 6; i++) ok.put(i, i);
+        now = 100; // all stale
+        const okSize = ok.size;
+        for (const k of ok.keys()) { void k; }
+        check(ok.size === okSize, () => 't9 C-iter-reap: the REAL iterator reaped stale entries mid-walk (size changed)');
+        // Teeth: a reaping walk drops size.
+        const b = new ReapingIterLru(8, { ttl: 5, clock });
+        for (let i = 0; i < 6; i++) b.put(i, i); // stamped at now=100 -> exp 105
+        now = 200; // all stale
+        const bSize = b.size;
+        for (const k of b.keys()) { void k; }
+        if (b.size === bSize) {
+            die('t9 C-iter-reap: a reaping walk did NOT change size (the no-reap-on-iterate law is toothless)');
+        }
+    }
 }

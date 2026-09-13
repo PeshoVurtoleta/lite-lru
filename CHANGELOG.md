@@ -7,6 +7,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.4.0] - 2026-09-13
+
+### Added
+
+- **Zero-GC iteration across all four members** (`LiteLru`, `Sieve`, `S3Fifo`,
+  `WTinyLfu`) behind the same `LiteCache<K,V>` surface: `keys()`, `values()`,
+  `entries()`, and `[Symbol.iterator]` (identical to `entries()`, matching `Map`).
+  Each is a hand-written iterator (not a generator, which would allocate an
+  `IteratorResult` per yield): a single `{ value, done }` result and, for
+  `entries()`, one borrowed `[key, value]` tuple, both reused and mutated in place.
+  Measured **0.00000 B/op per `next()`** on all four members (>= 10,000 steps
+  prefilled at capacity 4096; `gc maxMajor 0`, `maxPauseMs 4`). The iterator object
+  and its head roster are allocated once per call (cold), never per step.
+- **Defined per-member iteration order** -- pinned, and NOT a universal recency
+  claim (only `LiteLru` is true recency): `LiteLru` MRU..LRU; `Sieve` newest->oldest
+  (FIFO insertion); `S3Fifo` MAIN newest->oldest THEN SMALL newest->oldest (the
+  keys-only ghost is excluded); `WTinyLfu` WINDOW then PROTECTED then PROBATION,
+  each MRU..LRU (three segments concatenated).
+- `purgeStale()` remains the reclamation path; iteration is recency-neutral (a walk
+  applies no LRU promotion, visited bit, sketch bump, or segment relink) and, under
+  `ttl`, SKIPS stale entries without reaping them (no structural mutation mid-walk;
+  `size` is unchanged by a walk).
+- Fail-closed mutation-during-iteration: a single integer version counter on the
+  shared slot store, bumped only by `put`/`delete`/`clear`/eviction/reap (never on
+  the `get` path); an iterator captures it at creation and `next()` throws a
+  `[lite-lru]`-tagged `Error` on a mid-walk structural mutation.
+- `decisions/0018-iteration.md` (D18.1..D18.6); `test/Iteration.test.js` (+119
+  node:test cases, four members parameterized); torture tier additions (t0
+  iteration-order laws, t6 `Gate ITER` zero-alloc gate, three t9 controls:
+  per-step-allocating iterator, promote-on-walk, reap-mid-walk -- each fails).
+
+### Changed
+
+- `LiteCache<K,V>` now extends `Iterable<[K, V]>` and declares `keys`/`values`/
+  `entries`/`[Symbol.iterator]` on the interface and all four classes (additive; the
+  dts-drift counted surface moved 9 -> 12). No change to any existing method's
+  behavior or signature.
+- Test suite 429 -> 548 node:test cases. The `get` writes-per-hit baselines are
+  unchanged after adding the version counter (`LiteLru` head/interior/tail 0/5/4,
+  `Sieve`/`S3Fifo` 0 links + 1 visited byte, `WTinyLfu` window-MRU 0), confirmed by
+  the t6 gate.
+- Borrowed-tuple documentation corrected: only a copying map materializes
+  (`Array.from(cache.entries(), ([k, v]) => [k, v])`); a bare `[...cache.entries()]`
+  / `Array.from(cache)` collects references to the one reused tuple, which the
+  completed walk nulls, so it reads all-`[undefined, undefined]`. `keys()`/`values()`
+  yield scalars, so their spreads materialize correctly. (The earlier "`Array.from`
+  materializes" phrasing was inaccurate for the tuple-yielding iterators.)
+
 ## [1.3.0] - 2026-09-13
 
 ### Added

@@ -489,4 +489,45 @@ export async function run() {
         die('t6 Gate TTL-ON (ttl churn) retained-alloc gate rejected -- verdict=' + gttla.report.verdict +
             ' settled=' + gttla.result.settled + ' bytesPerCall=' + gttla.bytesPerCall);
     }
+
+    // --- Gate ITER: zero-GC iteration steps, ALL FOUR MEMBERS (decisions/0018, D18.2) --
+    // Prefill each member at capacity, then drive OPS (>> 10,000) next() steps of
+    // entries() -- the BORROWED [k,v] tuple path. The iterator OBJECT is COLD: recreated
+    // only when a walk exhausts (~once per CAP steps); each next() STEP must allocate
+    // NOTHING. Two channels, same shape as every gate above: the ops window (maxMajor 0,
+    // maxPauseMs 4, no arrayBuffers growth) and the retained window (maxBytesPerCall 1).
+    const iterMembers = [
+        ['LiteLru', new LiteLru(CAP)],
+        ['Sieve', new Sieve(CAP)],
+        ['S3Fifo', new S3Fifo(CAP)],
+        ['WTinyLfu', new WTinyLfu(CAP)],
+    ];
+    const iterSink = new Int32Array(1);
+    for (let m = 0; m < iterMembers.length; m++) {
+        const label = iterMembers[m][0];
+        const cache2 = iterMembers[m][1];
+        for (let i = 0; i < CAP; i++) cache2.put(i, i * 2 + 1);
+        check(cache2.size === CAP, () => 't6 Gate ITER ' + label + ': pre-fill did not reach capacity');
+        let it = cache2.entries();
+        const iterHot = () => {
+            let r = it.next();
+            if (r.done) { it = cache2.entries(); r = it.next(); } // cold iterator recreate, ~1/CAP
+            iterSink[0] += r.value[0] | 0; // read the BORROWED tuple's key (keeps the step live)
+        };
+        const gIter = runOpsGate(iterHot, { ops: OPS, warmup: WARMUP });
+        if (!gIter.report.ok) {
+            const g = gIter.summary.gc;
+            die('t6 Gate ITER ' + label + ' (entries step) ops gate rejected -- verdict=' + gIter.report.verdict +
+                ' source=' + gIter.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+        }
+        it = cache2.entries(); // fresh iterator for the retained channel
+        const gIterA = runAllocsGate(iterHot, { iterations: 50000, batches: 8 });
+        if (!gIterA.ok) {
+            die('t6 Gate ITER ' + label + ' (entries step) retained-alloc gate rejected -- verdict=' + gIterA.report.verdict +
+                ' settled=' + gIterA.result.settled + ' bytesPerCall=' + gIterA.bytesPerCall);
+        }
+        // Report the measured per-step retained allocation (stderr keeps stdout == "ok").
+        process.stderr.write('t6 Gate ITER ' + label + ': ' + gIterA.bytesPerCall.toFixed(5) +
+            ' B/op per next() step (' + OPS + ' ops window, prefilled at capacity ' + CAP + ')\n');
+    }
 }

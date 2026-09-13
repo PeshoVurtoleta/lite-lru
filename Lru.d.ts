@@ -32,7 +32,7 @@
  *   without touching recency) or `peek(key)` alongside it. `null` is a normal,
  *   distinguishable value; only `undefined` collides with the miss sentinel.
  */
-export interface LiteCache<K, V> {
+export interface LiteCache<K, V> extends Iterable<[K, V]> {
   /**
    * Look up a key AND mark it most-recently-used (per the member's policy).
    * @returns the stored value, or `undefined` on a miss. See D7 above: a stored
@@ -71,6 +71,31 @@ export interface LiteCache<K, V> {
    * a cache with no `ttl` configured).
    */
   purgeStale(): number;
+  /**
+   * Iterate the keys in the member's iteration order (decisions/0018, D18). Zero-GC
+   * per step: a hand-written iterator, no generator. The walk is recency-neutral (no
+   * promote / visited / sketch / segment change -- like `peek`) and, under `ttl`,
+   * SKIPS stale entries without reaping them (`size` is unchanged by a walk). Order is
+   * per-member (only `LiteLru` is true recency); see each class for its order. Fail
+   * closed: a structural mutation (put/delete/clear/evict/reap) mid-walk makes the
+   * next step throw a `[lite-lru]`-tagged Error.
+   */
+  keys(): IterableIterator<K>;
+  /** Iterate the values in iteration order (decisions/0018). Same contract as `keys`. */
+  values(): IterableIterator<V>;
+  /**
+   * Iterate `[key, value]` pairs in iteration order (decisions/0018). CAVEAT: the
+   * yielded 2-element tuple is BORROWED and reused across steps -- read it (or copy it)
+   * before the next step. ONLY a copying map materializes:
+   * `Array.from(cache.entries(), ([k, v]) => [k, v])` or a manual per-step copy. A plain
+   * `[...cache.entries()]` / `Array.from(cache)` with no map fn collects N refs to the
+   * one reused tuple, which the completed walk nulls -- every element reads
+   * `[undefined, undefined]`. `keys()`/`values()` yield scalars, so their spreads are safe.
+   */
+  entries(): IterableIterator<[K, V]>;
+  /** Iterable protocol: identical to `entries()` (matches `Map`). Same borrowed-tuple
+   *  caveat as `entries()`. */
+  [Symbol.iterator](): IterableIterator<[K, V]>;
   /** Current entry count (0 .. capacity). */
   readonly size: number;
   /** Fixed maximum entry count, set at construction. */
@@ -154,6 +179,13 @@ export class LiteLru<K = unknown, V = unknown> implements LiteCache<K, V> {
   delete(key: K): boolean;
   clear(): void;
   purgeStale(): number;
+  keys(): IterableIterator<K>;
+  values(): IterableIterator<V>;
+  entries(): IterableIterator<[K, V]>;
+  /** Iterable protocol == entries(); the yielded [K, V] tuple is BORROWED/reused
+   *  (decisions/0018) -- copy what you keep. Only a copying map materializes
+   *  (Array.from(c.entries(), ([k,v])=>[k,v])); a bare spread reads all-undefined. */
+  [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
 }
@@ -192,6 +224,13 @@ export class Sieve<K = unknown, V = unknown> implements LiteCache<K, V> {
   delete(key: K): boolean;
   clear(): void;
   purgeStale(): number;
+  keys(): IterableIterator<K>;
+  values(): IterableIterator<V>;
+  entries(): IterableIterator<[K, V]>;
+  /** Iterable protocol == entries(); the yielded [K, V] tuple is BORROWED/reused
+   *  (decisions/0018) -- copy what you keep. Only a copying map materializes
+   *  (Array.from(c.entries(), ([k,v])=>[k,v])); a bare spread reads all-undefined. */
+  [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
 }
@@ -234,6 +273,13 @@ export class S3Fifo<K = unknown, V = unknown> implements LiteCache<K, V> {
   delete(key: K): boolean;
   clear(): void;
   purgeStale(): number;
+  keys(): IterableIterator<K>;
+  values(): IterableIterator<V>;
+  entries(): IterableIterator<[K, V]>;
+  /** Iterable protocol == entries(); the yielded [K, V] tuple is BORROWED/reused
+   *  (decisions/0018) -- copy what you keep. Only a copying map materializes
+   *  (Array.from(c.entries(), ([k,v])=>[k,v])); a bare spread reads all-undefined. */
+  [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
 }
@@ -280,6 +326,13 @@ export class WTinyLfu<K = unknown, V = unknown> implements LiteCache<K, V> {
   delete(key: K): boolean;
   clear(): void;
   purgeStale(): number;
+  keys(): IterableIterator<K>;
+  values(): IterableIterator<V>;
+  entries(): IterableIterator<[K, V]>;
+  /** Iterable protocol == entries(); the yielded [K, V] tuple is BORROWED/reused
+   *  (decisions/0018) -- copy what you keep. Only a copying map materializes
+   *  (Array.from(c.entries(), ([k,v])=>[k,v])); a bare spread reads all-undefined. */
+  [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
 }
