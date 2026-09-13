@@ -9,8 +9,8 @@
  *   E single-capacity cache: every put evicts; head===tail always.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc } from './harness.mjs';
 
 export function run() {
     // --- A: re-hit the MRU N times (the head-re-hit fast path) -------------------
@@ -308,12 +308,96 @@ export function run() {
         void wrapTwoQ(c);
     }
 
+    // --- M: Arc degenerate caps + scan flood + the PHASE-CHANGE law (decisions/0016) -
+    {
+        const ARC_T2 = 1;
+        // Degenerate caps 1/2/3: every put churns, head/tail stay coherent, conservation
+        // holds, both ghost bounds respected.
+        for (const cap of [1, 2, 3]) {
+            const c = new Arc(cap);
+            for (let i = 0; i < 500; i++) {
+                c.put(i, i);
+                check(c.size === Math.min(cap, i + 1), () => 't2 M: arc cap-' + cap + ' size drift at ' + i);
+                check(c.get(i) === i, () => 't2 M: arc cap-' + cap + ' just-inserted key missing');
+                check(c._b1._len + c._b2._len <= c._ghostCap, () => 't2 M: arc cap-' + cap + ' combined ghost exceeded bound');
+                check(c._t1Size + c._b1._len <= c._ghostCap, () => 't2 M: arc cap-' + cap + ' |T1|+|B1| exceeded bound');
+                validate(c);
+            }
+            c.clear();
+            check(c.size === 0, () => 't2 M: arc cap-' + cap + ' not empty after clear');
+            check(c._b1._len === 0 && c._b2._len === 0, () => 't2 M: arc cap-' + cap + ' ghosts not empty after clear');
+            check(c._p === 0, () => 't2 M: arc cap-' + cap + ' p not reset after clear');
+            validate(c);
+        }
+
+        // A proven-frequent SET in T2 survives an unbounded distinct one-hit flood -- a
+        // cap-sized scan evicts 0 T2 entries.
+        const N = 64; const HOT = 8;
+        const c = new Arc(N);
+        for (let h = 0; h < HOT; h++) { const k = 'hot' + h; c.put(k, h); c.get(k); } // -> T2
+        for (let h = 0; h < HOT; h++) check(c._seg[c._store.get('hot' + h)] === ARC_T2, () => 't2 M: hot key ' + h + ' not in T2');
+        while (c.size < N) c.put('warm' + c.size, c.size);
+        check(c.size === N, () => 't2 M: arc not full before the scan');
+        for (let i = 0; i < 8000; i++) {
+            for (let h = 0; h < HOT; h++) check(c.get('hot' + h) === h, () => 't2 M: hot key ' + h + ' lost mid-scan at ' + i);
+            c.put('scan' + i, i);
+            check(c.size === N, () => 't2 M: arc drifted from capacity during the scan');
+            check(c._b1._len + c._b2._len <= c._ghostCap, () => 't2 M: arc combined ghost exceeded bound in scan');
+            if ((i & 511) === 0) validate(c);
+        }
+        for (let h = 0; h < HOT; h++) check(c.has('hot' + h), () => 't2 M: T2 hot key ' + h + ' evicted by the scan (no scan resistance)');
+        let survivors = 0;
+        for (let i = 0; i < 8000; i++) if (c.has('scan' + i)) survivors++;
+        check(survivors < N, () => 't2 M: too many scan keys survived (' + survivors + ') -- eviction not exercised');
+        validate(c);
+
+        // PHASE-CHANGE law: a RECENCY phase (re-references of keys just evicted from T1 ->
+        // B1 hits) must drive p UP; a following FREQUENCY phase (re-references of keys
+        // evicted from T2 -> B2 hits) must drive p DOWN. The DIRECTION is the point. Note
+        // B1 can only form while T2 is non-empty (an all-T1 cache direct-evicts, D16.4), so
+        // the recency phase seeds a little T2 first -- exactly ARC's real regime.
+        {
+            const CAP = 32;
+            // Recency phase: seed some T2, then repeatedly capture the T1 LRU that REPLACE
+            // sends to B1 and re-reference it -> a B1 hit each time -> p climbs from 0.
+            let lastEvicted = null;
+            const a = new Arc(CAP, { onEvict: (k) => { lastEvicted = k; } });
+            for (let i = 0; i < 8; i++) { a.put('f' + i, i); a.get('f' + i); } // seed T2
+            let b1Hits = 0, next = 0;
+            for (let round = 0; round < 400; round++) {
+                lastEvicted = null;
+                a.put('n' + next, next); next++;                 // true miss -> a resident -> ghost
+                if (lastEvicted !== null && a._b1.has(lastEvicted)) { a.put(lastEvicted, 0); b1Hits++; } // B1 hit -> p++
+            }
+            check(b1Hits > 0, () => 't2 M: recency phase produced 0 B1 hits (setup invalid)');
+            check(a._p > 0, () => 't2 M: recency phase did not raise p above 0 (got ' + a._p + ')');
+            validate(a);
+
+            // Frequency phase: from a recency-biased peak (p == CAP), drive B2 hits (re-
+            // references of keys evicted from T2) -> p must FALL.
+            const b = new Arc(CAP);
+            for (let i = 0; i < CAP; i++) { b.put(i, i); b.get(i); } // all -> T2
+            b._p = CAP; // peak, so a B2 hit's DECREASE is observable (floored at 0 otherwise)
+            const pStart = b._p;
+            let b2Hits = 0;
+            for (let round = 0; round < 8; round++) {
+                const base = 1000 + round * CAP;
+                for (let i = 0; i < CAP; i++) b.put(base + i, i);            // flush T2 keys -> B2
+                for (let i = 0; i < CAP; i++) if (b._b2.has(i)) { b.put(i, i); b2Hits++; } // B2 hits (lower p)
+            }
+            check(b2Hits > 0, () => 't2 M: frequency phase produced 0 B2 hits (setup invalid)');
+            check(b._p < pStart, () => 't2 M: frequency phase did not lower p from ' + pStart + ' (got ' + b._p + ')');
+            validate(b);
+        }
+        void wrapArc(c);
+    }
+
     // --- J: the LAZY-SEMANTICS TRIPLE as executable laws (decisions/0017, D17.3) --
     // For EVERY member: an expired entry is a MISS through get/has/peek alike, and each
     // of the three REAPS it in place (fires onEvict once, size drops). A fresh Infinity
     // sibling is untouched by any of them. validate() nets each reap.
     {
-        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ]];
+        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc]];
         // one probe method per fresh cache (each reap is destructive, so isolate them)
         const probes = [
             ['get', (c, k) => c.get(k), undefined],

@@ -9,7 +9,7 @@
  * stops happening (tsc flags an unused directive). Test-only; not in files[].
  * ASCII-only.
  */
-import LiteLru, { VERSION, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from "../../Lru.js";
+import LiteLru, { VERSION, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from "../../Lru.js";
 import type { LiteCache, LiteCacheOptions } from "../../Lru.js";
 
 // A type-equality check with teeth (identity holds only for exact-equal types).
@@ -265,3 +265,26 @@ new TwoQ<number, number>(10, { keys: "q" });
 
 // @ts-expect-error -- size is readonly on TwoQ.
 tq.size = 5;
+
+// ---- Arc: the seventh family member SATISFIES the SAME LiteCache surface -------
+// (decisions/0016) The one-line policy swap: `new Arc(n)` type-checks into the SAME
+// `LiteCache` binding as every other member.
+const ar = new Arc<string, number>(10);
+const arGot = ar.get("a");
+expectTrue<Equal<typeof arGot, number | undefined>>();
+expectTrue<Equal<ReturnType<typeof ar.has>, boolean>>();
+expectTrue<Equal<typeof ar.capacity, number>>();
+const arIface: LiteCache<string, number> = new Arc<string, number>(10);
+arIface.put("k", 1);
+new Arc<number, number>(10, { keys: "int" });
+const arTtl: LiteCache<number, number> = new Arc<number, number>(10, { ttl: 5 });
+expectTrue<Equal<ReturnType<typeof arTtl.purgeStale>, number>>();
+
+// @ts-expect-error -- V is number; a string value is rejected on Arc too.
+ar.put("a", "not-a-number");
+
+// @ts-expect-error -- 'q' is not a valid keys backing (only 'int').
+new Arc<number, number>(10, { keys: "q" });
+
+// @ts-expect-error -- size is readonly on Arc.
+ar.size = 5;

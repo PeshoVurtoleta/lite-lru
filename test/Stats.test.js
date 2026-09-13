@@ -24,13 +24,14 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../Lru.js';
 import { validate } from './validate.mjs';
 
-/** Every family member, so each body runs SIX TIMES over the exact same LiteCache
- *  surface (the stats contract is stated once on LiteCache, decisions/0019). Slru/TwoQ
- *  (decisions/0015, D15.5) count identically: segment movement (promotion/demotion/
- *  ghost-admission) is NOT an eviction, so the SAME outcome-based tally proves them too. */
+/** Every family member, so each body runs SEVEN TIMES over the exact same LiteCache
+ *  surface (the stats contract is stated once on LiteCache, decisions/0019). Slru/TwoQ/Arc
+ *  (decisions/0015 D15.5, 0016 D16.6) count identically: segment movement (promotion/
+ *  demotion/ghost-admission) and ARC's `p` adaptation are NOT evictions, so the SAME
+ *  outcome-based tally proves them too. */
 const MEMBERS = [
     { name: 'LiteLru', Ctor: LiteLru },
     { name: 'Sieve', Ctor: Sieve },
@@ -38,6 +39,7 @@ const MEMBERS = [
     { name: 'WTinyLfu', Ctor: WTinyLfu },
     { name: 'Slru', Ctor: Slru },
     { name: 'TwoQ', Ctor: TwoQ },
+    { name: 'Arc', Ctor: Arc },
 ];
 
 /** Seeded xorshift32 (same generator the torture harness uses) -- deterministic,

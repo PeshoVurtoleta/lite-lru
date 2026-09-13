@@ -9,7 +9,7 @@
  * These are contract, not accident -- pinned so a refactor cannot drift them.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Arc } from '../../Lru.js';
 import { check, validate } from './harness.mjs';
 
 export function run() {
@@ -99,11 +99,46 @@ export function run() {
         validate(c);
     }
 
+    // --- Arc degenerate keys + values (decisions/0016) --------------------------
+    // The same degenerate matrix as the LiteLru cases above, but through the adaptive
+    // member: SameValueZero key collapse, distinct primitive keys, object identity, the
+    // D7 stored-undefined ambiguity, and falsy values round-tripping -- all with the two
+    // ghosts + `p` present. validate() nets each mutation.
+    {
+        const c = new Arc(4);
+        c.put(0, 'zero'); c.put(-0, 'neg-zero'); // SameValueZero: one key
+        check(c.size === 1 && c.get(0) === 'neg-zero', () => 't1 arc: 0/-0 did not collapse');
+        c.put(NaN, 'nan1'); c.put(NaN, 'nan2');   // NaN is a single key
+        check(c.get(NaN) === 'nan2', () => 't1 arc: NaN not a single usable key');
+        validate(c);
+
+        const d = new Arc(8);
+        d.put('', 'empty'); d.put(null, 'null-key'); d.put(undefined, 'undef-key');
+        check(d.size === 3, () => 't1 arc: "" / null / undefined not distinct');
+        check(d.get(null) === 'null-key' && d.get(undefined) === 'undef-key', () => 't1 arc: null/undefined key lost');
+        const o1 = { id: 1 }, o2 = { id: 1 };
+        d.put(o1, 'first'); d.put(o2, 'second');
+        check(d.get(o1) === 'first' && d.get(o2) === 'second', () => 't1 arc: object identity keys collapsed');
+        validate(d);
+
+        // D7: a stored `undefined` value is indistinguishable from a miss via get(); has()
+        // disambiguates; peek() returns undefined for both.
+        const e = new Arc(4);
+        e.put('k', undefined);
+        check(e.get('k') === undefined && e.get('absent') === undefined, () => 't1 arc D7: get ambiguity broken');
+        check(e.has('k') === true && e.has('absent') === false, () => 't1 arc D7: has() did not disambiguate');
+        check(e.peek('k') === undefined, () => 't1 arc D7: peek(stored-undefined) != undefined');
+        // Falsy values round-trip exactly.
+        e.put('null', null); e.put('zero', 0); e.put('nan', NaN);
+        check(e.get('null') === null && e.get('zero') === 0 && Number.isNaN(e.get('nan')), () => 't1 arc: falsy value not preserved');
+        validate(e);
+    }
+
     // --- TTL fail-closed validation (decisions/0017, D17.2/D17.4) ----------------
     // Bad ttl / ttlMs / clock are caller bugs, thrown at the door. Pinned across ALL
     // four members so the shared door stays uniform.
     {
-        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu]];
+        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Arc', Arc]];
         const bad = (fn, why) => {
             let threw = false;
             try { fn(); } catch (e) { threw = /^\[lite-lru\]/.test(e.message); }

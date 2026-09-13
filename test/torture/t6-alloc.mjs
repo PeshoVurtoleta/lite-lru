@@ -31,7 +31,7 @@
  * rejects the window; T9 exercises the same alloc lane in-process.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, BREAK, check, die, makePrng,
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
@@ -107,6 +107,28 @@ class CoveredTwoQ extends TwoQ {
         const s = this._store.get(key);
         if (s >= 0) { if (this._seg[s] === SEG_B) this._amHits++; else this._a1Stays++; }
         return super.get(key);
+    }
+}
+
+/** An Arc counting the DISTINGUISHING lanes (decisions/0016) via plain integer field
+ *  increments (zero-alloc; lane coverage only, never on a MEASURED window): `p`-adaptations
+ *  (B1 or B2 ghost hits), B1 hits, B2 hits, and REPLACE evictions of a T2 (frequent)
+ *  resident (the else-branch of REPLACE). The ghost membership is read BEFORE `super.put`
+ *  runs (it consumes the key), so the classification is accurate. */
+class CoveredArc extends Arc {
+    constructor(cap, opts) { super(cap, opts); this._pAdapts = 0; this._b1Hits = 0; this._b2Hits = 0; this._replaceT2 = 0; }
+    _replace(xInB2) {
+        const before = this._t2Size;
+        const r = super._replace(xInB2);
+        if (this._t2Size < before) this._replaceT2++; // a T2 (frequent) resident was evicted
+        return r;
+    }
+    put(key, value, ttlMs) {
+        if (this._store.get(key) < 0) {
+            if (this._b1.has(key)) { this._b1Hits++; this._pAdapts++; }
+            else if (this._b2.has(key)) { this._b2Hits++; this._pAdapts++; }
+        }
+        return super.put(key, value, ttlMs);
     }
 }
 
@@ -638,6 +660,104 @@ export async function run() {
         ' B/op mixed churn (' + OPS + ' ops window, capacity ' + CAP + '); lanes covered: ghostAdmits=' +
         covQ._ghostAdmits + ' amHits=' + covQ._amHits + ' a1Stays=' + covQ._a1Stays + '\n');
 
+    // --- Gate ARC: the Arc member -- STRICT zero-alloc across EVERY lane (decisions/0016)
+    // A strictly-increasing key stream would only exercise insert/evict; it would NEVER
+    // reach the lanes that DISTINGUISH Arc -- `p` adaptation on B1/B2 ghost hits, and REPLACE
+    // evicting a T2 (frequent) resident. So the measured window runs the SAME MIXED, recurring
+    // int-key stream the Slru/TwoQ gates use (built ONCE, off the hot path) as the canonical
+    // cache access -- get, and put on a miss, plus a second get on a hit -- at capacity: a hot
+    // working set drives promotions to T2 and both ghosts, while cold churn + re-references of
+    // recently-evicted keys drive B1/B2 ghost hits (and thus `p` adaptation). Zero-alloc: the
+    // closure indexes a preallocated Int32Array and does int get/put only. _seg / _next / _prev
+    // / the int index buffers / both ghost rings + membership tables never grow, and
+    // `_b1._len + _b2._len <= c`, `_t1Size + _b1._len <= c` always. A separate, UN-measured
+    // CoveredArc run over the SAME stream proves the steady-state window TRIGGERS `p`-adapt,
+    // B1-hit, B2-hit AND REPLACE-of-a-T2 at least the plan's thresholds -- so a regression that
+    // stops exercising a lane fails LOUD instead of silently reading 0 B/op.
+    const arcStream = buildMixedStream(STREAM_LEN, HOT_SIZE, A1IN_CAP, 0xA5C0FFEE);
+    const acache = new Arc(CAP, { keys: 'int' });
+    const asink = new Int32Array(1);
+    let asi = 0;
+    const arcHot = () => {
+        const k = arcStream[asi & STREAM_MASK]; asi++;
+        const v = acache.get(k);
+        if (v === undefined) acache.put(k, k); else { asink[0] += v | 0; acache.get(k); }
+    };
+    for (let i = 0; i < PREFILL; i++) arcHot(); // reach steady state (both ghosts populated)
+    check(acache.size === CAP, () => 't6 Gate ARC: prefill did not reach capacity (size ' + acache.size + ')');
+    const aNextBytes = acache._next.buffer.byteLength;
+    const aPrevBytes = acache._prev.buffer.byteLength;
+    const aSegBytes = acache._seg.buffer.byteLength;
+    const aIxSlotBytes = acache._store._ixSlot.buffer.byteLength;
+    const aIxKeyBytes = acache._store._ixKey.buffer.byteLength;
+    const ab1RingBytes = acache._b1._ring.buffer.byteLength;
+    const ab1KeyBytes = acache._b1._ixKey.buffer.byteLength;
+    const ab1StateBytes = acache._b1._ixState.buffer.byteLength;
+    const ab2RingBytes = acache._b2._ring.buffer.byteLength;
+    const ab2KeyBytes = acache._b2._ixKey.buffer.byteLength;
+    const ab2StateBytes = acache._b2._ixState.buffer.byteLength;
+    const ga = runOpsGate(arcHot, { ops: OPS, warmup: WARMUP });
+    check(acache._next.buffer.byteLength === aNextBytes,
+        () => 't6 Gate ARC: _next.buffer grew ' + aNextBytes + ' -> ' + acache._next.buffer.byteLength);
+    check(acache._prev.buffer.byteLength === aPrevBytes,
+        () => 't6 Gate ARC: _prev.buffer grew ' + aPrevBytes + ' -> ' + acache._prev.buffer.byteLength);
+    check(acache._seg.buffer.byteLength === aSegBytes,
+        () => 't6 Gate ARC: _seg.buffer grew ' + aSegBytes + ' -> ' + acache._seg.buffer.byteLength);
+    check(acache._store._ixSlot.buffer.byteLength === aIxSlotBytes,
+        () => 't6 Gate ARC: _ixSlot.buffer grew ' + aIxSlotBytes + ' -> ' + acache._store._ixSlot.buffer.byteLength);
+    check(acache._store._ixKey.buffer.byteLength === aIxKeyBytes,
+        () => 't6 Gate ARC: _ixKey.buffer grew ' + aIxKeyBytes + ' -> ' + acache._store._ixKey.buffer.byteLength);
+    check(acache._b1._ring.buffer.byteLength === ab1RingBytes,
+        () => 't6 Gate ARC: B1 _ring grew ' + ab1RingBytes + ' -> ' + acache._b1._ring.buffer.byteLength);
+    check(acache._b1._ixKey.buffer.byteLength === ab1KeyBytes,
+        () => 't6 Gate ARC: B1 _ixKey grew ' + ab1KeyBytes + ' -> ' + acache._b1._ixKey.buffer.byteLength);
+    check(acache._b1._ixState.buffer.byteLength === ab1StateBytes,
+        () => 't6 Gate ARC: B1 _ixState grew ' + ab1StateBytes + ' -> ' + acache._b1._ixState.buffer.byteLength);
+    check(acache._b2._ring.buffer.byteLength === ab2RingBytes,
+        () => 't6 Gate ARC: B2 _ring grew ' + ab2RingBytes + ' -> ' + acache._b2._ring.buffer.byteLength);
+    check(acache._b2._ixKey.buffer.byteLength === ab2KeyBytes,
+        () => 't6 Gate ARC: B2 _ixKey grew ' + ab2KeyBytes + ' -> ' + acache._b2._ixKey.buffer.byteLength);
+    check(acache._b2._ixState.buffer.byteLength === ab2StateBytes,
+        () => 't6 Gate ARC: B2 _ixState grew ' + ab2StateBytes + ' -> ' + acache._b2._ixState.buffer.byteLength);
+    check(acache.size === CAP, () => 't6 Gate ARC: churn did not stay at capacity (size ' + acache.size + ')');
+    check(acache._b1._len + acache._b2._len <= acache._ghostCap,
+        () => 't6 Gate ARC: combined ghost exceeded its bound (' + (acache._b1._len + acache._b2._len) + ')');
+    check(acache._t1Size + acache._b1._len <= acache._ghostCap,
+        () => 't6 Gate ARC: |T1|+|B1| exceeded capacity (' + (acache._t1Size + acache._b1._len) + ')');
+    if (!ga.report.ok) {
+        const g = ga.summary.gc;
+        die('t6 Gate ARC (mixed churn) ops gate rejected -- verdict=' + ga.report.verdict +
+            ' source=' + ga.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gaa = runAllocsGate(arcHot, { iterations: 50000, batches: 8 });
+    if (!gaa.ok) {
+        die('t6 Gate ARC (mixed churn) retained-alloc gate rejected -- verdict=' + gaa.report.verdict +
+            ' settled=' + gaa.result.settled + ' bytesPerCall=' + gaa.bytesPerCall);
+    }
+    // Lane coverage (UN-measured): the SAME stream through a counting subclass; counters
+    // reset AFTER the prefill so they reflect ONLY the steady-state window. The plan's floors:
+    // p-adapt >= 100, B1-hit >= 50, B2-hit >= 50, REPLACE-T2 >= 50.
+    const covA = new CoveredArc(CAP, { keys: 'int' });
+    let casi = 0;
+    const covAHot = () => {
+        const k = arcStream[casi & STREAM_MASK]; casi++;
+        if (covA.get(k) === undefined) covA.put(k, k); else covA.get(k);
+    };
+    for (let i = 0; i < PREFILL; i++) covAHot();
+    covA._pAdapts = 0; covA._b1Hits = 0; covA._b2Hits = 0; covA._replaceT2 = 0;
+    for (let i = 0; i < OPS; i++) covAHot();
+    check(covA._pAdapts >= 100,
+        () => 't6 Gate ARC: the window triggered ' + covA._pAdapts + ' p-adaptations (< 100 -- lane not covered)');
+    check(covA._b1Hits >= 50,
+        () => 't6 Gate ARC: the window triggered ' + covA._b1Hits + ' B1 ghost hits (< 50 -- lane not covered)');
+    check(covA._b2Hits >= 50,
+        () => 't6 Gate ARC: the window triggered ' + covA._b2Hits + ' B2 ghost hits (< 50 -- lane not covered)');
+    check(covA._replaceT2 >= 50,
+        () => 't6 Gate ARC: the window triggered ' + covA._replaceT2 + ' REPLACE-of-T2 evictions (< 50 -- lane not covered)');
+    process.stderr.write('t6 Gate ARC: ' + gaa.bytesPerCall.toFixed(5) +
+        ' B/op mixed churn (' + OPS + ' ops window, capacity ' + CAP + '); lanes covered: pAdapt=' +
+        covA._pAdapts + ' b1Hit=' + covA._b1Hits + ' b2Hit=' + covA._b2Hits + ' replaceT2=' + covA._replaceT2 + '\n');
+
     // --- Gate TTL-OFF: byte-identical hot path (decisions/0017) -------------------
     // The off-path decision (D17): a single monomorphic `this._exp === null` guard,
     // KEPT because it costs zero writes on the ttl-OFF path. Proof (a): a non-ttl cache
@@ -726,6 +846,7 @@ export async function run() {
         ['WTinyLfu', new WTinyLfu(CAP)],
         ['Slru', new Slru(CAP)],
         ['TwoQ', new TwoQ(CAP)],
+        ['Arc', new Arc(CAP)],
     ];
     const iterSink = new Int32Array(1);
     for (let m = 0; m < iterMembers.length; m++) {

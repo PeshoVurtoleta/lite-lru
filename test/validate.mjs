@@ -76,6 +76,16 @@ export function activeListsOf(cache) {
             { name: 'twoq-a1in', head: cache._a1Head, tail: cache._a1Tail, doubly: true },
         ];
     }
+    // An Arc member (decisions/0016) threads TWO doubly-linked LRU lists through the shared
+    // _next/_prev columns (detected by its `_t1Head` T1 endpoint): T2 (frequent) and T1
+    // (recent). The keys-only B1/B2 ghosts hold no resident slot. The SAME checker sums
+    // over both (D16.5 iteration order: T2 then T1).
+    if (cache._t1Head !== undefined) {
+        return [
+            { name: 'arc-t2', head: cache._t2Head, tail: cache._t2Tail, doubly: true },
+            { name: 'arc-t1', head: cache._t1Head, tail: cache._t1Tail, doubly: true },
+        ];
+    }
     // A SIEVE member (decisions/0012) exposes _head/_tail on a single doubly-linked
     // FIFO ring (detected by its moving `_hand`). Classic LRU exposes the same shape
     // as a recency DLL. Both are ONE doubly-linked list -> one descriptor.
@@ -300,6 +310,32 @@ export function validate(cache, lists) {
         if (cache._gLen > cache._ghostCap) {
             throw new Error(
                 '[validate] twoq ghostCount(' + cache._gLen + ') > ghostCap(' + cache._ghostCap + ')');
+        }
+    }
+
+    // --- term 11 (Arc members, decisions/0016): segments + the two ghost bounds --
+    // A no-op unless the member exposes `_t1Head`. For an Arc: the two list sizes sum to
+    // size, every `_seg` byte is 0/1, `p` is in [0, capacity], and the two ghost bounds
+    // hold -- |T1|+|B1| <= c and |B1|+|B2| <= c (D16.2). The two-list population is already
+    // summed by term 3/4 via activeListsOf above.
+    if (cache._t1Head !== undefined) {
+        if (cache._t1Size + cache._t2Size !== size) {
+            throw new Error(
+                '[validate] arc t1Size(' + cache._t1Size + ') + t2Size(' + cache._t2Size +
+                ') != size(' + size + ')');
+        }
+        for (let i = 0; i < cap; i++) {
+            if (cache._seg[i] > 1) throw new Error('[validate] arc _seg[' + i + '] = ' + cache._seg[i] + ' > 1');
+        }
+        if (cache._p < 0 || cache._p > cap) {
+            throw new Error('[validate] arc p(' + cache._p + ') out of [0,' + cap + ']');
+        }
+        const b1 = cache._b1._len, b2 = cache._b2._len;
+        if (cache._t1Size + b1 > cap) {
+            throw new Error('[validate] arc t1Size(' + cache._t1Size + ') + b1(' + b1 + ') > capacity(' + cap + ')');
+        }
+        if (b1 + b2 > cap) {
+            throw new Error('[validate] arc b1(' + b1 + ') + b2(' + b2 + ') > capacity(' + cap + ')');
         }
     }
 }

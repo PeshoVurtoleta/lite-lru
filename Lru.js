@@ -110,6 +110,12 @@ const SLRU_PROTECTED = 1;
 const TWOQ_A1IN = 0;
 const TWOQ_AM = 1;
 
+/** ARC (decisions/0016, D16) segment tags: which of the two intrusive LRU lists a resident
+ *  slot is in (T1 recent / T2 frequent). Stored one byte per slot in `_seg` so `_detach`
+ *  fixes the RIGHT list's head/tail. The keys-only B1/B2 ghosts hold no resident slot. */
+const ARC_T1 = 0;
+const ARC_T2 = 1;
+
 /** W-TinyLFU count-min sketch shape (decisions/0014, D14.2): 4 rows of 4-bit
  *  saturating counters packed 8-per-Uint32. One per-row seed spreads a key across the
  *  rows; `Math.imul` keeps each mix an EXACT 32-bit multiply (zero-alloc). Built once. */
@@ -206,7 +212,7 @@ function validateStats(stats) {
         "[lite-lru] unknown stats option " + String(stats) + " (did you mean true?)");
 }
 
-export const VERSION = "1.6.0";
+export const VERSION = "1.7.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -3097,6 +3103,584 @@ export class TwoQ {
         if (this._size === 0) return undefined;
         if (this._a1Size > this._a1inCap || this._amSize === 0) return this._keys[this._a1Tail];
         return this._keys[this._amTail];
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * ArcGhost -- one bounded, keys-only ghost list for ARC (decisions/0016, D16.2).
+ * INTERNAL, never an export. The two-ghost realization of the S3-FIFO/TwoQ `_gRing`
+ * pattern (decisions/0013, 0015): a FIFO ring of KEYS (NEVER values) with O(1)
+ * membership, bounded to `cap` at construction and NEVER grown. `keys:'int'` -> strict
+ * zero-alloc (a pow2 Int32 ring + an open-addressed Int32 membership table with
+ * backward-shift deletion, no tombstones); the default Map backing -> a Set membership
+ * + an Array ring (honestly AMORTIZED -- a Set resize can allocate, the D3/D11 caveat).
+ * MRU add at the tail, LRU drop/peek at the head; `consume(key)` removes a specific key
+ * on re-admission (a COLD ring shift, never on the sequential-key hot path). Every
+ * method is zero-alloc on the int path.
+ * -------------------------------------------------------------------------- */
+
+class ArcGhost {
+    constructor(cap, isInt) {
+        this._cap = cap;
+        this._int = isInt;
+        this._len = 0;   // live ghost keys (0 .. cap)
+        this._head = 0;  // ring index of the OLDEST (LRU) key
+        if (cap > 0) {
+            if (isInt) {
+                const need = Math.ceil(cap / 0.75);
+                let gs = 1;
+                while (gs < need) gs <<= 1;
+                this._ixMask = gs - 1;
+                this._ixKey = new Int32Array(gs);
+                this._ixState = new Uint8Array(gs); // 0 = empty, 1 = occupied
+                let rs = 1;
+                while (rs < cap) rs <<= 1; // pow2 ring so indices mask
+                this._ringMask = rs - 1;
+                this._ring = new Int32Array(rs);
+            } else {
+                this._set = new Set();                        // key -> nothing (membership)
+                this._ringArr = new Array(cap).fill(undefined); // FIFO order
+            }
+        }
+    }
+
+    /** True if key is a ghost key (int path is open-addressed, zero-alloc). */
+    has(key) {
+        if (this._cap === 0) return false;
+        if (this._int) {
+            const st = this._ixState, ks = this._ixKey, mask = this._ixMask;
+            let b = hashInt(key, mask);
+            for (;;) {
+                if (st[b] === 0) return false;
+                if (ks[b] === key) return true;
+                b = (b + 1) & mask;
+            }
+        }
+        return this._set.has(key);
+    }
+
+    /** Add key at the MRU (tail) end. Caller GUARANTEES room (_len < cap). */
+    addMRU(key) {
+        if (this._cap === 0) return;
+        if (this._int) {
+            const pos = (this._head + this._len) & this._ringMask;
+            this._ring[pos] = key;
+            this._memAdd(key);
+        } else {
+            const pos = (this._head + this._len) % this._cap;
+            this._ringArr[pos] = key;
+            this._set.add(key);
+        }
+        this._len++;
+    }
+
+    /** Drop the LRU (oldest, head) key and return it. Caller GUARANTEES _len > 0. */
+    delLRU() {
+        if (this._int) {
+            const key = this._ring[this._head];
+            this._memDel(key);
+            this._head = (this._head + 1) & this._ringMask;
+            this._len--;
+            return key;
+        }
+        const key = this._ringArr[this._head];
+        this._set.delete(key);
+        this._ringArr[this._head] = undefined; // drop the key ref (retention hygiene)
+        this._head = (this._head + 1) % this._cap;
+        this._len--;
+        return key;
+    }
+
+    /** Remove a SPECIFIC key (re-admission). COLD ring shift; never a hot path. */
+    consume(key) {
+        if (this._cap === 0) return;
+        if (this._int) {
+            const mask = this._ringMask;
+            let idx = -1;
+            for (let i = 0; i < this._len; i++) {
+                if (this._ring[(this._head + i) & mask] === key) { idx = i; break; }
+            }
+            if (idx >= 0) {
+                for (let i = idx; i < this._len - 1; i++) {
+                    this._ring[(this._head + i) & mask] = this._ring[(this._head + i + 1) & mask];
+                }
+                this._len--;
+            }
+            this._memDel(key);
+        } else {
+            const cap = this._cap;
+            let idx = -1;
+            for (let i = 0; i < this._len; i++) {
+                if (sameKey(this._ringArr[(this._head + i) % cap], key)) { idx = i; break; }
+            }
+            if (idx >= 0) {
+                for (let i = idx; i < this._len - 1; i++) {
+                    this._ringArr[(this._head + i) % cap] = this._ringArr[(this._head + i + 1) % cap];
+                }
+                this._ringArr[(this._head + this._len - 1) % cap] = undefined;
+                this._len--;
+            }
+            this._set.delete(key);
+        }
+    }
+
+    /** Empty the ghost (retention hygiene: drop every key ref). */
+    clear() {
+        if (this._cap > 0) {
+            if (this._int) this._ixState.fill(0);
+            else { this._set.clear(); this._ringArr.fill(undefined); }
+        }
+        this._head = 0;
+        this._len = 0;
+    }
+
+    /** Int membership insert (open-addressed, no-op if already present). */
+    _memAdd(key) {
+        const st = this._ixState, ks = this._ixKey, mask = this._ixMask;
+        let b = hashInt(key, mask);
+        for (;;) {
+            if (st[b] === 0) { st[b] = 1; ks[b] = key; return; }
+            if (ks[b] === key) return;
+            b = (b + 1) & mask;
+        }
+    }
+
+    /** Int membership delete (backward-shift, no tombstones). */
+    _memDel(key) {
+        const st = this._ixState, ks = this._ixKey, mask = this._ixMask;
+        let b = hashInt(key, mask);
+        for (;;) {
+            if (st[b] === 0) return;
+            if (ks[b] === key) break;
+            b = (b + 1) & mask;
+        }
+        let i = b, j = b;
+        for (;;) {
+            j = (j + 1) & mask;
+            if (st[j] === 0) break;
+            const k = hashInt(ks[j], mask);
+            const inRange = (j > i) ? (i < k && k <= j) : (i < k || k <= j);
+            if (inRange) continue;
+            st[i] = 1; ks[i] = ks[j];
+            i = j;
+        }
+        st[i] = 0;
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * Arc -- the Adaptive Replacement Cache (Megiddo & Modha, FAST'03), decisions/0016,
+ * D16. The seventh named export in this file (same file-shape ruling: single main file
+ * + sideEffects:false + named exports = the tree-shake moat; D16.1 -- ONE adaptive
+ * member, no sibling and no mode flag, so each hot path stays monomorphic).
+ *
+ * ARC splits the resident set into a RECENT list T1 (seen once) and a FREQUENT list T2
+ * (seen 2+), threaded through the shared `_next`/`_prev` columns, tagged per slot by
+ * `_seg` (0 = T1, 1 = T2). `_next` toward the tail (LRU/oldest), `_prev` toward the head
+ * (MRU/newest). A single integer `p` (the T1 target size, 0..c) ADAPTS the split on its
+ * own -- no knobs. Two bounded keys-only ghosts drive it: B1 (keys evicted from T1) and
+ * B2 (keys evicted from T2). A miss whose key is found in B1 means "a RECENT page was
+ * evicted too soon" -> raise `p`; found in B2 means "a FREQUENT page was evicted too
+ * soon" -> lower `p` (D16.3). At capacity a new resident is admitted only after REPLACE
+ * evicts one (D16.4), so the RESIDENT value capacity stays EXACTLY `capacity` -- only the
+ * split adapts, never the total (D16.2, fixed-capacity honesty).
+ *
+ * A hit (get or put-update) promotes the entry to T2 MRU (ARC promotes any hit to
+ * frequent). `has`/`peek` are neutral. A `get` never touches the ghosts (ghost
+ * interaction is a cold `put`-only path, so the get hot path carries no ghost branch).
+ *
+ * Rides the shared `newStore` factory (default Map / opt-in keys:'int' strict-zero), the
+ * conservation invariant, the onEvict fire-after + `_inOnEvict` guard (0002), TTL (0017),
+ * zero-GC iteration (0018), and opt-in stats (0019). The two ghosts reuse the S3-FIFO/
+ * TwoQ ring pattern (ArcGhost above): keys only, bounded at construction, strict-zero on
+ * keys:'int', amortized on the Map backing.
+ * -------------------------------------------------------------------------- */
+
+export class Arc {
+    /**
+     * @param {number} capacity  Max entries. Must be an integer >= 1.
+     * @param {{ onEvict?: (key: any, value: any) => void, keys?: 'int' }} [options]
+     */
+    constructor(capacity, options) {
+        // Fail closed (D9), identical to the rest of the family.
+        if (!Number.isInteger(capacity) || capacity < 1) {
+            throw new RangeError(
+                "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
+            );
+        }
+
+        this._capacity = capacity;
+
+        // TTL (decisions/0017), validated fail-closed at the door -- identical to LiteLru.
+        this._clock = validateClock(options && options.clock);
+        this._ttl = validateTtl(options && options.ttl);
+
+        // Same shared substrate + int-key door as the rest of the family.
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+
+        // Cache the store's columns so the list relinks stay direct.
+        this._keys = this._store._keys;
+        this._vals = this._store._vals;
+        this._next = this._store._next; // toward the tail (LRU/oldest)
+        this._prev = this._store._prev; // toward the head (MRU/newest)
+        this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+
+        // D16 -- one segment tag per slot (0 = T1, 1 = T2) so `_detach` fixes the correct
+        // list. Fixed size, allocated once, never grown.
+        this._seg = new Uint8Array(capacity);
+
+        this._t1Head = NIL; this._t1Tail = NIL; this._t1Size = 0; // T1 (recent) LRU
+        this._t2Head = NIL; this._t2Tail = NIL; this._t2Size = 0; // T2 (frequent) LRU
+        this._size = 0;                                           // _t1Size + _t2Size
+
+        // D16.3 -- the adaptive target size for T1, a single integer (0..capacity). Never
+        // allocates. Starts recency-neutral at 0.
+        this._p = 0;
+
+        // D16.2 -- the two bounded keys-only ghosts, each sized to hold up to `capacity`
+        // keys (|B1| <= c and |B2| <= c follow from the invariants). Combined budget is c.
+        this._ghostCap = capacity;
+        this._ghostInt = (options && options.keys) === 'int';
+        this._b1 = new ArcGhost(capacity, this._ghostInt);
+        this._b2 = new ArcGhost(capacity, this._ghostInt);
+
+        this._onEvict = (options && options.onEvict) || NOOP;
+        this._inOnEvict = false;
+
+        // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
+        this._stats = validateStats(options && options.stats);
+    }
+
+    /** The store factory, delegating to the shared `newStore` (decisions/0011). */
+    _makeStore(capacity, keys, hasTtl) {
+        return newStore(capacity, keys, hasTtl);
+    }
+
+    get size() { return this._size; }
+    get capacity() { return this._capacity; }
+
+    // --- intrusive LRU-list helpers (per-list size accounting) ----------------
+
+    /** Unlink slot s from WHICHEVER list it is in (per `_seg[s]`), fixing that list's
+     *  neighbours + head/tail sentinels + size. */
+    _detach(s) {
+        const p = this._prev[s], n = this._next[s];
+        if (this._seg[s] === ARC_T1) {
+            if (p !== NIL) this._next[p] = n; else this._t1Head = n;
+            if (n !== NIL) this._prev[n] = p; else this._t1Tail = p;
+            this._t1Size--;
+        } else {
+            if (p !== NIL) this._next[p] = n; else this._t2Head = n;
+            if (n !== NIL) this._prev[n] = p; else this._t2Tail = p;
+            this._t2Size--;
+        }
+    }
+
+    /** Insert slot s at the head (MRU end) of T1 (recent). */
+    _pushT1(s) {
+        this._seg[s] = ARC_T1;
+        this._prev[s] = NIL; this._next[s] = this._t1Head;
+        if (this._t1Head !== NIL) this._prev[this._t1Head] = s;
+        this._t1Head = s; if (this._t1Tail === NIL) this._t1Tail = s;
+        this._t1Size++;
+    }
+
+    /** Insert slot s at the head (MRU end) of T2 (frequent). */
+    _pushT2(s) {
+        this._seg[s] = ARC_T2;
+        this._prev[s] = NIL; this._next[s] = this._t2Head;
+        if (this._t2Head !== NIL) this._prev[this._t2Head] = s;
+        this._t2Head = s; if (this._t2Tail === NIL) this._t2Tail = s;
+        this._t2Size++;
+    }
+
+    /** A HIT (get or put-update) promotes the entry to T2 MRU (ARC promotes any hit to
+     *  frequent). A T2-head re-hit early-returns (no relink). */
+    _onHit(s) {
+        if (this._seg[s] === ARC_T2) {
+            if (this._t2Head !== s) { this._detach(s); this._pushT2(s); }
+        } else { // T1 -> promote to frequent
+            this._detach(s);
+            this._pushT2(s);
+        }
+    }
+
+    /** Ensure the combined ghost has room (|B1|+|B2| < c) before an add: drop one LRU
+     *  ghost key from the larger list (ties -> B1). Only entered when combined >= c. */
+    _ghostRoom() {
+        if (this._b1._len + this._b2._len < this._ghostCap) return;
+        if (this._b1._len >= this._b2._len && this._b1._len > 0) this._b1.delLRU();
+        else if (this._b2._len > 0) this._b2.delLRU();
+        else if (this._b1._len > 0) this._b1.delLRU();
+    }
+
+    /**
+     * REPLACE(xInB2) (decisions/0016, D16.4): evict exactly ONE resident to a ghost and
+     * return its (reused-in-place) slot. Evict T1 LRU -> B1 when |T1| >= 1 and (|T1| > p
+     * OR the boundary case xInB2 && |T1| == p); else evict T2 LRU -> B2. Defensively
+     * total: if the chosen list is empty, evict the other. Only ever called at capacity.
+     */
+    _replace(xInB2) {
+        let evictT1 = (this._t1Size >= 1) &&
+            (this._t1Size > this._p || (xInB2 && this._t1Size === this._p));
+        if (!evictT1 && this._t2Size === 0) evictT1 = true;   // T2 empty -> must take T1
+        if (evictT1 && this._t1Size === 0) evictT1 = false;   // T1 empty -> must take T2
+        let t;
+        if (evictT1) {
+            t = this._t1Tail;                 // T1 LRU
+            const k = this._keys[t];
+            this._detach(t);
+            this._store.delete(k);
+            this._ghostRoom();
+            this._b1.addMRU(k);               // T1 eviction -> B1
+        } else {
+            t = this._t2Tail;                 // T2 LRU
+            const k = this._keys[t];
+            this._detach(t);
+            this._store.delete(k);
+            this._ghostRoom();
+            this._b2.addMRU(k);               // T2 eviction -> B2
+        }
+        return t;
+    }
+
+    // --- public API (all zero-alloc on the hot path) --------------------------
+
+    /** Look up a key. A hit promotes to T2 MRU (ARC: any hit -> frequent). @returns the
+     *  value, or undefined if absent (see D7). A get never touches the ghosts. */
+    get(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const s = this._store.get(key);
+        if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
+            this._reap(s);
+            return undefined;
+        }
+        this._onHit(s);
+        if (this._stats !== null) this._stats.hits++; // live hit (0019)
+        return this._vals[s];
+    }
+
+    /**
+     * Insert or update. An update rewrites the value and promotes to T2 (like a hit). A
+     * new key that is in B1 raises `p` and re-admits to T2; in B2 lowers `p` and re-admits
+     * to T2; otherwise enters T1. At capacity one resident is evicted via REPLACE (or the
+     * direct T1 evict) and its slot reused in place. onEvict fires LAST (0002). The
+     * positional `ttlMs` (0017, D17.4) overrides the instance ttl default.
+     */
+    put(key, value, ttlMs) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        let expiresAt;
+        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
+        this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
+        const store = this._store;
+        const existing = store.get(key);
+        if (existing >= 0) {                 // update-in-place + promote to T2
+            this._vals[existing] = value;
+            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            this._onHit(existing);
+            if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
+            return;
+        }
+
+        const c = this._capacity;
+        const inB1 = this._b1.has(key);
+        const inB2 = inB1 ? false : this._b2.has(key);
+        let s, evKey, evVal;
+        let evicted = false;
+
+        if (inB1) {
+            // recency ghost hit (D16.3): raise p using the CURRENT ghost sizes (|B1| >= 1
+            // since key is still in B1), consume the key, re-admit into T2.
+            const b1 = this._b1._len, b2 = this._b2._len;
+            let d = Math.floor(b2 / b1); if (d < 1) d = 1;
+            this._p += d; if (this._p > c) this._p = c;
+            this._b1.consume(key);
+            if (this._size === c) { s = this._replace(false); evKey = this._keys[s]; evVal = this._vals[s]; evicted = true; }
+            else s = store.allocSlot();
+            this._keys[s] = key; this._vals[s] = value;
+            if (this._exp !== null) this._exp[s] = expiresAt;
+            store.set(key, s);
+            this._pushT2(s);
+        } else if (inB2) {
+            // frequency ghost hit (D16.3): lower p, consume the key, re-admit into T2. The
+            // boundary REPLACE (|T1| == p) tips toward evicting T1 (xInB2 = true).
+            const b1 = this._b1._len, b2 = this._b2._len;
+            let d = Math.floor(b1 / b2); if (d < 1) d = 1;
+            this._p -= d; if (this._p < 0) this._p = 0;
+            this._b2.consume(key);
+            if (this._size === c) { s = this._replace(true); evKey = this._keys[s]; evVal = this._vals[s]; evicted = true; }
+            else s = store.allocSlot();
+            this._keys[s] = key; this._vals[s] = value;
+            if (this._exp !== null) this._exp[s] = expiresAt;
+            store.set(key, s);
+            this._pushT2(s);
+        } else {
+            // true miss -> enters T1 (recent).
+            if (this._t1Size === c) {
+                // all resident in T1 (T2 empty, B1 empty): direct evict T1 LRU, NO ghost
+                // (D16.4) -- pushT1 would otherwise overflow |T1| + |B1|.
+                s = this._t1Tail;
+                evKey = this._keys[s]; evVal = this._vals[s];
+                this._detach(s);
+                store.delete(evKey);
+                evicted = true;
+            } else {
+                // keep |T1| + |B1| <= c: free an L1 slot before we push into T1 (D16.4).
+                if (this._t1Size + this._b1._len === c) this._b1.delLRU();
+                if (this._size === c) { s = this._replace(false); evKey = this._keys[s]; evVal = this._vals[s]; evicted = true; }
+                else s = store.allocSlot();
+            }
+            this._keys[s] = key; this._vals[s] = value;
+            if (this._exp !== null) this._exp[s] = expiresAt;
+            store.set(key, s);
+            this._pushT1(s);
+        }
+
+        this._size = this._t1Size + this._t2Size;
+        if (this._stats !== null) this._stats.puts++; // successful insert (outcome-based); 0019
+
+        if (evicted) {
+            if (this._stats !== null) this._stats.evictions++; // capacity eviction (0019)
+            this._inOnEvict = true;
+            try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+        }
+    }
+
+    /** True if key is present (RESIDENT). Ghost keys are NOT present. Promotion-NEUTRAL. A
+     *  stale entry is a MISS and is reaped in place (decisions/0017, D17.3). */
+    has(key) {
+        const s = this._store.get(key);
+        if (s < 0) return false;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return false;
+        }
+        return true;
+    }
+
+    /** Read a value WITHOUT promoting. undefined if absent (see D7). A stale entry is a
+     *  MISS and is reaped in place (decisions/0017, D17.3). */
+    peek(key) {
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return undefined;
+        }
+        return this._vals[s];
+    }
+
+    /** Reap an expired slot in place (decisions/0017): unlink from its list, drop from the
+     *  index, free the slot, and fire onEvict LAST via the 0002 guard. A reap is NOT a
+     *  capacity victim, so it is never ghosted and never moves `p` (like delete). */
+    _reap(s) {
+        this._store._ver++; // D18.6 -- a reap is a structural mutation; invalidate iterators
+        const evKey = this._keys[s];
+        const evVal = this._vals[s];
+        this._detach(s);
+        this._store.delete(evKey);
+        this._store.freeSlot(s);
+        this._size = this._t1Size + this._t2Size;
+        if (this._stats !== null) this._stats.evictions++; // reap = eviction (0019, D19.2)
+        this._inOnEvict = true;
+        try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+    }
+
+    /** Evict every expired resident entry now (decisions/0017, D17.5). COLD, O(size);
+     *  fires onEvict per victim (0002) and returns the count evicted. */
+    purgeStale() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG);
+        if (this._exp === null) return 0;
+        const now = this._clock();
+        const exp = this._exp;
+        const victims = [];
+        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
+        return victims.length;
+    }
+
+    /** Remove a key. Returns true if it was present. Frees the slot, repairs the list it
+     *  was in. A delete is NOT an eviction, so it is never recorded in a ghost and never
+     *  moves `p`. */
+    delete(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const s = store.get(key);
+        if (s < 0) return false;
+        store._ver++; // D18.6 -- a real delete is a structural mutation; invalidate iterators
+        this._detach(s);
+        store.delete(key);
+        store.freeSlot(s);
+        this._size = this._t1Size + this._t2Size;
+        return true;
+    }
+
+    /** Empty the cache. Rebuilds the free list, empties both lists and both ghosts, and
+     *  resets `p`. Allocates nothing. O(capacity). */
+    clear() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
+        this._store.reset();
+        this._t1Head = NIL; this._t1Tail = NIL; this._t1Size = 0;
+        this._t2Head = NIL; this._t2Tail = NIL; this._t2Size = 0;
+        this._size = 0;
+        this._p = 0;
+        this._b1.clear();
+        this._b2.clear();
+    }
+
+    // --- opt-in runtime stats (decisions/0019, D19): cold accessors -----------
+
+    /** The live stats holder (decisions/0019, D19.3), returned BY REFERENCE (borrowed --
+     *  copy what you keep). Fail closed on an instance built without { stats: true }. */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE (decisions/0019); a borrowed holder stays valid.
+     *  Fail closed on a non-stats instance. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        const st = this._stats;
+        st.hits = 0; st.misses = 0; st.evictions = 0; st.puts = 0;
+    }
+
+    // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
+
+    /** The per-member iteration ROSTER (decisions/0018, D18.1 / 0016 D16.5): T2 (frequent,
+     *  MRU->LRU) THEN T1 (recent, MRU->LRU). Two segments concatenated -- NOT global
+     *  recency order. The keys-only B1/B2 ghosts are EXCLUDED. */
+    _iterHeads() { return [this._t2Head, this._t1Head]; }
+
+    keys() { return iterKeys(this); }
+    values() { return iterValues(this); }
+    entries() { return iterEntries(this); }
+    [Symbol.iterator]() { return iterEntries(this); }
+
+    // --- test/debug only (never call on a hot path) ---------------------------
+
+    /** Free-stack length, delegated to the store (conservation invariant). */
+    _freeListLength() {
+        return this._store.freeListLength();
+    }
+
+    /**
+     * The key the NEXT over-capacity insert would evict, computed WITHOUT mutating any
+     * link, size, `p` or ghost (the non-destructive twin of `_replace`). Mirrors
+     * `_replace(false)` (the true-miss / B1-hit convention), so real + oracle agree on a
+     * single, deterministic victim regardless of the incoming key. TEST-ONLY (drives the
+     * torture differential); never a hot path.
+     */
+    _peekVictim() {
+        if (this._size === 0) return undefined;
+        let evictT1 = (this._t1Size >= 1) && (this._t1Size > this._p);
+        if (!evictT1 && this._t2Size === 0) evictT1 = true;
+        if (evictT1 && this._t1Size === 0) evictT1 = false;
+        return evictT1 ? this._keys[this._t1Tail] : this._keys[this._t2Tail];
     }
 }
 

@@ -25,7 +25,7 @@
  */
 
 import { measureOps, checkNoGc, measureAllocs, checkAllocs } from '@zakkster/lite-gc-profiler';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../../Lru.js';
 import { makeLruOracle, svz } from './oracles/lru.mjs';
 import { makeFifoOracle, makeFifoReal } from './oracles/fifo.mjs';
 import { makeSieveOracle } from './oracles/sieve.mjs';
@@ -33,6 +33,7 @@ import { makeS3FifoOracle } from './oracles/s3fifo.mjs';
 import { makeWTinyLfuOracle } from './oracles/wtinylfu.mjs';
 import { makeSlruOracle } from './oracles/slru.mjs';
 import { makeTwoQOracle } from './oracles/twoq.mjs';
+import { makeArcOracle } from './oracles/arc.mjs';
 
 export { validate } from '../validate.mjs';
 
@@ -344,6 +345,37 @@ export const twoqIntPolicy = {
     oracle: (cap) => makeTwoQOracle(cap),
 };
 
+/** Wrap a real Arc as a uniform driver. victim via `_peekVictim` (test-only). */
+export function wrapArc(cache) {
+    return {
+        get: (k) => cache.get(k),
+        put: (k, v, t) => cache.put(k, v, t),
+        has: (k) => cache.has(k),
+        peek: (k) => cache.peek(k),
+        delete: (k) => cache.delete(k),
+        size: () => cache.size,
+        victim: () => cache._peekVictim(),
+        raw: cache,
+    };
+}
+
+/** The Arc policy (decisions/0016): the adaptive member + its own independent
+ *  two-list/two-ghost/`p` oracle. Default backing (Map): arbitrary keys. */
+export const arcPolicy = {
+    name: 'arc',
+    real: (cap) => wrapArc(new Arc(cap)),
+    oracle: (cap) => makeArcOracle(cap),
+};
+
+/** The Arc policy on the INTEGER substrate backing (`keys: 'int'`), driven against the
+ *  SAME arc oracle: the strict-zero backing (incl. the int B1/B2 ghost rings +
+ *  membership tables) must return byte-identical values + victims. */
+export const arcIntPolicy = {
+    name: 'arc-int',
+    real: (cap) => wrapArc(new Arc(cap, { keys: 'int' })),
+    oracle: (cap) => makeArcOracle(cap),
+};
+
 /* -------------------------------------------------------------------------- *
  * TTL policies (decisions/0017). The factories FORWARD a construction-options arg
  * `o` (the { ttl, clock } the runner injects) to BOTH the real cache and its oracle,
@@ -392,6 +424,13 @@ export const twoqTtlPolicy = {
     name: 'twoq-ttl',
     real: (cap, o) => wrapTwoQ(new TwoQ(cap, o)),
     oracle: (cap, o) => makeTwoQOracle(cap, o),
+};
+
+/** Arc with an opt-in TTL default (decisions/0017). */
+export const arcTtlPolicy = {
+    name: 'arc-ttl',
+    real: (cap, o) => wrapArc(new Arc(cap, o)),
+    oracle: (cap, o) => makeArcOracle(cap, o),
 };
 
 /* -------------------------------------------------------------------------- *

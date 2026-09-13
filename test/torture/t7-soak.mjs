@@ -11,7 +11,7 @@
  * the payload refs). The census is the teeth for that.
  */
 
-import { LiteLru, S3Fifo, WTinyLfu, Slru, TwoQ } from '../../Lru.js';
+import { LiteLru, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../../Lru.js';
 import { createLeakTracker } from '@zakkster/lite-leak';
 import { check, validate, censusOk, settleGc } from './harness.mjs';
 
@@ -198,6 +198,44 @@ export async function run() {
         check(qrefs.length > 0, () => 't7 twoq: census sample was empty (nothing to prove)');
         check(censusOk(qrefs),
             () => 't7 twoq: an evicted value is still live -- the A1out ghost is retaining values (leak)');
+    }
+
+    // --- Arc soak (decisions/0016): build/clear cycles + the GHOST-retains-no-values
+    // census. The two ghosts B1/B2 fingerprint evicted keys; they must retain only KEYS
+    // (bounded so |B1|+|B2| <= c), NEVER values. Push distinct int keys so every eviction
+    // records a fresh ghost key, sample the evicted VALUE objects, and prove they are
+    // collectible after teardown even though their keys may still sit in a ghost. Each
+    // cycle: conservation mid-life (both lists + both ghost bounds), size 0 + free list
+    // restored + ghosts empty + p reset after clear.
+    {
+        const arefs = [];
+        const atracker = createLeakTracker({ name: 'arc-soak' });
+        for (let cyc = 0; cyc < 1024; cyc++) {
+            const cache = new Arc(CAP, { keys: 'int' });
+            const h = atracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
+            for (let i = 0; i < CAP * 3; i++) {
+                const val = { c: cyc, i };
+                cache.put(cyc * 100000 + i, val); // distinct int keys => real ghost churn
+                if ((i & 1) === 0) cache.get(cyc * 100000 + i); // promote some to T2
+                if ((cyc & 63) === 0 && (i & 7) === 0) arefs.push(new WeakRef(val));
+            }
+            check(cache.size === CAP, () => 't7 arc: not full mid-life (size ' + cache.size + ')');
+            check(cache._b1._len + cache._b2._len <= cache._ghostCap, () => 't7 arc: combined ghost exceeded bound');
+            check(cache._t1Size + cache._b1._len <= cache._ghostCap, () => 't7 arc: |T1|+|B1| exceeded bound');
+            validate(cache); // conservation mid-life (both lists + both ghost bounds)
+            cache.clear();
+            check(cache.size === 0, () => 't7 arc: size != 0 after clear (cycle ' + cyc + ')');
+            check(cache._freeListLength() === CAP, () => 't7 arc: free list != capacity after clear (cycle ' + cyc + ')');
+            check(cache._b1._len === 0 && cache._b2._len === 0, () => 't7 arc: ghosts not empty after clear (cycle ' + cyc + ')');
+            check(cache._p === 0, () => 't7 arc: p not reset after clear (cycle ' + cyc + ')');
+            validate(cache);
+            atracker.untrack(h);
+        }
+        check(atracker.size() === 0, () => 't7 arc: leak tracker size ' + atracker.size() + ' != 0');
+        await settleGc(6);
+        check(arefs.length > 0, () => 't7 arc: census sample was empty (nothing to prove)');
+        check(censusOk(arefs),
+            () => 't7 arc: an evicted value is still live -- a B1/B2 ghost is retaining values (leak)');
     }
 
     // --- TTL soak (decisions/0017): expiry churn + conservation + purgeStale + census

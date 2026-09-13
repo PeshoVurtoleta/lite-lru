@@ -507,6 +507,60 @@ export class TwoQ<K = unknown, V = unknown> implements LiteCache<K, V> {
   get capacity(): number;
 }
 
+/**
+ * A fixed-capacity ARC (Adaptive Replacement Cache; Megiddo & Modha, FAST'03) with O(1)
+ * amortized get/put/has/peek/delete over a RECENT list T1 + a FREQUENT list T2, plus two
+ * bounded keys-only ghosts (B1, B2) driving a self-tuning integer `p` (decisions/0016).
+ * The no-tuning adaptive member of the family and an implementation of `LiteCache`.
+ *
+ * ARC splits the resident set into T1 (seen once) and T2 (seen 2+) and ADAPTS the split
+ * on its own -- no knobs. A hit (get or put-update) promotes to T2 (frequent). A new key
+ * found in B1 (recent ghost) raises `p` and re-admits to T2; found in B2 (frequent ghost)
+ * lowers `p` and re-admits to T2; otherwise it enters T1. At capacity REPLACE evicts the
+ * T1 or T2 LRU (per `p` and a boundary rule) to the matching ghost, so the RESIDENT value
+ * capacity stays EXACTLY `capacity` -- only the split adapts, never the total. `has`/`peek`
+ * are neutral; the ghosts hold KEYS only, never values, and are bounded at construction.
+ * Same `LiteCache` surface as `LiteLru`, so `new LiteLru(n)` swaps for `new Arc(n)` and
+ * stays type-checked -- the policy difference is INTERNAL.
+ *
+ * See `LiteCache` for the D7 undefined-value contract and `LiteCacheOptions.onEvict` for
+ * the reentrancy contract -- both hold here. The optional `keys: 'int'` backing
+ * (decisions/0011) applies identically: 32-bit signed integer keys, strict zero-GC
+ * (including the int B1/B2 ghost rings + membership tables).
+ *
+ * @typeParam K key type (any value; SameValueZero equality via the internal Map)
+ * @typeParam V value type
+ */
+export class Arc<K = unknown, V = unknown> implements LiteCache<K, V> {
+  /**
+   * @param capacity max entries; must be an integer >= 1 (else throws RangeError,
+   *                 fail-closed -- null is not zero).
+   * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
+   */
+  constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  get(key: K): V | undefined;
+  put(key: K, value: V, ttlMs?: number): void;
+  has(key: K): boolean;
+  peek(key: K): V | undefined;
+  delete(key: K): boolean;
+  clear(): void;
+  purgeStale(): number;
+  /** Live runtime counters (decisions/0019). BORROWED holder -- copy what you keep;
+   *  throws on an instance built without { stats: true } (fail-closed). */
+  stats(): CacheStats;
+  /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
+  resetStats(): void;
+  keys(): IterableIterator<K>;
+  values(): IterableIterator<V>;
+  entries(): IterableIterator<[K, V]>;
+  /** Iterable protocol == entries(); the yielded [K, V] tuple is BORROWED/reused
+   *  (decisions/0018) -- copy what you keep. Only a copying map materializes
+   *  (Array.from(c.entries(), ([k,v])=>[k,v])); a bare spread reads all-undefined. */
+  [Symbol.iterator](): IterableIterator<[K, V]>;
+  get size(): number;
+  get capacity(): number;
+}
+
 /** The package version (kept in lock-step with package.json + Lru.js). */
 export const VERSION: string;
 

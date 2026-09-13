@@ -7,6 +7,80 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.7.0] - 2026-09-13
+
+### Added
+
+- **`Arc` -- the Adaptive Replacement Cache** (Megiddo & Modha, FAST'03; patent
+  expired), decisions/0016, D16, as ONE new named export over the shared substrate --
+  NOT a member with a mode flag (D16.1), so the hot path stays monomorphic and the
+  tree-shake stays clean. It implements the SAME `LiteCache<K,V>` surface, so
+  `new LiteLru(n)` swaps for `new Arc(n)` and stays type-checked.
+  - Splits the resident set into a RECENT list T1 (seen once) and a FREQUENT list T2
+    (seen 2+), threaded through the shared `_next`/`_prev` columns and tagged per slot
+    by `_seg`. A single integer `p` (the T1 target, `0..capacity`) ADAPTS the split at
+    runtime -- no knobs. A hit (get or put-update) promotes to T2 (frequent);
+    `has`/`peek` are neutral.
+  - Two bounded, keys-only ghosts drive the adaptation, reusing the S3-FIFO/TwoQ ring
+    pattern (`ArcGhost`): B1 (keys evicted from T1) and B2 (keys evicted from T2),
+    strict zero-alloc on `keys: 'int'`, amortized on the default Map backing. On a new
+    `put`, a key found in B1 raises `p` (`p += max(1, floor(|B2|/|B1|))`, capped at
+    capacity) and re-admits to T2; a key found in B2 lowers `p`
+    (`p -= max(1, floor(|B1|/|B2|))`, floored at 0) and re-admits to T2 (D16.3).
+  - At capacity, REPLACE evicts the T1 LRU (to B1) when `|T1| > p` or the boundary
+    `key-in-B2 && |T1| == p`, else the T2 LRU (to B2); the all-recent `|T1| == c` edge
+    direct-evicts the T1 LRU with no ghost (D16.4). The RESIDENT value capacity stays
+    EXACTLY `capacity` -- only the split adapts, never the total (D16.2, fixed-capacity
+    honesty). The bounds `|T1|+|B1| <= c` and `|B1|+|B2| <= c` hold and are validated.
+- **`decisions/0016-arc.md`** -- D16.1 one export (no sibling, no mode flag) + why;
+  D16.2 fixed-capacity honesty + the two ghost bounds; D16.3 the `p` adaptation rule
+  and direction; D16.4 REPLACE incl. the `|T1| == p` boundary and the all-T1 direct
+  evict; D16.5 iteration order (T2 then T1); D16.6 outcome-based stats (ghost moves and
+  `p` adaptation are NOT evictions).
+- **`test/torture/oracles/arc.mjs`** -- an independent brute-force ARC reference (plain
+  arrays for T1/T2/B1/B2 + an integer `p`), driving the differential on both backings.
+- **`test/Arc.test.js`** -- a node:test boundary suite (the `p` rule at its edges,
+  ghost-driven re-admission, the `|T1| == p` REPLACE boundary, degenerate caps 1/2/3 +
+  a caps 1..4 sweep, has/peek neutrality, reentrancy, `keys: 'int'` parity).
+- Torture coverage for `Arc`: t0 (promote-to-T2, `p`-adaptation DIRECTION on B1/B2 ghost
+  hits, REPLACE victim, iteration order), t1 (degenerate keys/values), t2 (a cap-sized
+  distinct-key scan evicts 0 T2 entries + degenerate caps + a PHASE-CHANGE law asserting
+  `p` moves the right way), t5 (differential fuzz vs `arc.mjs`, both backings, caps
+  1..9 + 64, +/- TTL), t6 (`Gate ARC`, strict zero-alloc mixed churn with non-vacuous
+  lane coverage), t7 (build/clear soak + the ghost-retains-no-values census), and t9
+  controls (`arc-p-frozen`, `arc-unbounded-ghost` -- each diverges/drifts and fails).
+
+### Changed
+
+- `LiteCache<K,V>` gains no members; `Lru.d.ts` adds `class Arc<K,V>` (the same
+  14-member surface), and the dts-drift gate now counts it (test (i) + an
+  implements-clause control). The named export set grows from six members to seven.
+- **`benchmark/Bench.mjs` now rosters all seven members** (`LiteLru`, `Sieve`,
+  `S3Fifo`, `WTinyLfu`, `Slru`, `TwoQ`, `Arc`); the `Bench.test.js` member-count/name
+  contract moved from 6 to 7, so the shipped "measure your policy" tool never silently
+  omits `Arc`.
+- Tests: 888 -> 987 node:test cases (`Arc` added to the parameterized Stats / Ttl /
+  Iteration suites, plus the dedicated `Arc` boundary suite -- including the independent
+  hand-derived ghost-trim assertions -- and dts/types coverage).
+  `README.md` and `llms.txt` gain an `Arc` section and the updated counts.
+
+### Gated (measured this release)
+
+- `Gate ARC`: 60,000 mixed int-key ops at capacity 4096 -> 0 major GC, `maxPauseMs 4`,
+  0.00176 B/op retained, all backing typed-array byteLengths (`_seg` / `_next` /
+  `_prev` / `_ixSlot` / both ghost rings + membership tables) invariant across the run,
+  and `_b1.len + _b2.len <= capacity`, `_t1Size + _b1.len <= capacity` always. The
+  workload provably drives the distinguishing lanes -- lane-coverage counts asserted:
+  p-adapt 15173, B1-hit 7569, B2-hit 7604, REPLACE-of-T2 18926 -- so the near-zero
+  figure is not vacuous on the adaptive paths.
+- Differential: 100,000 ops per config across capacities 1..9 (including the degenerate
+  small-cap edges) and 64, on both backings, plus TTL, with zero divergence in value /
+  size / eviction victim against the independent oracle.
+- Bench (seed 0x9e3779b9, capacity 256, 200,000 ops, node v26 arm64 -- MACHINE-LOCAL,
+  reproduce on your own hardware): `Arc` hit% / %OPT / writes-per-hit -- zipf
+  65.5 / 88.1 / 4.785, scan 49.9 / 100.0 / 4.949, loop 0.0 / 0.0 / 0.000 (the LRU-family
+  loop pathology; only frequency-sketch W-TinyLFU survives a loop larger than the cache).
+
 ## [1.6.0] - 2026-09-13
 
 ### Added

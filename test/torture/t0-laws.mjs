@@ -15,8 +15,8 @@
  * corrupt structure still fails the tier.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc } from './harness.mjs';
 
 const NIL = -1;
 
@@ -359,6 +359,106 @@ export function run() {
         void wrapTwoQ(c);
     }
 
+    // --- Arc laws (decisions/0016) ----------------------------------------------
+    const ARC_T1 = 0, ARC_T2 = 1; // matches Lru.js tags
+
+    // A1: a hit PROMOTES to T2 (frequent). A newcomer enters T1 (recent); get(X) once
+    // moves X to T2 (ARC promotes any hit to frequent). has/peek are neutral.
+    {
+        const c = new Arc(8);
+        c.put('x', 1);
+        check(c._seg[c._store.get('x')] === ARC_T1, () => 't0 A1: newcomer did not enter T1');
+        c.get('x'); // hit -> promote to T2
+        check(c._seg[c._store.get('x')] === ARC_T2, () => 't0 A1: a hit did not promote to T2');
+        c.put('y', 2);
+        check(c._seg[c._store.get('y')] === ARC_T1, () => 't0 A1: setup for neutrality invalid');
+        c.has('y'); c.peek('y');
+        check(c._seg[c._store.get('y')] === ARC_T1, () => 't0 A1: has/peek promoted (must be neutral)');
+        validate(c);
+    }
+
+    // A2: p-adaptation DIRECTION. A B1 (recent ghost) hit RAISES p; a B2 (frequent ghost)
+    // hit LOWERS p. This is the pinned adaptive law -- a p-frozen Arc is the t9 control.
+    {
+        // Stage B1: fill T2 (so |T1| < c and REPLACE at p==0 prefers T1), leave 2 in T1, one
+        // true miss evicts the T1 LRU 'r0' into B1 (an all-T1 cache direct-evicts, D16.4).
+        let evicted;
+        const c = new Arc(8, { onEvict: (k) => { evicted = k; } });
+        for (let i = 0; i < 6; i++) { c.put('t' + i, i); c.get('t' + i); } // t0..t5 -> T2
+        c.put('r0', 0); c.put('r1', 1);       // T1: r0(LRU), r1(MRU); size 8, p == 0
+        c.put('x', 99);                       // true miss -> REPLACE evicts T1 LRU r0 -> B1
+        check(evicted === 'r0' && c._b1.has('r0'), () => 't0 A2: staging B1 failed (evicted ' + String(evicted) + ')');
+        const pBefore = c._p;
+        c.put('r0', 999); // B1 hit -> p += max(1, floor(|B2|/|B1|))
+        check(c._p > pBefore, () => 't0 A2: a B1 (recent-ghost) hit did not RAISE p (' + pBefore + ' -> ' + c._p + ')');
+        check(c._seg[c._store.get('r0')] === ARC_T2, () => 't0 A2: a B1 re-admit did not route to T2');
+        validate(c);
+
+        const d = new Arc(4);
+        for (let i = 0; i < 4; i++) { d.put(i, i); d.get(i); } // all promoted to T2
+        for (let i = 200; i < 220; i++) d.put(i, i);           // flood -> T2 evictions -> B2
+        check(d._b2._len > 0, () => 't0 A2: B2 empty after a T2 flood (setup invalid)');
+        let b2key = -1;
+        for (let k = 0; k < 4; k++) if (d._b2.has(k)) { b2key = k; break; }
+        check(b2key >= 0, () => 't0 A2: no B2 key to re-reference (setup invalid)');
+        d._p = d._capacity; // force p high so a decrease is observable (floored at 0 otherwise)
+        const pBefore2 = d._p;
+        d.put(b2key, 888); // B2 hit -> p -= max(1, floor(|B1|/|B2|))
+        check(d._p < pBefore2, () => 't0 A2: a B2 (frequent-ghost) hit did not LOWER p (' + pBefore2 + ' -> ' + d._p + ')');
+        check(d._seg[d._store.get(b2key)] === ARC_T2, () => 't0 A2: a B2 re-admit did not route to T2');
+        validate(d);
+    }
+
+    // A3: REPLACE victim. With p == 0, |T1| > p whenever T1 is non-empty -> the next
+    // capacity victim is the T1 LRU, evicted into B1 (T2 non-empty so it is a REPLACE, not
+    // the all-T1 direct-evict edge, which records NO ghost -- D16.4).
+    {
+        const c = new Arc(4);
+        c.put('a', 1); c.get('a');                   // a -> T2
+        c.put('b', 2); c.put('c', 3); c.put('d', 4); // T1: b(LRU),c,d(MRU); p=0
+        check(c._p === 0, () => 't0 A3: p not 0 at start');
+        check(wrapArc(c).victim() === 'b', () => 't0 A3: expected T1 LRU "b" as victim, got ' + wrapArc(c).victim());
+        let evKey;
+        const e = new Arc(4, { onEvict: (k) => { evKey = k; } });
+        e.put('a', 1); e.get('a');
+        e.put('b', 2); e.put('c', 3); e.put('d', 4);
+        e.put('x', 5); // true miss at capacity -> REPLACE evicts T1 LRU 'b' into B1
+        check(evKey === 'b', () => 't0 A3: REPLACE did not evict the T1 LRU (evicted ' + String(evKey) + ')');
+        check(!e.has('b'), () => 't0 A3: evicted key still present');
+        check(e._b1.has('b'), () => 't0 A3: the T1-evicted key was not recorded in B1');
+        check(e.size === 4, () => 't0 A3: size drifted from capacity');
+        // The all-T1 edge (|T1| == c) evicts directly with NO ghost record (D16.4).
+        const f = new Arc(4);
+        f.put(1, 1); f.put(2, 2); f.put(3, 3); f.put(4, 4); // all T1
+        f.put(5, 5); // |T1| == c -> direct evict of the T1 LRU 1, not ghosted
+        check(!f.has(1), () => 't0 A3: all-T1 edge did not evict the T1 LRU');
+        check(!f._b1.has(1), () => 't0 A3: all-T1 direct evict wrongly recorded a ghost');
+        validate(e); validate(f);
+    }
+
+    // A4: scan resistance -- a proven-frequent SET (in T2) survives a distinct one-hit flood.
+    {
+        const N = 64; const HOT = 8;
+        const c = new Arc(N);
+        for (let h = 0; h < HOT; h++) { const k = 'hot' + h; c.put(k, h); c.get(k); } // promote to T2
+        for (let h = 0; h < HOT; h++) check(c._seg[c._store.get('hot' + h)] === ARC_T2, () => 't0 A4: hot key ' + h + ' not in T2');
+        while (c.size < N) c.put('warm' + c.size, c.size);
+        check(c.size === N, () => 't0 A4: arc not full before the scan');
+        for (let i = 0; i < 8000; i++) {
+            for (let h = 0; h < HOT; h++) check(c.get('hot' + h) === h, () => 't0 A4: hot key ' + h + ' lost mid-scan at ' + i);
+            c.put('scan' + i, i);
+            check(c.size === N, () => 't0 A4: arc drifted from capacity during the scan');
+            check(c._b1._len + c._b2._len <= c._ghostCap, () => 't0 A4: combined ghost exceeded its bound');
+            if ((i & 511) === 0) validate(c);
+        }
+        for (let h = 0; h < HOT; h++) check(c.has('hot' + h), () => 't0 A4: T2 hot key ' + h + ' evicted by the scan (no scan resistance)');
+        let survivors = 0;
+        for (let i = 0; i < 8000; i++) if (c.has('scan' + i)) survivors++;
+        check(survivors < N, () => 't0 A4: too many scan keys survived (' + survivors + ') -- eviction not exercised');
+        validate(c);
+        void wrapArc(c);
+    }
+
     // --- TTL laws (decisions/0017) ----------------------------------------------
 
     // T1: stale = MISS, and the MISS does NOTHING to policy state. get() on an expired
@@ -480,6 +580,18 @@ export function run() {
         check(c._amHead !== NIL, () => 't0 ITER twoq: Am empty (setup invalid)');
         check(c._a1Head !== NIL, () => 't0 ITER twoq: A1in empty (setup invalid)');
         checkIterOrder('twoq', c, [c._amHead, c._a1Head]);
+        validate(c);
+    }
+
+    // I8 Arc -- T2 (_t2Head..) THEN T1 (_t1Head..), each MRU..LRU (decisions/0016, D16.5).
+    {
+        const c = new Arc(20);
+        for (let i = 0; i < 20; i++) c.put(i, i);      // all newcomers -> T1
+        for (let i = 0; i < 10; i++) c.get(i);         // hits -> promote to T2
+        for (let i = 100; i < 106; i++) c.put(i, i);   // fresh newcomers -> T1
+        check(c._t2Head !== NIL, () => 't0 ITER arc: T2 empty (setup invalid)');
+        check(c._t1Head !== NIL, () => 't0 ITER arc: T1 empty (setup invalid)');
+        checkIterOrder('arc', c, [c._t2Head, c._t1Head]);
         validate(c);
     }
 

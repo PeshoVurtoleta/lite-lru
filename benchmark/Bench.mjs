@@ -29,7 +29,7 @@
  * @license MIT
  */
 
-import {LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, VERSION} from '../Lru.js';
+import {LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, VERSION} from '../Lru.js';
 
 /* -------------------------------------------------------------------------- *
  * Seeded PRNG -- xorshift32, the same generator the torture harness uses, so a
@@ -331,6 +331,7 @@ const MEMBERS = [
     {name: 'WTinyLfu', ctor: WTinyLfu},
     {name: 'Slru', ctor: Slru},
     {name: 'TwoQ', ctor: TwoQ},
+    {name: 'Arc', ctor: Arc},
 ];
 
 /* -------------------------------------------------------------------------- *

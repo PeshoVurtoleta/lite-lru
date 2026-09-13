@@ -20,12 +20,12 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../Lru.js';
 import { validate } from './validate.mjs';
 
-/** Every family member, so each test body runs SIX TIMES over the exact same
+/** Every family member, so each test body runs SEVEN TIMES over the exact same
  *  LiteCache surface (the TTL contract is stated once on LiteCache, decisions/0017).
- *  Slru/TwoQ ride the identical `_exp`/`_clock`/`_reap` substrate (decisions/0015). */
+ *  Slru/TwoQ/Arc ride the identical `_exp`/`_clock`/`_reap` substrate (decisions/0015, 0016). */
 const MEMBERS = [
     { name: 'LiteLru', Ctor: LiteLru },
     { name: 'Sieve', Ctor: Sieve },
@@ -33,6 +33,7 @@ const MEMBERS = [
     { name: 'WTinyLfu', Ctor: WTinyLfu },
     { name: 'Slru', Ctor: Slru },
     { name: 'TwoQ', Ctor: TwoQ },
+    { name: 'Arc', Ctor: Arc },
 ];
 
 /** A hoisted, mutable virtual clock -- zero-alloc per call, fully controlled by the

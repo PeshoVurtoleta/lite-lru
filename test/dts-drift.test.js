@@ -121,6 +121,11 @@ function twoqImplementsLiteCache(dtsText) {
   return /class TwoQ<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
 }
 
+/** True if the d.ts declares `class Arc<...> implements LiteCache<...>`. */
+function arcImplementsLiteCache(dtsText) {
+  return /class Arc<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
+}
+
 /** True if BOTH sources declare a `Sieve` class (the second named export). */
 function jsDeclaresSieve(jsText) {
   return /export class Sieve\b/.test(jsText);
@@ -159,6 +164,14 @@ function jsDeclaresTwoQ(jsText) {
 }
 function dtsDeclaresTwoQ(dtsText) {
   return /export class TwoQ\b/.test(dtsText);
+}
+
+/** True if BOTH sources declare an `Arc` class (the seventh named export). */
+function jsDeclaresArc(jsText) {
+  return /export class Arc\b/.test(jsText);
+}
+function dtsDeclaresArc(dtsText) {
+  return /export class Arc\b/.test(dtsText);
 }
 
 /** Symmetric-difference report between two sets: [] when equal. */
@@ -280,6 +293,22 @@ test('(h) TwoQ surface: TwoQ is a named export in BOTH sources, members agree, i
   assert.ok(twoqImplementsLiteCache(DTS), 'class TwoQ must `implements LiteCache<...>`');
 });
 
+test('(i) Arc surface: Arc is a named export in BOTH sources, members agree, implements LiteCache', () => {
+  assert.ok(jsDeclaresArc(JS), 'Lru.js must `export class Arc` (the seventh named export)');
+  assert.ok(dtsDeclaresArc(DTS), 'Lru.d.ts must `export class Arc`');
+  const js = classMembers(JS, 'Arc');
+  const dts = classMembers(DTS, 'Arc');
+  const diffs = setDiff(js, dts, 'Lru.js', 'Lru.d.ts');
+  assert.deepEqual(diffs, [], diffs.join('; '));
+  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'purgeStale', 'stats', 'resetStats', 'keys', 'values', 'entries', 'size', 'capacity']) {
+    assert.ok(js.has(nm), 'Lru.js class Arc is missing public member ' + nm);
+    assert.ok(dts.has(nm), 'Lru.d.ts class Arc is missing member ' + nm);
+  }
+  assert.equal(js.size, 14, 'expected exactly 14 public members in Arc (Lru.js), saw ' + js.size);
+  assert.equal(dts.size, 14, 'expected exactly 14 members in Arc (Lru.d.ts), saw ' + dts.size);
+  assert.ok(arcImplementsLiteCache(DTS), 'class Arc must `implements LiteCache<...>`');
+});
+
 // --- teeth: each check must reject a mutated COPY (non-vacuity) --------------
 
 test('control: unmutated text reports zero diffs / all-present (vacuity)', () => {
@@ -291,6 +320,7 @@ test('control: unmutated text reports zero diffs / all-present (vacuity)', () =>
   assert.deepEqual(setDiff(classMembers(JS, 'WTinyLfu'), classMembers(DTS, 'WTinyLfu'), 'a', 'b'), []);
   assert.deepEqual(setDiff(classMembers(JS, 'Slru'), classMembers(DTS, 'Slru'), 'a', 'b'), []);
   assert.deepEqual(setDiff(classMembers(JS, 'TwoQ'), classMembers(DTS, 'TwoQ'), 'a', 'b'), []);
+  assert.deepEqual(setDiff(classMembers(JS, 'Arc'), classMembers(DTS, 'Arc'), 'a', 'b'), []);
   assert.ok(hasLiteCacheInterface(DTS));
   assert.ok(liteLruImplementsLiteCache(DTS));
   assert.ok(sieveImplementsLiteCache(DTS));
@@ -298,6 +328,7 @@ test('control: unmutated text reports zero diffs / all-present (vacuity)', () =>
   assert.ok(wtinylfuImplementsLiteCache(DTS));
   assert.ok(slruImplementsLiteCache(DTS));
   assert.ok(twoqImplementsLiteCache(DTS));
+  assert.ok(arcImplementsLiteCache(DTS));
 });
 
 test('control: desyncing the package.json version makes version parity fail', () => {
@@ -349,4 +380,9 @@ test('control: breaking Slru implements clause fails the Slru surface check', ()
 test('control: breaking TwoQ implements clause fails the TwoQ surface check', () => {
   const mutated = DTS.replace(/class TwoQ<[^>]*>\s+implements LiteCache<[^>]*>/, 'class TwoQ<K = unknown, V = unknown>');
   assert.ok(!twoqImplementsLiteCache(mutated), 'de-implementing LiteCache on TwoQ did not fail the surface check');
+});
+
+test('control: breaking Arc implements clause fails the Arc surface check', () => {
+  const mutated = DTS.replace(/class Arc<[^>]*>\s+implements LiteCache<[^>]*>/, 'class Arc<K = unknown, V = unknown>');
+  assert.ok(!arcImplementsLiteCache(mutated), 'de-implementing LiteCache on Arc did not fail the surface check');
 });

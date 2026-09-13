@@ -3,15 +3,16 @@
 Zero-dependency, zero-GC cache FAMILY for JavaScript under one uniform
 LiteCache<K,V> surface. A classic LRU reference member (LiteLru), the modern SIEVE
 headline (Sieve), the admission-controlled S3-FIFO member (S3Fifo), the
-frequency-admission W-TinyLFU member (WTinyLfu), and the two scan-resistant
-baselines Segmented-LRU (Slru) and 2Q (TwoQ) expose the
+frequency-admission W-TinyLFU member (WTinyLfu), the two scan-resistant
+baselines Segmented-LRU (Slru) and 2Q (TwoQ), and the no-tuning adaptive member
+ARC (Arc) expose the
 SAME get/put/has/peek/delete/clear API, so the eviction policy is a one-line
 constructor swap. Single-file ESM, zero runtime
 dependencies, node:test only. Ships a runnable + importable benchmark tool
 (Bench.mjs) with Belady OPT so a caller measures which policy fits their trace
 instead of guessing.
 
-## Status: 1.6.0 - two scan-resistant baseline members Slru (Segmented LRU: probation FIFO ~20% + protected LRU ~80%, promote-on-2nd-hit) and TwoQ (full 2Q: A1in FIFO ~25% + Am LRU + fixed keys-only A1out ghost), as TWO thin named exports over the shared substrate (NOT a mode flag), each hot path monomorphic, both on the SAME LiteCache<K,V> surface; a cap-sized distinct-key scan evicts 0 protected/Am entries; Gate SLRU/TWOQ 0.00000 B/op int churn at capacity 4096; the shipped Bench.mjs now rosters all six members - atop opt-in zero-GC stats (1.5.0), zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool
+## Status: 1.7.0 - the no-tuning adaptive member Arc (ARC, Megiddo & Modha FAST'03; patent expired): a RECENT list T1 + a FREQUENT list T2 + two bounded keys-only ghosts B1/B2 driving a self-tuning integer p (the T1/T2 split target), as ONE new named export over the shared substrate (NOT a mode flag - D16.1), each hot path monomorphic, on the SAME LiteCache<K,V> surface; a B1 ghost hit raises p, a B2 ghost hit lowers it (D16.3); RESIDENT value capacity stays EXACTLY capacity - only the split adapts (D16.2); bounds |T1|+|B1| <= c and |B1|+|B2| <= c validated; a cap-sized distinct-key scan evicts 0 T2 entries; Gate ARC 0.00176 B/op mixed int churn at capacity 4096 with non-vacuous lane coverage (p-adapt 15173 / B1-hit 7569 / B2-hit 7604 / REPLACE-T2 18926); the shipped Bench.mjs now rosters all seven members - atop the scan-resistant baselines Slru/TwoQ (1.6.0), opt-in zero-GC stats (1.5.0), zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool.
 
 The family is the identity from v1.0.0: classic LRU is the reference member +
 differential oracle + honest floor, SIEVE is the headline, and the shipped
@@ -28,11 +29,11 @@ that substrate (decisions/0012). S9 (this session) adds the docs, the shipped
 bench + Belady OPT tool, and the OPT torture gate -- with ZERO change to Lru.js /
 Lru.d.ts (the three version sites move together, only at /release).
 
-## Members (decisions/0001, 0012, 0013, 0014, 0015)
+## Members (decisions/0001, 0012, 0013, 0014, 0015, 0016)
 
-All classes implement LiteCache<K,V>; the recency/lazy-promotion/admission
+All classes implement LiteCache<K,V>; the recency/lazy-promotion/admission/adaptive
 difference is INTERNAL, so new LiteLru(n) swaps for new Sieve(n), new S3Fifo(n),
-new WTinyLfu(n), new Slru(n) or new TwoQ(n) and stays type-checked.
+new WTinyLfu(n), new Slru(n), new TwoQ(n) or new Arc(n) and stays type-checked.
 
 - LiteLru: classic Least-Recently-Used. get/put promote to most-recently-used;
   at capacity a new key evicts the LRU tail and reuses its slot in place. A hit
@@ -90,6 +91,20 @@ new WTinyLfu(n), new Slru(n) or new TwoQ(n) and stays type-checked.
   evicts the A1in tail (recording its key in the ghost) when A1in is over its target or
   Am is empty, else the Am LRU (not ghosted). A distinct one-hit-wonder flood churns
   A1in only, never displacing Am. has/peek are neutral; the ghost holds KEYS only.
+- Arc: the Adaptive Replacement Cache (Megiddo & Modha, FAST'03; patent expired),
+  decisions/0016. A RECENT list T1 (seen once) + a FREQUENT list T2 (seen 2+) threaded
+  through the shared _next/_prev columns (tagged per slot by _seg = 0/1), plus two
+  bounded keys-only ghosts B1/B2 (the S3-FIFO/TwoQ ring pattern, factored into an
+  internal ArcGhost; strict zero-alloc on keys:'int', amortized on the Map backing). A
+  single integer p (the T1 target, 0..capacity) self-tunes the split -- no knobs. A hit
+  (get or put-update) promotes to T2 (frequent). A new put whose key is in B1 raises p
+  (p += max(1, floor(|B2|/|B1|)), capped at capacity) and re-admits to T2; in B2 lowers p
+  (p -= max(1, floor(|B1|/|B2|)), floored at 0) and re-admits to T2. At capacity REPLACE
+  evicts the T1 LRU (to B1) when |T1| > p or the boundary key-in-B2 && |T1| == p, else
+  the T2 LRU (to B2); the all-recent |T1| == c edge direct-evicts the T1 LRU with no
+  ghost. RESIDENT value capacity stays EXACTLY capacity -- only the split adapts, never
+  the total (D16.2); bounds |T1|+|B1| <= c and |B1|+|B2| <= c hold. has/peek are neutral;
+  a get never touches the ghosts.
 
 ## Uniform surface (LiteCache<K,V>)
 
@@ -145,7 +160,7 @@ new WTinyLfu(n), new Slru(n) or new TwoQ(n) and stays type-checked.
 
 - OPT-IN, zero-cost-when-off, pay-for-what-you-use. { stats: true } mints a fresh
   per-instance holder {hits,misses,evictions,puts}; omitted -> _stats === null and
-  the hot path writes NOTHING (same writes-per-hit as the pre-stats build). All six
+  the hot path writes NOTHING (same writes-per-hit as the pre-stats build). All seven
   members, one LiteCache<K,V> surface.
 - Counting law (D19.2): get -> hits (live resident) or misses (absent OR stale-TTL);
   put -> one puts always, plus one evictions when a new key is inserted at capacity;
@@ -163,7 +178,7 @@ new WTinyLfu(n), new Slru(n) or new TwoQ(n) and stays type-checked.
   out-of-band MEASUREMENT (a runtime counter would need a store per hit).
 - Gated: t6 Gate STATS (>= 60000 ops at capacity, { stats: true }) = 0 B/op, holder
   identity stable, holder plain with exactly the four names; Stats.test.js brute-tally
-  parity over the T5 corpus (all six members); t9 stats-double-count + stats-counts-
+  parity over the T5 corpus (all seven members); t9 stats-double-count + stats-counts-
   peek controls (each diverges from the brute tally and fails).
 
 ## TTL (decisions/0017, D17)
@@ -177,7 +192,7 @@ new WTinyLfu(n), new Slru(n) or new TwoQ(n) and stays type-checked.
   toward size until touched or purgeStale()'d.
 - Fail-closed: ttlMs on a cache with no ttl configured throws [lite-lru]; ttl/ttlMs
   <= 0 / NaN throw [lite-lru] RangeError; Infinity = never (NEVER 0).
-- All six members support it identically over the shared SlotStore _exp column.
+- All seven members support it identically over the shared SlotStore _exp column.
 - Off-path decision (measured, D17): a single monomorphic this._exp===null guard.
   ttl-OFF writes-per-hit unchanged (LiteLru 0/5/4, Sieve/S3Fifo 0 links + 1 vis,
   WTinyLfu window-MRU 0); ttl-ON strict zero-alloc (maxMajor 0), _exp.byteLength
@@ -194,7 +209,7 @@ new WTinyLfu(n), new Slru(n) or new TwoQ(n) and stays type-checked.
   yield). One hand-written iterator reuses a single {value,done} result mutated in
   place; the iterator object is allocated once per keys()/values()/entries() call
   (cold), never per step. Gated: >=10,000 next() steps at capacity = 0 B/op per step
-  on all six members. Honest pitch: our iterators allocate nothing per step,
+  on all seven members. Honest pitch: our iterators allocate nothing per step,
   lru-cache's allocate. Never "lock-free".
 - Per-member ORDER (only LiteLru is true recency): LiteLru MRU->LRU (recency);
   Sieve newest->oldest (FIFO insertion, NOT recency); S3Fifo MAIN newest->oldest
@@ -259,7 +274,7 @@ drops LiteLru's body from the bundle (and vice versa). The shared substrate is
 INTERNAL, not an export; there is NO subpath-per-policy. Bench.mjs is a separate
 runnable tool, not a second implementation.
 
-## API (1.6.0)
+## API (1.7.0)
 
 Named exports from @zakkster/lite-lru:
 
@@ -267,7 +282,10 @@ Named exports from @zakkster/lite-lru:
 - Sieve: the SIEVE member.
 - S3Fifo: the S3-FIFO member.
 - WTinyLfu: the W-TinyLFU member.
-- VERSION: '1.6.0'
+- Slru: the Segmented-LRU member.
+- TwoQ: the full-2Q member.
+- Arc: the Adaptive Replacement Cache member.
+- VERSION: '1.7.0'
 
 Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
@@ -276,7 +294,7 @@ Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
 ## Testing
 
-- npm test        -- 888 node:test cases (all six members, recency/SIEVE/S3-FIFO/
+- npm test        -- 987 node:test cases (all seven members, recency/SIEVE/S3-FIFO/
   W-TinyLFU/Slru/TwoQ laws, TTL laws + fail-closed + purgeStale, stats parity,
   iteration order, degenerate keys/values + degenerate caps 1..4, dts drift,
   family surface).

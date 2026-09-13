@@ -21,10 +21,10 @@
  *   C-stats-counts-peek   a peek that credits a hit    -> brute-tally parity fails
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, wrapWTinyLfu,
-    wrapSlru, wrapTwoQ, validate,
+    wrapSlru, wrapTwoQ, wrapArc, validate,
     lruPolicy, check, die, makePrng,
 } from './harness.mjs';
 import { makeLruOracle } from './oracles/lru.mjs';
@@ -34,6 +34,7 @@ import { makeS3FifoOracle } from './oracles/s3fifo.mjs';
 import { makeWTinyLfuOracle } from './oracles/wtinylfu.mjs';
 import { makeSlruOracle } from './oracles/slru.mjs';
 import { makeTwoQOracle } from './oracles/twoq.mjs';
+import { makeArcOracle } from './oracles/arc.mjs';
 
 const NIL = -1;
 
@@ -175,6 +176,46 @@ class UnboundedGhostTwoQ extends TwoQ {
     _ghostHas(key) { return this._ubGhost.has(key); }
     _ghostAdd(key) { this._ubGhost.add(key); this._gLen = this._ubGhost.size; }
     _ghostConsume(key) { this._ubGhost.delete(key); this._gLen = this._ubGhost.size; }
+}
+
+/** C-arc-p-frozen (decisions/0016, D16.3): an Arc whose adaptive `p` is PINNED at 0 (it
+ *  never moves on a B1/B2 ghost hit). The adaptive law is that a B1 hit RAISES p and a B2
+ *  hit LOWERS it; freezing p means REPLACE always sees p == 0 at op boundaries, so it
+ *  evicts the T1 LRU where an adaptive ARC (with a grown p) would evict the T2 LRU -- the
+ *  next-eviction victim MUST drift from the pure (adaptive) Arc oracle. Self-consistent
+ *  (its own `_peekVictim` reads the frozen p), yet WRONG versus the oracle. */
+class FrozenPArc extends Arc {
+    put(key, value, ttlMs) {
+        this._p = 0;
+        super.put(key, value, ttlMs);
+        this._p = 0; // BUG: never let the ghost-hit adaptation persist
+    }
+}
+
+/** A minimal UNBOUNDED ghost (mirrors the C-twoq-unbounded-ghost control): a growable
+ *  Set + array that NEVER ages out when full. Used to break Arc's ghost bound. */
+class UnboundedGhost {
+    constructor() { this._set = new Set(); this._arr = []; this._len = 0; }
+    has(k) { return this._set.has(k); }
+    addMRU(k) { if (!this._set.has(k)) { this._set.add(k); this._arr.push(k); this._len = this._set.size; } }
+    delLRU() { const k = this._arr.shift(); this._set.delete(k); this._len = this._set.size; return k; }
+    consume(k) { if (this._set.delete(k)) { const i = this._arr.indexOf(k); if (i >= 0) this._arr.splice(i, 1); } this._len = this._set.size; }
+    clear() { this._set.clear(); this._arr.length = 0; this._len = 0; }
+}
+
+/** C-arc-unbounded-ghost (decisions/0016, D16.2): an Arc whose B1/B2 ghosts are UNBOUNDED
+ *  (the combined-room trim is a no-op and the rings never age out). The ghost bound is
+ *  load-bearing: a bounded ARC forgets old evicted keys, so a long-ago-evicted key re-
+ *  enters T1 as a true miss; an unbounded one remembers it forever and re-admits it
+ *  straight to T2, drifting the segment populations and the next-eviction victim from the
+ *  pure (bounded) Arc oracle -- AND it violates the conservation ghost bound. */
+class UnboundedGhostArc extends Arc {
+    constructor(cap, options) {
+        super(cap, options);
+        this._b1 = new UnboundedGhost();
+        this._b2 = new UnboundedGhost();
+    }
+    _ghostRoom() { /* BUG: never make combined-ghost room -> |B1|+|B2| grows unbounded */ }
 }
 
 /** C9: a W-TinyLFU whose admission ALWAYS admits the candidate (never rejects on a
@@ -452,6 +493,68 @@ export function run() {
         let threw = false;
         try { validate(c); } catch (e) { threw = true; }
         if (!threw) die('t9 C-twoq-unbounded-ghost: validate() passed a ghost over its bound (the ghost-bound term is toothless)');
+    }
+
+    // --- C-arc-p-frozen (decisions/0016): a pinned `p` -> diverges from the arc oracle
+    // The Arc headline is the SELF-TUNING split: a B1 hit raises p, a B2 hit lowers it.
+    // Freezing p pins REPLACE's victim choice, so it drifts from the adaptive oracle.
+    // Non-vacuity: the CORRECT Arc agrees (t5).
+    {
+        const brokenPolicy = {
+            name: 'arc-p-frozen',
+            real: (cap) => wrapArc(new FrozenPArc(cap)),
+            oracle: (cap) => makeArcOracle(cap),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0xA2C01, keyspace: 40 });
+        if (r.ok) die('t9 C-arc-p-frozen: a pinned `p` did NOT diverge from the arc oracle (no teeth)');
+        // Teeth on the phase-change law directly: across a RECENCY phase (B1 hits) an
+        // adaptive Arc raises p, but a frozen-p Arc does not. B1 only forms while T2 is
+        // non-empty (an all-T1 cache direct-evicts, D16.4), so seed a little T2, then
+        // capture the T1 LRU sent to B1 and re-reference it (a B1 hit) each round.
+        let evA = null, evF = null;
+        const adaptive = new Arc(16, { onEvict: (k) => { evA = k; } });
+        const frozen = new FrozenPArc(16, { onEvict: (k) => { evF = k; } });
+        for (let i = 0; i < 8; i++) { adaptive.put('f' + i, i); adaptive.get('f' + i); frozen.put('f' + i, i); frozen.get('f' + i); }
+        for (let k = 0; k < 400; k++) {
+            evA = null; adaptive.put('n' + k, k); if (evA !== null && adaptive._b1.has(evA)) adaptive.put(evA, 0);
+            evF = null; frozen.put('n' + k, k); if (evF !== null && frozen._b1.has(evF)) frozen.put(evF, 0);
+        }
+        check(frozen._p === 0, () => 't9 C-arc-p-frozen: the frozen p moved (control invalid)');
+        check(adaptive._p > 0, () => 't9 C-arc-p-frozen: the adaptive p did NOT rise in a recency phase (the phase-change law is toothless)');
+    }
+
+    // --- C-arc-unbounded-ghost (decisions/0016, D16.2): unbounded B1/B2 -> diverges + drifts
+    // Non-vacuity: the CORRECT Arc agrees (t5). Teeth: an unbounded ghost re-admits an
+    // ancient key straight to T2 (drifting the victim) AND overflows the ghost bound.
+    {
+        const brokenPolicy = {
+            name: 'arc-unbounded-ghost',
+            real: (cap) => wrapArc(new UnboundedGhostArc(cap)),
+            oracle: (cap) => makeArcOracle(cap),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0xA2C02, keyspace: 60 });
+        if (r.ok) die('t9 C-arc-unbounded-ghost: an unbounded B1/B2 ghost did NOT diverge from the arc oracle (no teeth)');
+        // Teeth on validate() too: a MIXED workload (hot recurrence -> T2 promotions, cold
+        // churn -> evictions, re-references -> ghost hits) makes the un-trimmed ghost grow
+        // past its bound. (A pure distinct-key flood is all-T1 and direct-evicts with no
+        // ghost -- D16.4 -- so it would never exercise the bound.)
+        const prng = makePrng(0xA2CBEEF);
+        const c = new UnboundedGhostArc(8);
+        let cold = 8;
+        for (let i = 0; i < 5000; i++) {
+            const kind = prng() % 10;
+            let k;
+            if (kind < 5) k = prng() % 6;                 // hot recurrence -> T2 promotions
+            else if (kind < 8) k = cold++;                // cold churn -> evictions to ghosts
+            else k = cold - (2 + (prng() % 20));          // re-reference recently evicted -> ghost hits
+            if (k < 0) k = prng() % 6;
+            if (c.get(k) === undefined) c.put(k, k);
+        }
+        check(c._b1._len + c._b2._len > c._ghostCap,
+            () => 't9 C-arc-unbounded-ghost: the ghost did not exceed its bound (setup invalid)');
+        let threw = false;
+        try { validate(c); } catch (e) { threw = true; }
+        if (!threw) die('t9 C-arc-unbounded-ghost: validate() passed a ghost over its bound (the ghost-bound term is toothless)');
     }
 
     // --- C-skip-gate (decisions/0017): a get that skips the ttl gate -> diverges ---

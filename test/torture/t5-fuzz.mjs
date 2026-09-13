@@ -18,8 +18,9 @@ import {
     sievePolicy, sieveIntPolicy, s3fifoPolicy, s3fifoIntPolicy,
     wtinylfuPolicy, wtinylfuIntPolicy,
     slruPolicy, slruIntPolicy, twoqPolicy, twoqIntPolicy,
+    arcPolicy, arcIntPolicy,
     lruTtlPolicy, sieveTtlPolicy, s3fifoTtlPolicy, wtinylfuTtlPolicy,
-    slruTtlPolicy, twoqTtlPolicy,
+    slruTtlPolicy, twoqTtlPolicy, arcTtlPolicy,
     SEED, die,
 } from './harness.mjs';
 
@@ -116,6 +117,20 @@ export function run() {
     fuzzPolicy(twoqPolicy, twoqConfigs);
     fuzzPolicy(twoqIntPolicy, twoqConfigs);
 
+    // The Arc MEMBER proof (decisions/0016): the adaptive member on BOTH backings against
+    // its own independent two-list/two-ghost/`p` oracle -- same value AND same next victim
+    // AND same size after every op, including the `p` adaptation on B1/B2 ghost hits and the
+    // REPLACE boundary. The int backing also exercises the strict-zero B1/B2 ghost rings +
+    // membership tables. Caps 1..9 stress the degenerate small caps (ghost sizing, the
+    // |T1|==c direct-evict edge); 64 is a normal split where both ghosts + p adaptation fire.
+    const arcConfigs = [];
+    for (let cap = 1; cap <= 9; cap++) {
+        arcConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0xd0 + cap });
+    }
+    arcConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0xdf });
+    fuzzPolicy(arcPolicy, arcConfigs);
+    fuzzPolicy(arcIntPolicy, arcConfigs);
+
     // The SEAM proof: the SAME runner drives a second policy unchanged.
     fuzzPolicy(fifoPolicy, [
         { cap: 1, keyspace: 4, ops: OPS, salt: 0x61 },
@@ -139,4 +154,5 @@ export function run() {
     fuzzPolicy(wtinylfuTtlPolicy, ttlConfigs);
     fuzzPolicy(slruTtlPolicy, ttlConfigs);
     fuzzPolicy(twoqTtlPolicy, ttlConfigs);
+    fuzzPolicy(arcTtlPolicy, ttlConfigs);
 }

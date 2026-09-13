@@ -17,7 +17,7 @@ import { makeSieveOracle } from './torture/oracles/sieve.mjs';
 const NIL = -1;
 
 test('exports: VERSION and the named Sieve export are present', async () => {
-    assert.equal(VERSION, '1.6.0');
+    assert.equal(VERSION, '1.7.0');
     const mod = await import('../Lru.js');
     assert.equal(mod.Sieve, Sieve);
 });

@@ -652,11 +652,11 @@ TASKS / ASSERTIONS / DONE WHEN
   law pinned; scan flood; strict-zero T6; oracle-identical over T5; controls fail.
 
 ===============================================================================
-# S8 -- v1.4.0 -- ARC (flagged: stresses the fixed-capacity law)
+# S8 -- v1.7.0 -- ARC (flagged: stresses the fixed-capacity law)
 ===============================================================================
 ```markdown
-version_target: 1.4.0
-status: planned
+version_target: 1.7.0
+status: built + gated (VERSION stays 1.6.0 until /release 1.7.0)
 depends_on: [S3, S5]
 ```
 PURPOSE
@@ -664,6 +664,25 @@ PURPOSE
   frequent) + two GHOST lists driving a self-tuning parameter `p`. No knobs -- it
   adapts between recency- and frequency-friendly phases on its own. Worth shipping
   as the "no-tuning adaptive" member, but it is the one that STRESSES the laws.
+
+WHAT LANDED (S8, working tree, uncommitted; VERSION still 1.6.0 until /release 1.7.0):
+  ONE `Arc` named export over the shared substrate (decisions/0016, D16.1 -- no
+  sibling, no mode flag). T1 (recent) + T2 (frequent) threaded through `_next`/`_prev`
+  tagged by `_seg`; two bounded keys-only ghosts B1/B2 (the S3-FIFO/TwoQ ring pattern,
+  factored into an internal `ArcGhost`; strict-zero on keys:'int'); a single integer
+  `p` that adapts on B1/B2 ghost hits. RESIDENT value capacity stays EXACTLY `capacity`
+  -- only the split adapts (D16.2, fixed-capacity honesty); bounds |T1|+|B1| <= c and
+  |B1|+|B2| <= c validated. Brute oracle (two lists + two ghosts + `p`) wired into the
+  runner (arc / arc-int / arc-ttl policies). GATED: t0 (promote-to-T2, `p`-adaptation
+  DIRECTION, REPLACE victim incl. the |T1|==p boundary + all-T1 direct-evict edge,
+  iteration order T2-then-T1), t2 (scan flood evicts 0 T2 + degenerate caps + the
+  phase-change law), t5 (differential, both backings, caps 1..9 + 64, +/- TTL, zero
+  divergence), t6 `Gate ARC` (0.00176 B/op retained, maxMajor 0, buffers invariant;
+  lane coverage p-adapt 15173 / B1-hit 7569 / B2-hit 7604 / REPLACE-T2 18926 -- not
+  vacuous), t7 (build/clear soak + ghost-retains-no-values census), t9 controls
+  (`arc-p-frozen` fails the phase-change law, `arc-unbounded-ghost` drifts + overflows
+  the bound). 979 node:tests green; tsc clean; `node --expose-gc test/torture.mjs` ok.
+  Export set 6 -> 7; Bench.mjs rosters all seven.
 THE DECISION (decisions/0016-arc.md -- own the tension up front)
   The ghost lists roughly DOUBLE the key-index metadata, and `p` moves the
   effective recency/frequency split at runtime -- in tension with law 3 (fixed,

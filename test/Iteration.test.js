@@ -31,7 +31,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc } from '../Lru.js';
 import { validate } from './validate.mjs';
 
 const NIL = -1;
@@ -39,10 +39,10 @@ const SEG_WINDOW = 0;
 const SEG_PROBATION = 1;
 const SEG_PROTECTED = 2;
 
-/** Every family member, so each test body runs SIX TIMES over the exact same
- *  LiteCache<K,V> iteration surface (the D18 contract is stated once). Slru/TwoQ
- *  (decisions/0015, D15.4) are pinned to PROTECTED/Am first, then PROBATION/A1in,
- *  each MRU..LRU -- handled by `expectedHeads()` below. */
+/** Every family member, so each test body runs SEVEN TIMES over the exact same
+ *  LiteCache<K,V> iteration surface (the D18 contract is stated once). Slru/TwoQ/Arc
+ *  (decisions/0015 D15.4, 0016 D16.5) are pinned to PROTECTED/Am/T2 first, then
+ *  PROBATION/A1in/T1, each MRU..LRU -- handled by `expectedHeads()` below. */
 const MEMBERS = [
     { name: 'LiteLru', Ctor: LiteLru },
     { name: 'Sieve', Ctor: Sieve },
@@ -50,6 +50,7 @@ const MEMBERS = [
     { name: 'WTinyLfu', Ctor: WTinyLfu },
     { name: 'Slru', Ctor: Slru },
     { name: 'TwoQ', Ctor: TwoQ },
+    { name: 'Arc', Ctor: Arc },
 ];
 
 /** A hoisted, mutable virtual clock -- zero-alloc per call, fully controlled by the
@@ -69,6 +70,7 @@ function expectedHeads(name, c) {
     if (name === 'WTinyLfu') return [c._wHead, c._ptHead, c._prHead];
     if (name === 'Slru') return [c._protHead, c._probHead]; // D15.4: PROTECTED then PROBATION
     if (name === 'TwoQ') return [c._amHead, c._a1Head];      // D15.4: Am then A1in
+    if (name === 'Arc') return [c._t2Head, c._t1Head];       // D16.5: T2 (frequent) then T1 (recent)
     return [c._head]; // LiteLru (recency DLL), Sieve (FIFO ring)
 }
 
