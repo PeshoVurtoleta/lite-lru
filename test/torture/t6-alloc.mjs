@@ -31,7 +31,7 @@
  * rejects the window; T9 exercises the same alloc lane in-process.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, BREAK, check, die, makePrng,
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
@@ -40,6 +40,7 @@ import {
     CountedWTinyLfu, WTINYLFU_WRITES_WINDOW_MRU_REHIT,
     CountedLirs, LIRS_WRITES_LIR_TOP_REHIT,
     CountedLfu, LFU_WRITES_FASTPATH, LFU_WRITES_MAX,
+    CountedClockPro, CLOCKPRO_WRITES_HIT_LINKS, CLOCKPRO_WRITES_HIT_ST, CLOCKPRO_WRITES_MISS_EVICT_TRIPWIRE,
 } from './harness.mjs';
 
 const CAP = 4096;      // power of 2 so the hot body masks its key with & MASK
@@ -176,6 +177,29 @@ class CoveredLfu extends Lfu {
         const relabel = only && (nb === -1 || this._bFreq[nb] !== this._bFreq[b] + 1);
         if (relabel) this._bRelabels++;
         super._touch(s);
+    }
+}
+
+/** A ClockPro counting the DISTINGUISHING lanes (decisions/0025) via plain integer field
+ *  increments (zero-alloc; lane coverage only, never on a MEASURED window): HAND_cold
+ *  promotions of a referenced test page, HAND_hot demotions, Q-front-style evictions, and
+ *  history re-admits (a put of a key still in the bounded non-resident history). A well-mixed
+ *  stream must exercise all four. */
+class CoveredClockPro extends ClockPro {
+    constructor(cap, opts) {
+        super(cap, opts);
+        this._promos = 0; this._demotes = 0; this._evicts = 0; this._histReadmits = 0;
+    }
+    _promoteCold(c) { this._promos++; super._promoteCold(c); }
+    _handHotDemote() {
+        const before = this._nHot;
+        super._handHotDemote();
+        if (this._nHot < before) this._demotes++;
+    }
+    _evictOne() { this._evicts++; return super._evictOne(); }
+    put(key, value, ttlMs) {
+        if (this._store.get(key) < 0 && this._hist.has(key)) this._histReadmits++;
+        return super.put(key, value, ttlMs);
     }
 }
 
@@ -1297,4 +1321,116 @@ export async function run() {
         ' worst-observed=' + lfuMaxWrites + ' (stream-dependent; pinned bound=' + LFU_WRITES_MAX +
         '); lanes covered: bucketCreates=' +
         covLfu._bCreates + ' destroys=' + covLfu._bDestroys + ' relabels=' + covLfu._bRelabels + '\n');
+
+    // --- Gate CLOCKPRO: the ClockPro member -- STRICT zero-alloc + MEASURED writes-per-hit --
+    // (decisions/0025) The SAME MIXED, recurring int-key stream drives every ClockPro lane at
+    // capacity: hot recurrence -> reference bits set (0 relinks) + HAND_cold promotions of
+    // referenced test pages; cold churn -> HAND_cold evictions + HAND_hot demotions + bounded-
+    // history re-admits (raise _mHot) + HAND_test expiries (lower _mHot). Zero-alloc: the
+    // closure indexes a preallocated Int32Array and does int get/put only. The ring columns
+    // `_next`/`_prev`, the state column `_st`, the int index buffers AND the history ring never
+    // grow; |hot| + |cold| == size == capacity always; the history stays bounded.
+    const cpStream = buildMixedStream(STREAM_LEN, HOT_SIZE, A1IN_CAP, 0x1c10c9a0);
+    const cpCache = new ClockPro(CAP, { keys: 'int' });
+    const cpSink = new Int32Array(1);
+    let cpi = 0;
+    const cpHot = () => {
+        const k = cpStream[cpi & STREAM_MASK]; cpi++;
+        const v = cpCache.get(k);
+        if (v === undefined) cpCache.put(k, k); else { cpSink[0] += v | 0; cpCache.get(k); }
+    };
+    for (let i = 0; i < PREFILL; i++) cpHot(); // reach steady state
+    check(cpCache.size === CAP, () => 't6 Gate CLOCKPRO: prefill did not reach capacity (size ' + cpCache.size + ')');
+    const cpNextBytes = cpCache._next.buffer.byteLength;
+    const cpPrevBytes = cpCache._prev.buffer.byteLength;
+    const cpStBytes = cpCache._st.buffer.byteLength;
+    const cpIxSlotBytes = cpCache._store._ixSlot.buffer.byteLength;
+    const cpIxKeyBytes = cpCache._store._ixKey.buffer.byteLength;
+    const cpHistRingBytes = cpCache._hist._ring.buffer.byteLength;
+    const gcp = runOpsGate(cpHot, { ops: OPS, warmup: WARMUP });
+    check(cpCache._next.buffer.byteLength === cpNextBytes,
+        () => 't6 Gate CLOCKPRO: _next.buffer grew ' + cpNextBytes + ' -> ' + cpCache._next.buffer.byteLength);
+    check(cpCache._prev.buffer.byteLength === cpPrevBytes,
+        () => 't6 Gate CLOCKPRO: _prev.buffer grew ' + cpPrevBytes + ' -> ' + cpCache._prev.buffer.byteLength);
+    check(cpCache._st.buffer.byteLength === cpStBytes,
+        () => 't6 Gate CLOCKPRO: _st.buffer grew ' + cpStBytes + ' -> ' + cpCache._st.buffer.byteLength);
+    check(cpCache._store._ixSlot.buffer.byteLength === cpIxSlotBytes,
+        () => 't6 Gate CLOCKPRO: _ixSlot.buffer grew ' + cpIxSlotBytes + ' -> ' + cpCache._store._ixSlot.buffer.byteLength);
+    check(cpCache._store._ixKey.buffer.byteLength === cpIxKeyBytes,
+        () => 't6 Gate CLOCKPRO: _ixKey.buffer grew ' + cpIxKeyBytes + ' -> ' + cpCache._store._ixKey.buffer.byteLength);
+    check(cpCache._hist._ring.buffer.byteLength === cpHistRingBytes,
+        () => 't6 Gate CLOCKPRO: history _ring grew ' + cpHistRingBytes + ' -> ' + cpCache._hist._ring.buffer.byteLength);
+    check(cpCache.size === CAP, () => 't6 Gate CLOCKPRO: churn did not stay at capacity (size ' + cpCache.size + ')');
+    check(cpCache._nHot + cpCache._nCold === CAP,
+        () => 't6 Gate CLOCKPRO: hot(' + cpCache._nHot + ') + cold(' + cpCache._nCold + ') != capacity');
+    check(cpCache._hist._len <= CAP,
+        () => 't6 Gate CLOCKPRO: history exceeded its bound (' + cpCache._hist._len + ')');
+    if (!gcp.report.ok) {
+        const g = gcp.summary.gc;
+        die('t6 Gate CLOCKPRO (mixed churn) ops gate rejected -- verdict=' + gcp.report.verdict +
+            ' source=' + gcp.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gcpA = runAllocsGate(cpHot, { iterations: 50000, batches: 8 });
+    if (!gcpA.ok) {
+        die('t6 Gate CLOCKPRO (mixed churn) retained-alloc gate rejected -- verdict=' + gcpA.report.verdict +
+            ' settled=' + gcpA.result.settled + ' bytesPerCall=' + gcpA.bytesPerCall);
+    }
+    // Writes-per-hit pin (the headline): a HIT relinks NOTHING (0 _next/_prev stores) and sets
+    // exactly ONE _st byte (the reference bit) -- the Sieve/S3Fifo lazy-promotion discipline.
+    const ccp = new CountedClockPro(16);
+    for (let i = 0; i < 16; i++) ccp.put(i, i);
+    ccp.get(5);                    // set the reference bit once (idempotent)
+    ccp.resetWrites();
+    ccp.get(5);                    // a hit -> 0 links, 1 state store
+    check(ccp.writes() === CLOCKPRO_WRITES_HIT_LINKS,
+        () => 't6 Gate CLOCKPRO: a hit relinked ' + ccp.writes() + ' cells, expected ' + CLOCKPRO_WRITES_HIT_LINKS);
+    check(ccp.stWrites() === CLOCKPRO_WRITES_HIT_ST,
+        () => 't6 Gate CLOCKPRO: a hit wrote ' + ccp.stWrites() + ' state bytes, expected ' + CLOCKPRO_WRITES_HIT_ST);
+    // Miss+evict is NOT a constant: it is amortized O(1) (classic CLOCK) but WORST-CASE
+    // O(capacity) `_st` writes on a full-scan-then-insert (HAND_cold + HAND_hot sweep the whole
+    // clock clearing reference bits). We do NOT pin a bound. The number below is a per-STREAM
+    // regression TRIPWIRE on `cpStream` only (a mixed stream that never does scan-then-insert):
+    // if it ever exceeds the tripwire the change is investigated -- it is not a proven cap.
+    const ccp2 = new CountedClockPro(CAP, { keys: 'int' });
+    let ccp2i = 0, cpMaxWrites = 0;
+    for (let i = 0; i < STREAM_LEN; i++) {
+        const k = cpStream[i & STREAM_MASK];
+        const s = ccp2._store.get(k);
+        if (s >= 0) { ccp2.get(k); continue; }
+        ccp2.resetWrites();
+        ccp2.put(k, k);
+        const w = ccp2.writes() + ccp2.stWrites();
+        if (w > cpMaxWrites) cpMaxWrites = w;
+    }
+    check(cpMaxWrites <= CLOCKPRO_WRITES_MISS_EVICT_TRIPWIRE,
+        () => 't6 Gate CLOCKPRO: cpStream miss+evict worst-observed ' + cpMaxWrites +
+            ' exceeded the cpStream tripwire ' + CLOCKPRO_WRITES_MISS_EVICT_TRIPWIRE +
+            ' (a per-stream regression tripwire, NOT a bound; the true worst case is O(capacity))');
+    // Lane coverage: the mixed stream must exercise promotions, demotions, evictions and
+    // history re-admits.
+    const covCp = new CoveredClockPro(CAP, { keys: 'int' });
+    let covCpi = 0;
+    const covCpHot = () => {
+        const k = cpStream[covCpi & STREAM_MASK]; covCpi++;
+        if (covCp.get(k) === undefined) covCp.put(k, k); else covCp.get(k);
+    };
+    for (let i = 0; i < PREFILL; i++) covCpHot();
+    covCp._promos = 0; covCp._demotes = 0; covCp._evicts = 0; covCp._histReadmits = 0;
+    for (let i = 0; i < OPS; i++) covCpHot();
+    check(covCp._evicts >= 100,
+        () => 't6 Gate CLOCKPRO: the window triggered ' + covCp._evicts + ' evictions (< 100 -- lane not covered)');
+    check(covCp._promos >= 20,
+        () => 't6 Gate CLOCKPRO: the window triggered ' + covCp._promos + ' cold->hot promotions (< 20 -- lane not covered)');
+    check(covCp._demotes >= 20,
+        () => 't6 Gate CLOCKPRO: the window triggered ' + covCp._demotes + ' hot->cold demotions (< 20 -- lane not covered)');
+    check(covCp._histReadmits >= 20,
+        () => 't6 Gate CLOCKPRO: the window triggered ' + covCp._histReadmits + ' history re-admits (< 20 -- lane not covered)');
+    process.stderr.write('t6 Gate CLOCKPRO: ' + gcpA.bytesPerCall.toFixed(5) +
+        ' B/op mixed churn (' + OPS + ' ops window, capacity ' + CAP + '); maxPauseMs=' +
+        gcp.summary.gc.maxMs.toFixed(3) + '; writes/hit links=' + CLOCKPRO_WRITES_HIT_LINKS +
+        ' state=' + CLOCKPRO_WRITES_HIT_ST + '; miss+evict worst-on-cpStream=' + cpMaxWrites +
+        ' (amortized O(1); worst-case O(capacity) on scan-then-insert; cpStream tripwire=' +
+        CLOCKPRO_WRITES_MISS_EVICT_TRIPWIRE + '); lanes covered: promos=' +
+        covCp._promos + ' demotes=' + covCp._demotes + ' evicts=' + covCp._evicts +
+        ' historyReadmits=' + covCp._histReadmits + '\n');
 }

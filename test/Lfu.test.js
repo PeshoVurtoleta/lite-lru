@@ -33,7 +33,7 @@ function orderKeys(c) {
 }
 
 test('exports: VERSION and the named Lfu export are present', async () => {
-    assert.equal(VERSION, '1.11.0');
+    assert.equal(VERSION, '1.12.0');
     const mod = await import('../Lru.js');
     assert.equal(mod.Lfu, Lfu);
 });

@@ -11,7 +11,7 @@
  * the payload refs). The census is the teeth for that.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../../Lru.js';
 import { createLeakTracker } from '@zakkster/lite-leak';
 import { check, validate, censusOk, settleGc } from './harness.mjs';
 
@@ -312,6 +312,46 @@ export async function run() {
             () => 't7 lfu: an evicted value is still live -- a bucket column is retaining values (leak)');
     }
 
+    // --- ClockPro soak (decisions/0025): build/clear cycles + the HISTORY-retains-no-values
+    // census + the hand/count conservation. The bounded non-resident history fingerprints
+    // evicted test pages; it must retain only KEYS (bounded so hist._len <= capacity), NEVER
+    // values. Push distinct int keys so every eviction churns the history, sample the evicted
+    // VALUE objects, and prove they are collectible after teardown even though their keys may
+    // still sit in the history. Each cycle: conservation mid-life (hot+cold==size, history
+    // bounded, hands resident), then size 0 + free list restored + history/hands reset after
+    // clear.
+    {
+        const cprefs = [];
+        const cptracker = createLeakTracker({ name: 'clockpro-soak' });
+        for (let cyc = 0; cyc < 1024; cyc++) {
+            const cache = new ClockPro(CAP, { keys: 'int' });
+            const h = cptracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
+            for (let i = 0; i < CAP * 3; i++) {
+                const val = { c: cyc, i };
+                cache.put(cyc * 100000 + i, val); // distinct int keys => real history churn
+                if ((i & 1) === 0) cache.get(cyc * 100000 + i); // set reference bits
+                if ((cyc & 63) === 0 && (i & 7) === 0) cprefs.push(new WeakRef(val));
+            }
+            check(cache.size === CAP, () => 't7 clockpro: not full mid-life (size ' + cache.size + ')');
+            check(cache._hist._len <= CAP, () => 't7 clockpro: history exceeded bound');
+            check(cache._nHot + cache._nCold === CAP, () => 't7 clockpro: hot+cold != size mid-life');
+            validate(cache); // conservation mid-life (split + hands + history bound)
+            cache.clear();
+            check(cache.size === 0, () => 't7 clockpro: size != 0 after clear (cycle ' + cyc + ')');
+            check(cache._freeListLength() === CAP, () => 't7 clockpro: free list != capacity after clear (cycle ' + cyc + ')');
+            check(cache._hist._len === 0, () => 't7 clockpro: history not empty after clear (cycle ' + cyc + ')');
+            check(cache._handCold === -1 && cache._handHot === -1 && cache._handTest === -1,
+                () => 't7 clockpro: hands not reset after clear (cycle ' + cyc + ')');
+            validate(cache);
+            cptracker.untrack(h);
+        }
+        check(cptracker.size() === 0, () => 't7 clockpro: leak tracker size ' + cptracker.size() + ' != 0');
+        await settleGc(6);
+        check(cprefs.length > 0, () => 't7 clockpro: census sample was empty (nothing to prove)');
+        check(censusOk(cprefs),
+            () => 't7 clockpro: an evicted value is still live -- the non-resident history is retaining values (leak)');
+    }
+
     // --- TTL soak (decisions/0017): expiry churn + conservation + purgeStale + census
     // Build each cycle PAST capacity under a virtual clock, half the entries with a
     // finite ttl (they expire mid-build) and half never-expire. Assert conservation
@@ -364,7 +404,7 @@ export async function run() {
     {
         const snaptracker = createLeakTracker({ name: 'snapshot-soak' });
         const srefs = [];
-        const MEM = [LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu];
+        const MEM = [LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro];
         for (let cyc = 0; cyc < 4096; cyc++) {
             const C = MEM[cyc % MEM.length];
             const cache = new C(CAP, { keys: 'int' });

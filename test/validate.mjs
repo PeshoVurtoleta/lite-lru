@@ -488,4 +488,58 @@ export function validate(cache, lists) {
                 ') != capacity(' + cap + ')');
         }
     }
+
+    // --- term 14 (ClockPro members, decisions/0025): the split + the three hands + the
+    // bounded history. A no-op unless the member exposes `_handCold`. The circular clock is
+    // realized as a NIL-terminated DLL (head..tail) with wrap-around hand advance, so its
+    // resident population is already summed against `size` by term 3/4 via the DEFAULT recency
+    // descriptor above. This term adds the ClockPro-specifics: every `_st` byte is a valid tag
+    // (0..7, never HOT|TEST -- a hot page is never in a test period); |hot| + |cold| == size
+    // and the two counts match a fresh ring walk; the adaptive `_mHot` is in [0, capacity];
+    // all THREE hands are NIL iff the clock is empty and reference a RESIDENT slot otherwise
+    // (the logical ring closure -- a hand can never dangle); and the non-resident history never
+    // exceeds its construction bound (hist._len <= capacity).
+    if (cache._handCold !== undefined) {
+        const HOTB = 1, TESTB = 4;
+        if (cache._nHot + cache._nCold !== size) {
+            throw new Error('[validate] clockpro nHot(' + cache._nHot + ') + nCold(' + cache._nCold +
+                ') != size(' + size + ')');
+        }
+        // Walk the ring once: mark residency + tally hot/cold + validate per-page state.
+        const resident = new Uint8Array(cap);
+        let nHot = 0, nCold = 0, walked = 0;
+        for (let s = cache._head; s !== NIL; s = cache._next[s]) {
+            if (s < 0 || s >= cap) throw new Error('[validate] clockpro ring reached out-of-range slot ' + s);
+            resident[s] = 1;
+            const st = cache._st[s];
+            if (st > 7) throw new Error('[validate] clockpro _st[' + s + '] = ' + st + ' > 7');
+            if ((st & HOTB) && (st & TESTB)) {
+                throw new Error('[validate] clockpro slot ' + s + ' is both hot and in a test period (invalid)');
+            }
+            if (st & HOTB) nHot++; else nCold++;
+            walked++;
+            if (walked > cap) throw new Error('[validate] clockpro ring has a cycle (walked > capacity)');
+        }
+        if (nHot !== cache._nHot) {
+            throw new Error('[validate] clockpro walked hot(' + nHot + ') != nHot(' + cache._nHot + ')');
+        }
+        if (nCold !== cache._nCold) {
+            throw new Error('[validate] clockpro walked cold(' + nCold + ') != nCold(' + cache._nCold + ')');
+        }
+        if (cache._mHot < 0 || cache._mHot > cap) {
+            throw new Error('[validate] clockpro mHot(' + cache._mHot + ') out of [0,' + cap + ']');
+        }
+        const hands = [['handCold', cache._handCold], ['handHot', cache._handHot], ['handTest', cache._handTest]];
+        for (let hi = 0; hi < hands.length; hi++) {
+            const nm = hands[hi][0], h = hands[hi][1];
+            if (size === 0) {
+                if (h !== NIL) throw new Error('[validate] clockpro ' + nm + ' ' + h + ' set on an empty clock (expected NIL)');
+            } else if (h === NIL || h < 0 || h >= cap || resident[h] === 0) {
+                throw new Error('[validate] clockpro ' + nm + ' ' + h + ' does not reference a resident slot (dangling)');
+            }
+        }
+        if (cache._hist._len > cache._histCap) {
+            throw new Error('[validate] clockpro history(' + cache._hist._len + ') > histCap(' + cache._histCap + ')');
+        }
+    }
 }

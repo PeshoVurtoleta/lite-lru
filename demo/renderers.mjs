@@ -236,6 +236,42 @@ export const RENDERERS = {
             }
         },
     },
+    ClockPro: {
+        // ClockPro dump() shape (decisions/0025): the circular clock newest..oldest (values),
+        // the per-page `st` byte (bit0 hot / bit1 referenced / bit2 test), the three hand slot
+        // positions, the adaptive `mHot`, and the bounded non-resident history (keys only).
+        // Occupancy only -- the hot/cold split geometry is not in dump() (D22.5); each page is
+        // tinted hot vs cold, outlined when referenced, and suffixed '.' when in a test period.
+        fields: ['ring', 'st', 'handCold', 'handHot', 'handTest', 'mHot', 'hist'],
+        model(s) { return pick(s, this.fields); },
+        draw(g, s, geom) {
+            let y = geom.y + 16;
+            y = drawPBar(g, geom.x, y + 8, s.mHot, s.cap);
+            g.fillStyle = COL.label;
+            g.font = '11px ui-monospace, monospace';
+            g.fillText('clock newest..oldest (hot tint / referenced outline / . = test)', geom.x, y - 4);
+            const ring = s.ring, st = s.st;
+            let cx = geom.x;
+            for (let i = 0; i < ring.k.length; i++) {
+                const b = st[i];
+                g.fillStyle = (b & 1) ? COL.prot : COL.prob; // hot vs cold
+                g.fillRect(cx, y, CELL_W, CELL_H);
+                if (b & 2) { g.strokeStyle = COL.visited; g.lineWidth = 2; } // referenced
+                else { g.strokeStyle = COL.slotEdge; g.lineWidth = 1; }
+                g.strokeRect(cx, y, CELL_W, CELL_H);
+                g.fillStyle = COL.text;
+                g.fillText(String(ring.k[i]) + ((b & 4) ? '.' : ''), cx + 4, y + 16);
+                cx += CELL_W + GAP;
+                if (cx > geom.x + 12 * (CELL_W + GAP)) { cx = geom.x; y += CELL_H + GAP + 12; }
+            }
+            y += CELL_H + 18;
+            g.fillStyle = COL.hand;
+            g.font = '11px ui-monospace, monospace';
+            g.fillText('hands -> cold ' + s.handCold + '  hot ' + s.handHot + '  test ' + s.handTest, geom.x, y);
+            y += 14;
+            drawGhost(g, geom.x, y, s.hist, 'non-resident history');
+        },
+    },
 };
 
 /** The members this module renders. Demo.test.mjs asserts this covers every engine

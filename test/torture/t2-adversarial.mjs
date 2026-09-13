@@ -9,8 +9,8 @@
  *   E single-capacity cache: every put evicts; head===tail always.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro } from './harness.mjs';
 
 export function run() {
     // --- A: re-hit the MRU N times (the head-re-hit fast path) -------------------
@@ -525,12 +525,56 @@ export function run() {
         }
     }
 
+    // --- Q: ClockPro degenerate caps + reference-bit second chance + scan resistance +
+    // the bounded-history bound + conservation (decisions/0025) --------------------
+    {
+        // Degenerate caps 1..4: every put churns, conservation holds, the history stays
+        // bounded, and hot+cold == size always.
+        for (const cap of [1, 2, 3, 4]) {
+            const c = new ClockPro(cap);
+            for (let i = 0; i < 500; i++) {
+                c.put(i, i);
+                check(c.size === Math.min(cap, i + 1), () => 't2 Q: clockpro cap-' + cap + ' size drift at ' + i);
+                check(c.get(i) === i, () => 't2 Q: clockpro cap-' + cap + ' just-inserted key missing');
+                check(c._hist._len <= cap, () => 't2 Q: clockpro cap-' + cap + ' history over bound');
+                check(c._nHot + c._nCold === c.size, () => 't2 Q: clockpro cap-' + cap + ' hot+cold != size');
+                validate(c);
+            }
+            c.clear();
+            check(c.size === 0, () => 't2 Q: clockpro cap-' + cap + ' not empty after clear');
+            check(c._handCold === -1 && c._handHot === -1 && c._handTest === -1,
+                () => 't2 Q: clockpro cap-' + cap + ' hands not reset after clear');
+            check(c._freeListLength() === cap, () => 't2 Q: clockpro cap-' + cap + ' free list != capacity after clear');
+            validate(c);
+        }
+
+        // Scan resistance: a referenced-and-promoted hot set survives a distinct one-hit
+        // flood far larger than capacity, at EXACTLY capacity throughout.
+        {
+            const N = 64;
+            const c = new ClockPro(N, { keys: 'int' });
+            for (let i = 0; i < N; i++) c.put(i, i);
+            const hot = [0, 1, 2, 3, 4, 5, 6, 7];
+            for (const h of hot) for (let t = 0; t < 10; t++) c.get(h);
+            for (let i = 0; i < 8000; i++) {
+                for (const h of hot) check(c.get(h) === h, () => 't2 Q: clockpro hot key ' + h + ' lost mid-scan at ' + i);
+                c.put(1000 + i, i);
+                check(c.size === N, () => 't2 Q: clockpro drifted from capacity during the scan');
+                check(c._hist._len <= N, () => 't2 Q: clockpro history over bound during the scan');
+                if ((i & 511) === 0) validate(c);
+            }
+            for (const h of hot) check(c.has(h), () => 't2 Q: clockpro hot key ' + h + ' evicted by the scan (no scan resistance)');
+            validate(c);
+            void wrapClockPro(c);
+        }
+    }
+
     // --- J: the LAZY-SEMANTICS TRIPLE as executable laws (decisions/0017, D17.3) --
     // For EVERY member: an expired entry is a MISS through get/has/peek alike, and each
     // of the three REAPS it in place (fires onEvict once, size drops). A fresh Infinity
     // sibling is untouched by any of them. validate() nets each reap.
     {
-        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu]];
+        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu], ['ClockPro', ClockPro]];
         // one probe method per fresh cache (each reap is destructive, so isolate them)
         const probes = [
             ['get', (c, k) => c.get(k), undefined],
@@ -569,7 +613,8 @@ export function run() {
     // free stack so size + freeListLength === capacity). Every member, both backings.
     {
         const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo],
-            ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu]];
+            ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu],
+            ['ClockPro', ClockPro]];
         for (const [name, C] of members) {
             for (const keys of [undefined, 'int']) {
                 const o = keys ? { keys } : undefined;

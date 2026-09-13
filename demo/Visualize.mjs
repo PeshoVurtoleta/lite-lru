@@ -16,9 +16,9 @@
 //
 // Repo-only dev artifact; NEVER shipped in the npm tarball (D22.3).
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../Lru.js';
 
-/** The nine family members, in the roster order Bench.mjs uses (so a demo run and
+/** The ten family members, in the roster order Bench.mjs uses (so a demo run and
  *  a bench run line up member-for-member). Each is constructed once per engine. */
 export const MEMBER_DEFS = [
     { name: 'LiteLru', ctor: LiteLru },
@@ -30,6 +30,7 @@ export const MEMBER_DEFS = [
     { name: 'Arc', ctor: Arc },
     { name: 'Lirs', ctor: Lirs },
     { name: 'Lfu', ctor: Lfu },
+    { name: 'ClockPro', ctor: ClockPro },
 ];
 
 export const MEMBER_NAMES = MEMBER_DEFS.map((d) => d.name);

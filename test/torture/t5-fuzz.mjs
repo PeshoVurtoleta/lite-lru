@@ -21,8 +21,9 @@ import {
     arcPolicy, arcIntPolicy,
     lirsPolicy, lirsIntPolicy,
     lfuPolicy, lfuIntPolicy,
+    clockProPolicy, clockProIntPolicy,
     lruTtlPolicy, sieveTtlPolicy, s3fifoTtlPolicy, wtinylfuTtlPolicy,
-    slruTtlPolicy, twoqTtlPolicy, arcTtlPolicy, lirsTtlPolicy, lfuTtlPolicy,
+    slruTtlPolicy, twoqTtlPolicy, arcTtlPolicy, lirsTtlPolicy, lfuTtlPolicy, clockProTtlPolicy,
     SNAP_MEMBERS, runRoundTrip,
     SEED, die,
 } from './harness.mjs';
@@ -163,6 +164,25 @@ export function run() {
     fuzzPolicy(lfuPolicy, lfuConfigs);
     fuzzPolicy(lfuIntPolicy, lfuConfigs);
 
+    // The ClockPro MEMBER proof (decisions/0025): the CLOCK-approximation-of-LIRS member on
+    // BOTH backings against its own independent clock/three-hand/bounded-history oracle -- same
+    // value AND same next victim AND same live size after every op, including the reference-bit
+    // second chance, HAND_cold promotion of a referenced test page, HAND_hot demotion, the
+    // HAND_test test-period expiry (which lowers _mHot), the bounded non-resident history
+    // re-admit (which raises _mHot), and the eviction victim from the non-destructive sweep
+    // twin. The int backing also exercises the strict-zero history ring + membership table.
+    // Caps 1..10 stress the degenerate small caps (cap 1 -> the all-cold single-page window,
+    // and the "no cold victim -> demote a hot page" guard); 64/256 exercise a normal split
+    // where promotion + demotion + both adaptations all fire.
+    const clockProConfigs = [];
+    for (let cap = 1; cap <= 10; cap++) {
+        clockProConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0x1a0 + cap });
+    }
+    clockProConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0x1af });
+    clockProConfigs.push({ cap: 256, keyspace: 300, ops: OPS, salt: 0x1a1f });
+    fuzzPolicy(clockProPolicy, clockProConfigs);
+    fuzzPolicy(clockProIntPolicy, clockProConfigs);
+
     // The SEAM proof: the SAME runner drives a second policy unchanged.
     fuzzPolicy(fifoPolicy, [
         { cap: 1, keyspace: 4, ops: OPS, salt: 0x61 },
@@ -189,6 +209,7 @@ export function run() {
     fuzzPolicy(arcTtlPolicy, ttlConfigs);
     fuzzPolicy(lirsTtlPolicy, ttlConfigs);
     fuzzPolicy(lfuTtlPolicy, ttlConfigs);
+    fuzzPolicy(clockProTtlPolicy, ttlConfigs);
 
     // The SNAPSHOT proof (decisions/0021): for EVERY member, on BOTH backings, ttl OFF
     // and ttl ON, over the 100k corpus -- dump -> restore -> dump is a fixed point AND a

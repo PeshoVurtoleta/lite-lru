@@ -756,6 +756,60 @@ export class Lfu<K = unknown, V = unknown> implements LiteCache<K, V> {
   get capacity(): number;
 }
 
+/**
+ * ClockPro -- CLOCK-Pro (Jiang, Chen & Zhang, USENIX ATC'05), decisions/0025. The tenth
+ * family member: the CLOCK approximation of LIRS. It approximates recency-of-recency with
+ * ONE circular list + per-page reference bits + three moving hands (HAND_cold eviction,
+ * HAND_hot demotion, HAND_test test-period expiry), so -- like Sieve/S3Fifo -- a hit sets a
+ * single reference bit and moves NOTHING (0 link writes, the headline). The hot/cold split
+ * ADAPTS via an integer target (`_mHot`), raised when a non-resident test page is re-admitted
+ * and lowered when a test page expires unreferenced; the resident value capacity stays EXACTLY
+ * `capacity` (only the split moves). The non-resident test-page history is a SEPARATE bounded
+ * keys-only ring (cap = capacity, drop-oldest), NOT interleaved into the clock -- the honest,
+ * bounded deviation from the textbook interleaving (mirrors Lirs/Arc). Same uniform
+ * `LiteCache<K, V>` surface as every other member -- the one-line policy swap.
+ *
+ * @typeParam K key type (any value; SameValueZero equality via the internal Map)
+ * @typeParam V value type
+ */
+export class ClockPro<K = unknown, V = unknown> implements LiteCache<K, V> {
+  /**
+   * @param capacity max entries; must be an integer >= 1 (else throws RangeError,
+   *                 fail-closed -- null is not zero).
+   * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
+   */
+  constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  /** Reconstruct a FRESH `ClockPro` from a `dump()` snapshot (decisions/0021 + 0025), incl.
+   *  the full circular order, the per-page hot/ref/test bits, ALL THREE hand positions, the
+   *  adaptive `mHot`, AND the bounded non-resident history (dropping any is a fail-OPEN
+   *  future-eviction bug). Fail closed on any mismatch or bound violation. */
+  static restore<K = unknown, V = unknown>(snap: CacheSnapshot, opts?: LiteCacheOptions<K, V>): ClockPro<K, V>;
+  get(key: K): V | undefined;
+  put(key: K, value: V, ttlMs?: number): void;
+  has(key: K): boolean;
+  peek(key: K): V | undefined;
+  delete(key: K): boolean;
+  clear(): void;
+  purgeStale(): number;
+  /** Live runtime counters (decisions/0019). BORROWED holder -- copy what you keep;
+   *  throws on an instance built without { stats: true } (fail-closed). */
+  stats(): CacheStats;
+  /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
+  resetStats(): void;
+  /** Serialize to a plain, structurally-cloneable snapshot (decisions/0021). COLD, may
+   *  allocate (honest <= 96 B/entry; no zero-GC claim). Restore with the static restore(). */
+  dump(): CacheSnapshot;
+  keys(): IterableIterator<K>;
+  values(): IterableIterator<V>;
+  entries(): IterableIterator<[K, V]>;
+  /** Iterable protocol == entries(); the yielded [K, V] tuple is BORROWED/reused
+   *  (decisions/0018) -- copy what you keep. Only a copying map materializes
+   *  (Array.from(c.entries(), ([k,v])=>[k,v])); a bare spread reads all-undefined. */
+  [Symbol.iterator](): IterableIterator<[K, V]>;
+  get size(): number;
+  get capacity(): number;
+}
+
 /** The package version (kept in lock-step with package.json + Lru.js). */
 export const VERSION: string;
 

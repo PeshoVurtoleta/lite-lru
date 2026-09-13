@@ -21,10 +21,10 @@
  *   C-stats-counts-peek   a peek that credits a hit    -> brute-tally parity fails
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, wrapWTinyLfu,
-    wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, validate, runRoundTrip,
+    wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, validate, runRoundTrip,
     lruPolicy, check, die, makePrng,
 } from './harness.mjs';
 import { makeLfuOracle } from './oracles/lfu.mjs';
@@ -37,6 +37,7 @@ import { makeSlruOracle } from './oracles/slru.mjs';
 import { makeTwoQOracle } from './oracles/twoq.mjs';
 import { makeArcOracle } from './oracles/arc.mjs';
 import { makeLirsOracle } from './oracles/lirs.mjs';
+import { makeClockProOracle } from './oracles/clockpro.mjs';
 
 const NIL = -1;
 
@@ -274,6 +275,16 @@ class ApproxFreqLfu extends Lfu {
         if (this._bFreq[this._kB[s]] >= 2) return; // BUG: saturate -> approximate, not exact
         super._touch(s);
     }
+}
+
+/** C-clockpro-no-adapt (decisions/0025): a ClockPro whose adaptive hot target `_mHot` is
+ *  FROZEN at 0 -- the D25.3 adaptation (raise on a bounded-history re-admit) is disabled. With
+ *  `_mHot` pinned to 0 every promoted page is demoted immediately, so the hot/cold split never
+ *  adapts and the next-eviction victim drifts from the pure (adaptive) ClockPro oracle. Self-
+ *  consistent (its own _peekVictim reads its own frozen _mHot), yet WRONG versus the oracle.
+ *  Non-vacuity: the CORRECT (adaptive) ClockPro agrees (t5). */
+class NoAdaptClockPro extends ClockPro {
+    put(key, value, ttlMs) { super.put(key, value, ttlMs); this._mHot = 0; } // BUG: never adapt
 }
 
 /** C-skip-gate (decisions/0017): a get that SKIPS the ttl staleness gate entirely, so a
@@ -648,6 +659,21 @@ export function run() {
         if (r.ok) die('t9 C-lfu-approx-freq: saturating the frequency counter did NOT diverge from the exact-lfu oracle (no teeth)');
     }
 
+    // --- C-clockpro-no-adapt (decisions/0025): freezing the adaptive hot target -> diverges --
+    // ClockPro's D25.3 adaptation (raise _mHot on a bounded-history re-admit, lower on a test-
+    // page expiry) is load-bearing: freezing _mHot at 0 collapses the hot/cold split so the
+    // next-eviction victim drifts from the adaptive oracle. Non-vacuity: the CORRECT ClockPro
+    // agrees (t5).
+    {
+        const brokenPolicy = {
+            name: 'clockpro-no-adapt',
+            real: (cap) => wrapClockPro(new NoAdaptClockPro(cap)),
+            oracle: (cap) => makeClockProOracle(cap),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x1c9a, keyspace: 40 });
+        if (r.ok) die('t9 C-clockpro-no-adapt: freezing the adaptive hot target did NOT diverge from the clockpro oracle (no teeth)');
+    }
+
     // --- C-skip-gate (decisions/0017): a get that skips the ttl gate -> diverges ---
     // The lazy TTL rule (D17.3): a stale hit is a MISS, reaped in place. A get that never
     // checks staleness returns the expired value and keeps it resident, so it MUST
@@ -858,12 +884,41 @@ export function run() {
                 return Lfu.restore(copy, opts);
             }
         }
+        // clockpro-hands-dropped: restore forgets the three swept hand positions (parks them
+        // all at the head). HAND_cold/HAND_hot/HAND_test then sweep from the WRONG places, so
+        // the victim drifts from the twin (whose hands were preserved). Post-restore mutation
+        // (the snapshot itself is valid) -- exactly the fail-OPEN bug D25.6 requires t9 to catch.
+        class HandsDroppedClockPro extends ClockPro {
+            static restore(snap, opts) {
+                const inst = ClockPro.restore(snap, opts);
+                inst._handCold = inst._head; inst._handHot = inst._head; inst._handTest = inst._head;
+                return inst;
+            }
+        }
+        // clockpro-mhot-dropped: restore forgets the adaptive hot target (pins it to 0). The
+        // promote/demote balance then differs from the twin (whose _mHot was preserved).
+        class MHotDroppedClockPro extends ClockPro {
+            static restore(snap, opts) { const inst = ClockPro.restore(snap, opts); inst._mHot = 0; return inst; }
+        }
+        // clockpro-test-bits-dropped: restore clears every per-page test bit. An evicted page
+        // then never enters the bounded history (and referenced pages promote differently), so
+        // the victim drifts from the twin (whose test bits were preserved).
+        class TestBitsDroppedClockPro extends ClockPro {
+            static restore(snap, opts) {
+                const inst = ClockPro.restore(snap, opts);
+                for (let i = 0; i < inst._st.length; i++) inst._st[i] &= ~4; // clear CLOCKPRO_TEST
+                return inst;
+            }
+        }
 
         const controls = [
             { name: 'arc-p-dropped', broken: { Ctor: PDroppedArc, wrap: wrapArc }, real: { Ctor: Arc, wrap: wrapArc } },
             { name: 'sketch-dropped', broken: { Ctor: SketchDroppedWTinyLfu, wrap: wrapWTinyLfu }, real: { Ctor: WTinyLfu, wrap: wrapWTinyLfu } },
             { name: 'ghost-omitted', broken: { Ctor: GhostOmittedS3Fifo, wrap: wrapS3Fifo }, real: { Ctor: S3Fifo, wrap: wrapS3Fifo } },
             { name: 'lfu-freq-dropped', broken: { Ctor: FreqDroppedLfu, wrap: wrapLfu }, real: { Ctor: Lfu, wrap: wrapLfu } },
+            { name: 'clockpro-hands-dropped', broken: { Ctor: HandsDroppedClockPro, wrap: wrapClockPro }, real: { Ctor: ClockPro, wrap: wrapClockPro } },
+            { name: 'clockpro-mhot-dropped', broken: { Ctor: MHotDroppedClockPro, wrap: wrapClockPro }, real: { Ctor: ClockPro, wrap: wrapClockPro } },
+            { name: 'clockpro-test-bits-dropped', broken: { Ctor: TestBitsDroppedClockPro, wrap: wrapClockPro }, real: { Ctor: ClockPro, wrap: wrapClockPro } },
         ];
         for (const ctl of controls) {
             // Non-vacuity: the CORRECT round-trip agrees with the twin (also proven in t5).

@@ -7,6 +7,62 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.12.0] - 2026-09-14
+
+### Added
+
+- **ClockPro (`ClockPro`) -- the tenth cache member** (decisions/0025, D25; Jiang, Chen &
+  Zhang, "CLOCK-Pro: An Effective Improvement of the CLOCK Replacement", USENIX ATC'05):
+  the CLOCK approximation of LIRS -- recency-of-recency (IRR) expressed on a clock instead
+  of LIRS's lists + interleaved stack -- on the same `LiteCache<K,V>` surface, so
+  `new LiteLru(n)` swaps for `new ClockPro(n)` type-checked.
+  - One resident list threaded through the shared `_next`/`_prev` columns and walked as a
+    clock (a NIL-terminated DLL with wrap-around hand advance, D25.1, so it reuses the
+    family's shared iteration / conservation / snapshot machinery unchanged), three hands
+    (hand_cold / hand_hot / hand_test), and a per-slot `_st` byte (bit0 hot/cold, bit1
+    referenced, bit2 in-test).
+  - Hot path is lazy promotion: a `get` (or `put`-update) sets ONE reference bit and does
+    NOTHING structural -- 0 link writes, exactly 1 `_st` store (the same headline as
+    `Sieve`/`S3Fifo`), pinned by the torture gate. `has`/`peek` are reference-neutral.
+  - Eviction is honestly NOT a constant: amortized O(1) per miss (the classic CLOCK
+    amortization) but worst-case O(capacity) `_st` writes on a full-scan-then-insert
+    (~2*capacity; ~134 at cap 64, ~518 at 256, ~2054 at 1024). No constant miss+evict bound
+    is pinned; the t6 per-stream worst-observed is a regression tripwire, not a cap.
+  - The hot/cold split ADAPTS via an integer `_mHot` (D25.3): a `put` re-admitting a key
+    still in the bounded non-resident history raises it, a test period ending without a hit
+    lowers it. The non-resident history is a SEPARATE bounded keys-only ring (cap =
+    capacity, drop-oldest, D25.2 -- an honest bounded variant like LIRS D23, not textbook
+    interleaving). Resident value capacity stays EXACTLY capacity (only the split moves,
+    D25.4). Gate CLOCKPRO 0.00032 B/op mixed churn (Map-backing amortization; `keys:'int'`
+    strictly 0 B/op), `maxPauseMs` 0.000.
+  - `ClockPro` inherits TTL, zero-GC iteration (resident-only, clock order newest->oldest),
+    opt-in stats, and snapshot/restore (tag `m:'ClockPro'`; the full clock order + per-slot
+    `_st` bits + all three hands + `_mHot` + the bounded history captured verbatim,
+    fail-closed on restore -- dropping the hands, `_mHot`, or the test bits is rejected as a
+    divergence).
+- `ClockPro` in the shipped bench (`MEMBERS` 9 -> 10) and the policy-visualization demo (a
+  `ClockPro` renderer drawing the clock + hands + hot/cold strictly from `dump()`); the
+  `ClockPro` class on `Lru.d.ts`.
+- **`@zakkster/lite-perf-gate` integrated as a node:test zero-allocation gate** (dev-only
+  devDependency; zero RUNTIME dependencies unchanged). New `npm run test:perf` script
+  (`node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs`), folded
+  into `npm run verify` and deliberately outside the `npm test` (`test/*.test.js`) glob so
+  the main suite is untouched. 20 int-backed scenarios (all ten members x get-hit +
+  put-churn) gated at 0 scavenges / 0 old-gen / 0 arrayBuffers across N=200000 and
+  k*N=1.6M, a `mustFail` self-test proving the gate has teeth, and a writes-per-hit
+  cross-check pinned to the torture harness constants. Complements torture t6 (the hard perf
+  gate covers `keys:'int'` strict zero-alloc; Map-backing is amortized, still covered by
+  t6). Ships nothing to the tarball (`test/` is not in `files[]`).
+
+### Changed
+
+- Cache-member roster nine -> ten (`LiteLru`, `Sieve`, `S3Fifo`, `WTinyLfu`, `Slru`,
+  `TwoQ`, `Arc`, `Lirs`, `Lfu`, `ClockPro`); README + `llms.txt` positioning of `ClockPro`
+  as the CLOCK approximation of LIRS.
+- `test/Snapshot.test.js` `MEMBERS` extended to all ten members (was the original seven).
+- Test count 1155 -> 1212 node:test cases (the new `ClockPro` boundary suite + the extended
+  snapshot suite); torture harness, oracle, and `validate()` term extended to `ClockPro`.
+
 ## [1.11.0] - 2026-09-13
 
 ### Added

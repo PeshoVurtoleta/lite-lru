@@ -5,8 +5,9 @@ LiteCache<K,V> surface. A classic LRU reference member (LiteLru), the modern SIE
 headline (Sieve), the admission-controlled S3-FIFO member (S3Fifo), the
 frequency-admission W-TinyLFU member (WTinyLfu), the two scan-resistant
 baselines Segmented-LRU (Slru) and 2Q (TwoQ), the no-tuning adaptive member
-ARC (Arc), the scan/loop-resistant recency-of-recency member LIRS (Lirs), and the
-O(1) EXACT least-frequently-used member (Lfu)
+ARC (Arc), the scan/loop-resistant recency-of-recency member LIRS (Lirs), the
+O(1) EXACT least-frequently-used member (Lfu), and the CLOCK-approximation-of-LIRS
+member CLOCK-Pro (ClockPro)
 expose the
 SAME get/put/has/peek/delete/clear API, so the eviction policy is a one-line
 constructor swap. Single-file ESM, zero runtime
@@ -14,7 +15,7 @@ dependencies, node:test only. Ships a runnable + importable benchmark tool
 (Bench.mjs) with Belady OPT so a caller measures which policy fits their trace
 instead of guessing.
 
-## Status: 1.11.0 - LFU (Lfu), the NINTH member (Shah, Matani & Kumar, "An O(1) algorithm for implementing the LFU cache eviction scheme", 2010): EXACT Least-Frequently-Used at O(1), the exact-frequency counterpart to WTinyLfu's approximate Count-Min sketch. A doubly-linked list OF frequency buckets, each bucket a doubly-linked list of keys at that exact frequency; the frequency lives on the bucket (all keys in a bucket share it). Within a bucket the order is recency (LRU tie-break): a new key (freq 1) and a just-promoted key attach at MRU, eviction takes the LRU key of the LOWEST-frequency bucket. Buckets come from a preallocated pool (size = capacity, a _bFreq Float64Array giving exact counts to 2^53 + _bNext/_bPrev/_bHead/_bTail Int32Array columns + a _bFree stack), so a bucket is NEVER allocated with new on the hot path; pool exhaustion is provably unreachable (buckets partition the <= capacity resident keys) and fail-closed regardless. The hot path is zero-ALLOCATION but honestly NOT zero-write: a frequency bump relinks a key across buckets - fast-path relabel 1 write, worst-case relink 14 (a non-exceedable bound, pinned by the torture gate); put(update) counts as a hit, has/peek are frequency-neutral. Gate LFU 0.00032 B/op mixed churn (Map-backing amortization; keys:'int' strictly 0 B/op), maxPauseMs 0.000. new LiteLru(n) <-> ... <-> new Lirs(n) <-> new Lfu(n), type-checked; TTL / iteration (ascending frequency, MRU->LRU per bucket) / stats / snapshot (exact per-bucket frequencies captured verbatim, tag m:'Lfu', fail-closed restore) / bench / the demo all extend to the ninth member. Built atop LIRS (1.10.0: the recency-of-recency member, bounded non-resident history, loop 99.2% of Belady OPT), the S13/S15 policy-visualization demo (a never-shipped demo/ that animates all nine members on one trace drawn strictly from dump(), served by a zero-dep Node demo/serve.mjs, fails closed off-server), snapshot / restore (1.8.0: a COLD dump() + static restore(snap, opts?), the SoA columns ARE the serial form, no substrate field / no hot-path branch, EXACT future-eviction round-trip, fail-closed restore tag {f,m,cap,keys,ttl,t}, TTL absolute-not-rebased), the no-tuning adaptive member Arc (1.7.0), the scan-resistant baselines Slru/TwoQ (1.6.0), opt-in zero-GC stats (1.5.0), zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool.
+## Status: 1.12.0 - ClockPro (ClockPro), the TENTH member (Jiang, Chen & Zhang, "CLOCK-Pro: An Effective Improvement of the CLOCK Replacement", USENIX ATC'05): the CLOCK approximation of LIRS -- recency-of-recency (IRR) expressed on a clock instead of LIRS's lists + interleaved stack. One resident list threaded through the shared _next/_prev columns and walked as a clock (a NIL-terminated DLL with wrap-around hand advance, D25.1 -- so it reuses the family's shared iteration / conservation / snapshot machinery unchanged), three hands (hand_cold / hand_hot / hand_test), and a per-slot _st byte (bit0 hot/cold, bit1 referenced, bit2 in-test). The HOT PATH is lazy promotion: a get (or put-update) sets ONE reference bit and does NOTHING structural -- 0 link writes, exactly 1 _st store, the same headline as Sieve/S3Fifo (a REAL pinned gate). Eviction runs hand_cold (with hand_hot demotion + hand_test test-period bookkeeping) and is honestly NOT a constant: amortized O(1) per miss (the classic CLOCK amortization) but WORST-CASE O(capacity) _st writes on a full-scan-then-insert (reference every resident page, then insert -> the sweep clears every reference bit; ~2*capacity, e.g. ~134 at cap 64, ~518 at 256, ~2054 at 1024) -- we do NOT pin a constant miss+evict bound (the t6 per-stream worst-observed is a regression TRIPWIRE, not a cap; contrast Lfu's PROVEN <=14 writes/hit). The hot/cold split ADAPTS via an integer _mHot (D25.3: a put re-admitting a key still in the bounded non-resident history raises it, a test period ending without a hit lowers it); the non-resident history is a SEPARATE bounded keys-only ring (cap = capacity, drop-oldest, D25.2 -- an honest bounded variant like Lirs D23, not textbook interleaving); RESIDENT value capacity stays EXACTLY capacity (only the split moves, D25.4). Gate CLOCKPRO 0.00032 B/op mixed churn (Map-backing amortization; keys:'int' strictly 0 B/op), maxPauseMs 0.000. new LiteLru(n) <-> ... <-> new Lfu(n) <-> new ClockPro(n), type-checked; TTL / iteration (resident-only, clock order newest->oldest) / stats / snapshot (full clock order + per-slot _st bits + all three hands + _mHot + the bounded history captured verbatim, tag m:'ClockPro', fail-closed restore) / bench / the demo all extend to the tenth member. This release ALSO integrates @zakkster/lite-perf-gate (dev-only, zero RUNTIME deps intact) as a node:test zero-allocation gate: `npm run test:perf` (a dedicated --expose-gc script in `verify`, outside the plain `npm test` glob) runs 20 int-backed scenarios (all ten members x get-hit + put-churn) at 0 scavenges / 0 old-gen / 0 arrayBuffers across N=200000 and k*N=1.6M, with a mustFail self-test proving the gate has teeth and the writes-per-hit pinned to the torture harness constants; it COMPLEMENTS torture t6 (the hard perf gate covers keys:'int' strict zero-alloc; Map-backing is amortized, still covered by t6) and ships nothing to the tarball. Built atop LFU (1.11.0: the O(1) exact least-frequently-used member), LIRS (1.10.0: recency-of-recency, bounded non-resident history, loop 99.2% of Belady OPT), the S13/S15 policy-visualization demo (a never-shipped demo/ that animates all ten members on one trace drawn strictly from dump(), served by a zero-dep Node demo/serve.mjs, fails closed off-server), snapshot / restore (1.8.0: a COLD dump() + static restore(snap, opts?), the SoA columns ARE the serial form, no substrate field / no hot-path branch, EXACT future-eviction round-trip, fail-closed restore tag {f,m,cap,keys,ttl,t}, TTL absolute-not-rebased), the no-tuning adaptive member Arc (1.7.0), the scan-resistant baselines Slru/TwoQ (1.6.0), opt-in zero-GC stats (1.5.0), zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool.
 
 The family is the identity from v1.0.0: classic LRU is the reference member +
 differential oracle + honest floor, SIEVE is the headline, and the shipped
@@ -35,7 +36,8 @@ Lru.d.ts (the three version sites move together, only at /release).
 
 All classes implement LiteCache<K,V>; the recency/lazy-promotion/admission/adaptive
 difference is INTERNAL, so new LiteLru(n) swaps for new Sieve(n), new S3Fifo(n),
-new WTinyLfu(n), new Slru(n), new TwoQ(n), new Arc(n), new Lirs(n) or new Lfu(n) and stays
+new WTinyLfu(n), new Slru(n), new TwoQ(n), new Arc(n), new Lirs(n), new Lfu(n) or
+new ClockPro(n) and stays
 type-checked.
 
 - LiteLru: classic Least-Recently-Used. get/put promote to most-recently-used;
@@ -151,6 +153,28 @@ type-checked.
   snapshot captures EXACT per-bucket frequencies verbatim (dropping them is a fail-OPEN
   future-eviction bug - the t9 lfu-freq-dropped control catches it; lfu-approx-freq proves a
   saturating counter diverges from the exact oracle).
+- ClockPro: CLOCK-Pro (Jiang, Chen & Zhang, USENIX ATC'05), decisions/0025. The CLOCK
+  approximation of LIRS: recency-of-recency on ONE circular clock of resident pages + per-page
+  state bits (_st: bit0 hot, bit1 referenced, bit2 test) + THREE Int32 hands (_handCold
+  eviction, _handHot demotion, _handTest test-period expiry). A hit sets the reference bit ONLY
+  - 0 link writes, exactly 1 _st store (the Sieve/S3Fifo lazy-promotion headline; put-update
+  also sets ref, has/peek are reference-neutral). The clock is realized as a NIL-terminated DLL
+  (_head newest .. _tail oldest) with wrap-around hand advance (_advance(_tail)->_head), so the
+  traversal is circular but iteration/conservation/snapshot reuse the shared machinery
+  byte-for-byte (the one documented D25 deviation). ADAPTIVE integer hot target _mHot (0..cap):
+  a re-admit of a key still in the bounded non-resident history RAISES it (page proved worthy,
+  re-admitted HOT); HAND_test ending a test period unreferenced LOWERS it - O(1) both. RESIDENT
+  capacity is EXACTLY capacity; only the hot/cold split moves (_nHot+_nCold==size). Bounded
+  non-resident test-page history (ClockProHistory extends ArcGhost, keys-only, cap = capacity,
+  drop-oldest, NOT interleaved into the clock - the honest bounded deviation, mirrors Lirs).
+  Exact/approximate pair with Lirs the way Lfu/WTinyLfu are for frequency. Gate CLOCKPRO strict
+  zero-alloc (keys:'int'), writes/hit 0 links + 1 state (a REAL pin); eviction amortized O(1) per
+  miss (classic CLOCK) but WORST-CASE O(capacity) writes on a full-scan-then-insert (reference every
+  resident page, then insert -> the sweep clears every reference bit) - NOT a constant, so the t6
+  miss+evict worst-observed is a per-stream (cpStream) regression TRIPWIRE, not a bound; snapshot
+  captures the clock + all three hands + _mHot + test bits + history verbatim (dropping any is fail-OPEN -
+  t9 clockpro-hands-dropped / clockpro-mhot-dropped / clockpro-test-bits-dropped catch it;
+  clockpro-no-adapt proves freezing _mHot diverges).
 
 ## Uniform surface (LiteCache<K,V>)
 
@@ -158,7 +182,7 @@ type-checked.
   new S3Fifo(capacity, options?) / new WTinyLfu(capacity, options?) /
   new Slru(capacity, options?) / new TwoQ(capacity, options?) /
   new Arc(capacity, options?) / new Lirs(capacity, options?) /
-  new Lfu(capacity, options?)
+  new Lfu(capacity, options?) / new ClockPro(capacity, options?)
   - capacity: integer >= 1, else a [lite-lru]-tagged RangeError at the door.
 - get(key) -> V | undefined. Applies the member's hit policy (LiteLru promotes to
   MRU; Sieve and S3Fifo set the visited bit; WTinyLfu bumps the frequency sketch
@@ -233,7 +257,7 @@ type-checked.
   out-of-band MEASUREMENT (a runtime counter would need a store per hit).
 - Gated: t6 Gate STATS (>= 60000 ops at capacity, { stats: true }) = 0 B/op, holder
   identity stable, holder plain with exactly the four names; Stats.test.js brute-tally
-  parity over the T5 corpus (all nine members); t9 stats-double-count + stats-counts-
+  parity over the T5 corpus (all ten members); t9 stats-double-count + stats-counts-
   peek controls (each diverges from the brute tally and fails).
 
 ## TTL (decisions/0017, D17)
@@ -247,7 +271,7 @@ type-checked.
   toward size until touched or purgeStale()'d.
 - Fail-closed: ttlMs on a cache with no ttl configured throws [lite-lru]; ttl/ttlMs
   <= 0 / NaN throw [lite-lru] RangeError; Infinity = never (NEVER 0).
-- All nine members support it identically over the shared SlotStore _exp column.
+- All ten members support it identically over the shared SlotStore _exp column.
 - Off-path decision (measured, D17): a single monomorphic this._exp===null guard.
   ttl-OFF writes-per-hit unchanged (LiteLru 0/5/4, Sieve/S3Fifo 0 links + 1 vis,
   WTinyLfu window-MRU 0); ttl-ON strict zero-alloc (maxMajor 0), _exp.byteLength
@@ -264,7 +288,7 @@ type-checked.
   yield). One hand-written iterator reuses a single {value,done} result mutated in
   place; the iterator object is allocated once per keys()/values()/entries() call
   (cold), never per step. Gated: >=10,000 next() steps at capacity = 0 B/op per step
-  on all nine members. Honest pitch: our iterators allocate nothing per step,
+  on all ten members. Honest pitch: our iterators allocate nothing per step,
   lru-cache's allocate. Never "lock-free".
 - Per-member ORDER (only LiteLru is true recency): LiteLru MRU->LRU (recency);
   Sieve newest->oldest (FIFO insertion, NOT recency); S3Fifo MAIN newest->oldest
@@ -323,7 +347,7 @@ type-checked.
   backings never grow, writes-per-hit unchanged. dump() is read-only (no _ver bump), so
   a walk in progress is not invalidated.
 - Gated: t6 Gate SNAP (0 B/op restored hot path + dump B/entry + writes-per-hit), t5
-  round-trip differential over the 100k corpus (all nine members x both backings x ttl
+  round-trip differential over the 100k corpus (all ten members x both backings x ttl
   off/on), Snapshot.test.js (round-trip identity + 8 rejections + capacity law + interop
   + degenerate caps/keys/values), t7 4096 dump/restore cycles, t9 three drop controls.
 
@@ -370,9 +394,9 @@ runnable tool, not a second implementation.
 
 ## Demo (decisions/0022, D22; dev-only, NEVER shipped)
 
-demo/ animates ONE shared trace through all nine members, each panel drawn STRICTLY from that member's live dump() snapshot (D22.1, no shadow state), with a running %-of-Belady-optimal line. npm run demo (headless per-member summary via demo/Visualize.mjs) and npm run demo:serve (zero-dep Node server demo/serve.mjs -> http://localhost:8013/, browser page demo/visuals.html imports only ../Lru.js). demo/ is absent from files[]; Lru.js / Lru.d.ts / Bench.mjs are consumed, never edited. Must be run through the Node server (npm run demo:serve -> http://localhost:8013/), NOT as a static file or an IDE static preview: /trace.json is a dynamic route and ES modules need an http origin, so off-server the page fails closed with an actionable message instead of hanging.
+demo/ animates ONE shared trace through all ten members, each panel drawn STRICTLY from that member's live dump() snapshot (D22.1, no shadow state), with a running %-of-Belady-optimal line. npm run demo (headless per-member summary via demo/Visualize.mjs) and npm run demo:serve (zero-dep Node server demo/serve.mjs -> http://localhost:8013/, browser page demo/visuals.html imports only ../Lru.js). demo/ is absent from files[]; Lru.js / Lru.d.ts / Bench.mjs are consumed, never edited. Must be run through the Node server (npm run demo:serve -> http://localhost:8013/), NOT as a static file or an IDE static preview: /trace.json is a dynamic route and ES modules need an http origin, so off-server the page fails closed with an actionable message instead of hanging.
 
-## API (1.11.0)
+## API (1.12.0)
 
 Named exports from @zakkster/lite-lru:
 
@@ -385,7 +409,8 @@ Named exports from @zakkster/lite-lru:
 - Arc: the Adaptive Replacement Cache member.
 - Lirs: the LIRS member (recency-of-recency; scan/loop-resistant; bounded non-resident history).
 - Lfu: the O(1) EXACT Least-Frequently-Used member (frequency buckets; LRU tie-break; the exact counterpart to WTinyLfu's approximate sketch).
-- VERSION: '1.11.0'
+- ClockPro: the CLOCK-Pro member (CLOCK approximation of LIRS; recency-of-recency on a clock with a 0-link-write hit + a self-tuning hot/cold split; bounded non-resident history).
+- VERSION: '1.12.0'
 
 Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
@@ -394,16 +419,25 @@ Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
 ## Testing
 
-- npm test        -- 1155 node:test cases (all nine members, recency/SIEVE/S3-FIFO/
-  W-TinyLFU/Slru/TwoQ/Arc/LIRS laws, TTL laws + fail-closed + purgeStale, stats parity,
+- npm test        -- 1212 node:test cases (all ten members, recency/SIEVE/S3-FIFO/
+  W-TinyLFU/Slru/TwoQ/Arc/LIRS/LFU/ClockPro laws, TTL laws + fail-closed + purgeStale, stats parity,
   iteration order, snapshot/restore round-trip + fail-closed, degenerate keys/values
   + degenerate caps 1..4, dts drift, family surface).
 - npm run test:types -- tsc: the LiteCache<K,V> surface + the one-line-swap check.
 - npm run torture -- @zakkster/lite-leak + lite-gc-profiler, --expose-gc: prints
   "ok"; tiers t0/t1/t2/t5/t6/t7/t8/t9 (t8 = the Belady OPT gate).
 - npm run torture:controls -- the deliberately-broken variants; every gate fails.
+- npm run test:perf -- @zakkster/lite-perf-gate (dev-only devDep; ships NOTHING to the
+  tarball), a node:test-native HARD zero-alloc gate that COMPLEMENTS torture t6. 20
+  scenarios (get-hit + put-churn per member) on the keys:'int' backing, proving 0
+  scavenges across N=200000 and k*N=1.6M, with old-gen / arrayBuffers / the int-index
+  `grows` counter all pinned to 0, plus a mustFail object-key churn that MUST trip the
+  gate (teeth every run). The HARD gate covers ONLY keys:'int' (strict zero-alloc,
+  decisions/0011); the Map-backing hot paths are AMORTIZED (resize may scavenge) and are
+  covered by t6, NOT here. Retained-heap keeps the tool default 64 KB (heapUsed deltas
+  are noisy); the proof is the scavenge / old-gen / external / counter lanes at strict 0.
 - npm run bench   -- the measurement tool (repo + shipped).
-- npm run verify  -- test + test:types + torture + controls, the publish gate.
+- npm run verify  -- test + test:types + torture + controls + test:perf, the publish gate.
 
 ## Composability
 

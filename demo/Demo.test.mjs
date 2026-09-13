@@ -14,7 +14,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../Lru.js';
 import { zipfTrace, loopTrace, scanTrace, beladyOpt } from '../benchmark/Bench.mjs';
 import {
     createEngine, step, runToEnd, frameModel, summary,
@@ -26,7 +26,7 @@ import { serveTrace, handle } from './serve.mjs';
 const DEMO_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = dirname(DEMO_DIR);
 
-const CTORS = { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu };
+const CTORS = { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro };
 
 function makeSpec(cap, length, seed) {
     const trace = zipfTrace({ length, keyspace: cap * 16, exponent: 1.0, seed: seed ^ 0x11 });
@@ -49,7 +49,7 @@ function replay(Ctor, trace, cap) {
 
 test('every engine member has a renderer (no member silently unrendered)', () => {
     assert.deepEqual([...MEMBER_NAMES].sort(), [...RENDERED_MEMBERS].sort());
-    assert.equal(MEMBER_DEFS.length, 9);
+    assert.equal(MEMBER_DEFS.length, 10);
 });
 
 test('assertion 1: rendered model deep-equals dump() over >= 2000 ops, all 8 (0 shadow fields)', () => {
@@ -119,7 +119,7 @@ test('assertion 3: pctOptimal === 100 * memberHitRate / beladyOpt.hitRate (|delt
     runToEnd(engine);
     const rows = summary(engine);
     const opt = beladyOpt(spec.trace, cap);
-    assert.equal(rows.length, 9);
+    assert.equal(rows.length, 10);
     for (let i = 0; i < rows.length; i++) {
         const r = rows[i];
         const expected = opt.hitRate ? (100 * r.hitRate) / opt.hitRate : 0;
@@ -312,7 +312,7 @@ test('gap: pctOptimal fail-closed on an all-distinct (never-repeating) trace -- 
     const engine = createEngine({ trace, cap, opt, kind: 'custom' });
     runToEnd(engine);
     const rows = summary(engine);
-    assert.equal(rows.length, 9);
+    assert.equal(rows.length, 10);
     for (let i = 0; i < rows.length; i++) {
         assert.equal(rows[i].hitRate, 0, rows[i].name + ' should also have hitRate 0 on an all-distinct trace');
         // Teeth: the naive formula 100*hitRate/opt.hitRate is 0/0 = NaN here. A

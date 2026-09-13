@@ -15,8 +15,8 @@
  * corrupt structure still fails the tier.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro } from './harness.mjs';
 
 const NIL = -1;
 
@@ -596,6 +596,78 @@ export function run() {
         void wrapLfu(c);
     }
 
+    // --- ClockPro laws (decisions/0025) -----------------------------------------
+
+    // CP1: the hot path sets the reference bit ONLY. A get on a resident page sets bit1 and
+    // moves NOTHING; has/peek are reference-neutral. Fixed capacity: |hot| + |cold| == size.
+    {
+        const c = new ClockPro(8);
+        for (let i = 0; i < 8; i++) c.put(i, i);
+        const R = 2; // CLOCKPRO_REF
+        const s3 = c._store.get(3);
+        check((c._st[s3] & R) === 0, () => 't0 CP1: a fresh page must start unreferenced');
+        c.get(3);
+        check((c._st[s3] & R) !== 0, () => 't0 CP1: get did not set the reference bit');
+        c.has(3); c.peek(3);
+        const s5 = c._store.get(5);
+        c.has(5); c.peek(5);
+        check((c._st[s5] & R) === 0, () => 't0 CP1: has/peek set a reference bit (must be neutral)');
+        check(c._nHot + c._nCold === c.size, () => 't0 CP1: hot+cold != size');
+        validate(c);
+    }
+
+    // CP2: the reference-bit second chance -- a referenced page survives an eviction sweep
+    // that reclaims an unreferenced one. Fill; reference every page but one; the next insert
+    // evicts the single unreferenced page (its neighbours got a second chance / promotion).
+    {
+        let evicted;
+        const c = new ClockPro(4, { onEvict: (k) => { evicted = k; } });
+        c.put(0, 0); c.put(1, 1); c.put(2, 2); c.put(3, 3);
+        c.get(0); c.get(2); c.get(3); // 1 is the only unreferenced page
+        c.put(4, 4);                  // a sweep must reclaim the unreferenced page (1)
+        check(evicted === 1, () => 't0 CP2: evicted ' + String(evicted) + ' != the unreferenced page 1');
+        check(c.has(0) && c.has(2) && c.has(3) && c.has(4),
+            () => 't0 CP2: a referenced page was evicted instead of the unreferenced one');
+        check(c.size === 4, () => 't0 CP2: size drifted from capacity');
+        validate(c);
+    }
+
+    // CP3: adaptivity + bounded history -- a page evicted while in its test period is recorded
+    // (keys only, bounded), and re-referencing it raises the adaptive hot target and re-admits
+    // it HOT. The resident capacity stays EXACTLY capacity throughout.
+    {
+        const c = new ClockPro(4);
+        for (let i = 0; i < 4; i++) c.put(i, i);   // 4 cold test pages
+        const before = c._mHot;
+        c.put(100, 100);                            // evicts a test page -> history
+        check(c._hist._len >= 1, () => 't0 CP3: an evicted test page was not recorded in the bounded history');
+        check(c._hist._len <= c._histCap, () => 't0 CP3: history exceeded its bound');
+        // re-admit a remembered key -> HOT + raised hot target.
+        let readmit = -1;
+        for (let k = 0; k < 4; k++) { if (c._hist.has(k)) { readmit = k; break; } }
+        check(readmit >= 0, () => 't0 CP3: no remembered key to re-admit (setup invalid)');
+        c.put(readmit, readmit);
+        check((c._st[c._store.get(readmit)] & 1) !== 0, () => 't0 CP3: a history re-admit must be HOT');
+        check(c._mHot >= before, () => 't0 CP3: re-admitting a test page did not raise the hot target');
+        check(c.size === 4, () => 't0 CP3: resident capacity is not exactly capacity');
+        validate(c);
+    }
+
+    // CP4: scan/loop resistance -- a referenced-and-promoted hot set survives a distinct
+    // one-hit flood larger than capacity.
+    {
+        const N = 32;
+        const c = new ClockPro(N, { keys: 'int' });
+        for (let i = 0; i < N; i++) c.put(i, i);
+        const hot = [0, 1, 2, 3];
+        for (const h of hot) for (let t = 0; t < 8; t++) c.get(h);
+        for (let i = 0; i < 4000; i++) { for (const h of hot) c.get(h); c.put(1000 + i, i); }
+        for (const h of hot) check(c.has(h), () => 't0 CP4: hot key ' + h + ' evicted by the flood (no scan resistance)');
+        check(c.size === N, () => 't0 CP4: size drifted from capacity under the flood');
+        validate(c);
+        void wrapClockPro(c);
+    }
+
     // --- TTL laws (decisions/0017) ----------------------------------------------
 
     // T1: stale = MISS, and the MISS does NOTHING to policy state. get() on an expired
@@ -769,6 +841,18 @@ export function run() {
         validate(c);
     }
 
+    // I11 ClockPro -- the clock walked newest (_head) -> oldest (_tail) over the shared
+    // _next column, RESIDENT only, the non-resident history EXCLUDED (decisions/0025). The
+    // clock is realized NIL-terminated (head..tail with wrap-around hands), so the shared
+    // CacheIterator + the manual head-walk agree exactly.
+    {
+        const c = new ClockPro(16);
+        for (let i = 0; i < 40; i++) c.put(i % 24, i); // churn past capacity
+        for (let i = 0; i < 12; i++) c.get((i * 5) % 24); // set reference bits (no relink)
+        checkIterOrder('clockpro', c, [c._head]);
+        validate(c);
+    }
+
     // I5 TTL-skip WITHOUT reap (D18.5): a walk sees only live entries, but leaves the
     // stale ones resident (size unchanged); purgeStale() is the reclamation path.
     {
@@ -787,7 +871,8 @@ export function run() {
 
     // --- Snapshot / restore laws (decisions/0021, D21) --------------------------
     const SNAP = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo],
-        ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu]];
+        ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu],
+        ['ClockPro', ClockPro]];
 
     // SN1: round-trip identity. Build a churned mid-life state, dump, structuredClone,
     // restore, and assert dump==dump (fixed point) AND identical order/values/size via an

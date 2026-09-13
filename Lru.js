@@ -139,6 +139,16 @@ const LFU_POOL_MSG =
     "[lite-lru] Lfu bucket pool exhausted (more than capacity distinct frequencies); " +
     "this is an invariant violation, not a capacity condition";
 
+/** ClockPro (decisions/0025, D25) per-slot state bits, packed in a member-specific `_st`
+ *  Uint8 column (mirrors LIRS's `_st`, NOT a field on the shared SlotStore -- the other
+ *  members' hot paths stay byte-identical). bit0 = hot (1) / cold (0); bit1 = referenced
+ *  (the ONLY bit a get/put-update touches -- the Sieve/S3Fifo 0-link-write headline);
+ *  bit2 = test (a cold page in its test period). A page is hot XOR cold; a hot page is
+ *  never in a test period, so `HOT | TEST` is an invalid combination (validate rejects it). */
+const CLOCKPRO_HOT = 1;  // bit0: 1 = hot page, 0 = cold page
+const CLOCKPRO_REF = 2;  // bit1: referenced since the last hand pass (the hot-path store)
+const CLOCKPRO_TEST = 4; // bit2: a cold page currently in its test period
+
 /** W-TinyLFU count-min sketch shape (decisions/0014, D14.2): 4 rows of 4-bit
  *  saturating counters packed 8-per-Uint32. One per-row seed spreads a key across the
  *  rows; `Math.imul` keeps each mix an EXACT 32-bit multiply (zero-alloc). Built once. */
@@ -235,7 +245,7 @@ function validateStats(stats) {
         "[lite-lru] unknown stats option " + String(stats) + " (did you mean true?)");
 }
 
-export const VERSION = "1.11.0";
+export const VERSION = "1.12.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -5342,6 +5352,626 @@ export class Lfu {
     _peekVictim() {
         if (this._bMin === LFU_NIL) return undefined;
         return this._keys[this._bTail[this._bMin]];
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * ClockProHistory -- the bounded, keys-only non-resident test-page history for
+ * ClockPro (decisions/0025, D25.2). A GENERALIZATION of ArcGhost (exactly like
+ * LirsHistory, decisions/0023): the same open-addressed int ring (strict zero-alloc on
+ * keys:'int') / Set + FIFO array (amortized on the Map backing), bounded at construction
+ * to `capacity`, drop-oldest. It stands in for the non-resident cold pages of the
+ * textbook interleaved ClockPro clock: a non-resident cold page is "still remembered"
+ * (its test period has not been forgotten) iff its key is still in this bounded ring. It
+ * is NOT interleaved into the circular clock (the D25.2 honest, bounded deviation from
+ * the textbook interleaving). INTERNAL, never exported.
+ * -------------------------------------------------------------------------- */
+
+class ClockProHistory extends ArcGhost {}
+
+/* -------------------------------------------------------------------------- *
+ * ClockPro -- CLOCK-Pro (Jiang, Chen & Zhang, USENIX ATC'05), decisions/0025, D25.
+ * The TENTH named export in this file (same single-file ruling as the rest of the
+ * family: single main file + sideEffects:false + named exports = the tree-shake moat).
+ *
+ * ClockPro is the CLOCK approximation of LIRS: it approximates recency-of-recency (the
+ * inter-reference recency LIRS orders exactly) with ONE circular list + reference bits +
+ * three moving hands, so it needs no O(1) stack surgery on a hit -- a hit sets a single
+ * reference bit and moves NOTHING (the Sieve/S3Fifo 0-link-write headline, D25.5).
+ *
+ * STRUCTURE (all fixed at construction, zero-alloc on the hot path):
+ *   - ONE circular list of RESIDENT pages threaded through the shared `_next`/`_prev`
+ *     columns (D25.1). REALIZATION NOTE (documented deviation, decisions/0025): the clock
+ *     is realized as a NIL-terminated doubly-linked list (`_head` = newest .. `_tail` =
+ *     oldest) whose hands WRAP (`_advance(_tail) -> _head`) -- the TRAVERSAL is circular
+ *     (a clock has no ends), while the NIL terminus lets the member reuse the family's
+ *     shared iteration (CacheIterator), conservation (validate's default recency
+ *     descriptor) and snapshot (snapList/snapLink) machinery BYTE-FOR-BYTE. validate()
+ *     asserts the logical closure (every hand resident, hot+cold == size).
+ *   - `_st` Uint8: bit0 hot, bit1 referenced, bit2 test (D25.1). A hit is a single
+ *     `_st[s] |= REF` -- 0 link writes, exactly 1 state store (D25.5, pinned in t6).
+ *   - THREE hands as Int32 slot pointers (D25.1): `_handCold` (the eviction hand -- finds
+ *     an unreferenced resident cold page), `_handHot` (demotes a hot page to cold when the
+ *     hot set exceeds its adaptive target), `_handTest` (ends the test period of a resident
+ *     cold page, lowering the adaptive hot target when a test page expires unreferenced).
+ *   - `_mHot` (0..capacity): the ADAPTIVE integer hot-page target (D25.3). A re-admit of a
+ *     key still in the bounded history RAISES it (the page proved worthy); `_handTest`
+ *     ending a test period unreferenced LOWERS it. O(1) updates.
+ *   - `_hist` (ClockProHistory): the bounded non-resident test-page history (D25.2), keys
+ *     only, cap = capacity, drop-oldest -- NOT interleaved into the clock.
+ *
+ * Fixed-capacity honesty (D25.4, restating Arc D16.2 / Lirs D23): the RESIDENT value
+ * capacity is EXACTLY `capacity`; only the hot/cold split moves, |hot| + |cold| == size.
+ *
+ * Rides the shared newStore factory (default Map / opt-in keys:'int' strict-zero), the
+ * onEvict fire-after + `_inOnEvict` guard (0002), TTL (0017), zero-GC iteration (0018),
+ * stats (0019), snapshot (0021). A hit is proven zero-alloc + 0-link-write by the t6 gate.
+ * -------------------------------------------------------------------------- */
+
+export class ClockPro {
+    /**
+     * @param {number} capacity  Max resident entries. Must be an integer >= 1.
+     * @param {{ onEvict?: (key: any, value: any) => void, keys?: 'int' }} [options]
+     */
+    constructor(capacity, options) {
+        if (!Number.isInteger(capacity) || capacity < 1) {
+            throw new RangeError(
+                "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
+            );
+        }
+
+        this._capacity = capacity;
+
+        // TTL (decisions/0017), validated fail-closed -- identical to the rest of the family.
+        this._clock = validateClock(options && options.clock);
+        this._ttl = validateTtl(options && options.ttl);
+
+        // Same shared substrate + int-key door as every other member.
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+
+        // Cache the store's columns so the ring relinks stay direct. `_next` toward the
+        // tail (older), `_prev` toward the head (newer); the hands WRAP `_next[tail] -> head`.
+        this._keys = this._store._keys;
+        this._vals = this._store._vals;
+        this._next = this._store._next;
+        this._prev = this._store._prev;
+        this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+
+        // Per-slot state (bit0 hot, bit1 referenced, bit2 test). Member-specific, fixed,
+        // never grown -- the other members' hot paths carry no new column (like LIRS `_st`).
+        this._st = new Uint8Array(capacity);
+
+        this._head = NIL; // the newest resident page (the insertion end)
+        this._tail = NIL; // the oldest resident page
+
+        // The three hands (D25.1), Int32 slot pointers; NIL only when the clock is empty.
+        this._handCold = NIL; // eviction hand
+        this._handHot = NIL;  // hot-demotion hand
+        this._handTest = NIL; // test-period-expiry hand
+
+        this._nHot = 0;  // resident hot pages
+        this._nCold = 0; // resident cold pages (|hot| + |cold| == size, D25.4)
+        this._size = 0;
+
+        // The adaptive integer hot-page target (D25.3), 0..capacity. Starts cold-favouring at 0.
+        this._mHot = 0;
+
+        // The bounded non-resident test-page history (D25.2): keys only, cap = capacity, drop-oldest.
+        this._histCap = capacity;
+        this._histInt = (options && options.keys) === 'int';
+        this._hist = new ClockProHistory(capacity, this._histInt);
+
+        this._onEvict = (options && options.onEvict) || NOOP;
+        this._inOnEvict = false;
+
+        // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
+        this._stats = validateStats(options && options.stats);
+    }
+
+    /** The store factory, delegating to the shared `newStore` (decisions/0011). */
+    _makeStore(capacity, keys, hasTtl) {
+        return newStore(capacity, keys, hasTtl);
+    }
+
+    get size() { return this._size; }
+    get capacity() { return this._capacity; }
+
+    // --- the circular ring (NIL-terminated DLL + wrap-around hand advance) -----
+
+    /** Advance one step around the clock: toward the tail, wrapping tail -> head (D25.1). */
+    _advance(s) {
+        const n = this._next[s];
+        return n !== NIL ? n : this._head;
+    }
+
+    /** The ring successor of `s` used when `s` is being removed: its `_next`, else the head
+     *  (wrap), else NIL when `s` is the sole resident. Computed BEFORE the detach. */
+    _ringSucc(s) {
+        const n = this._next[s];
+        if (n !== NIL) return n;
+        return this._head === s ? NIL : this._head;
+    }
+
+    /** Insert slot s at the head (newest end) of the ring. Sets all three hands when the
+     *  ring was empty (the sole page is where every hand parks). */
+    _pushFront(s) {
+        this._prev[s] = NIL;
+        this._next[s] = this._head;
+        if (this._head !== NIL) this._prev[this._head] = s;
+        this._head = s;
+        if (this._tail === NIL) {
+            this._tail = s;
+            this._handCold = s;
+            this._handHot = s;
+            this._handTest = s;
+        }
+    }
+
+    /** Unlink slot s from the ring, fixing neighbours + head/tail sentinels. */
+    _detach(s) {
+        const p = this._prev[s], n = this._next[s];
+        if (p !== NIL) this._next[p] = n; else this._head = n;
+        if (n !== NIL) this._prev[n] = p; else this._tail = p;
+    }
+
+    /** Remove a resident slot: repair any hand parked on it (advance to its successor),
+     *  unlink it, and drop the matching hot/cold count. Does NOT touch the index / free
+     *  stack / `_st` / `_size` (the caller finishes those). */
+    _removeSlot(s) {
+        const succ = this._ringSucc(s);
+        if (this._handCold === s) this._handCold = succ;
+        if (this._handHot === s) this._handHot = succ;
+        if (this._handTest === s) this._handTest = succ;
+        this._detach(s);
+        if (this._st[s] & CLOCKPRO_HOT) this._nHot--; else this._nCold--;
+    }
+
+    // --- the ClockPro hands (COLD helpers, allocation-free) --------------------
+
+    /** Add a key to the bounded non-resident history, dropping the OLDEST at the bound
+     *  (D25.2). COLD (only the eviction path reaches it). */
+    _histAdd(key) {
+        if (this._hist._len >= this._histCap) this._hist.delLRU();
+        this._hist.addMRU(key);
+    }
+
+    /** ONE step of HAND_test: end the test period of the resident cold page it points at (so a
+     *  long-resident page whose test period lapsed is NOT remembered when later evicted) and
+     *  LOWER the adaptive hot target (D25.3 -- a test page expired without earning hot status),
+     *  then advance. Stepped ONLY on reference activity (a HAND_cold promotion / second chance),
+     *  never on a plain eviction -- so it neither runs in lockstep with HAND_cold (which would
+     *  starve the non-resident history) nor lowers `_mHot` on every eviction (which would pin it
+     *  to 0 and make the adaptation vacuous). Amortized O(1). */
+    _handTestStep() {
+        const t = this._handTest;
+        if (t === NIL) return;
+        const st = this._st[t];
+        if ((st & CLOCKPRO_HOT) === 0 && (st & CLOCKPRO_TEST) !== 0) {
+            this._st[t] &= ~CLOCKPRO_TEST;         // the resident test period is over
+            if (this._mHot > 0) this._mHot--;      // ... LOWER the adaptive hot target (D25.3)
+        }
+        this._handTest = this._advance(this._handTest);
+    }
+
+    /** HAND_hot: demote exactly ONE hot page to cold. A hot page whose reference bit is set
+     *  gets a second chance (bit cleared, advance); the first unreferenced hot page is
+     *  demoted to a cold page in a fresh test period. Only called when a hot page exists.
+     *  COLD / out-of-line. */
+    _handHotDemote() {
+        for (;;) {
+            const h = this._handHot;
+            if (h === NIL) return; // defensive (never on a coherent clock with a hot page)
+            const st = this._st[h];
+            if (st & CLOCKPRO_HOT) {
+                if (st & CLOCKPRO_REF) {
+                    this._st[h] = CLOCKPRO_HOT;                 // second chance: clear ref, stay hot
+                    this._handHot = this._advance(this._handHot);
+                } else {
+                    this._st[h] = CLOCKPRO_TEST;               // demote: cold, in a fresh test period
+                    this._nHot--; this._nCold++;
+                    this._handHot = this._advance(this._handHot);
+                    return;
+                }
+            } else {
+                this._handHot = this._advance(this._handHot);  // skip cold pages
+            }
+        }
+    }
+
+    /** Promote a referenced resident cold page (found in its test period by HAND_cold) to a
+     *  hot page. Split into a helper so a subclass (torture lane coverage) can count it. */
+    _promoteCold(c) {
+        this._st[c] = CLOCKPRO_HOT; // hot, ref cleared, test cleared
+        this._nCold--; this._nHot++;
+    }
+
+    /**
+     * Free exactly ONE resident slot and return it for in-place reuse (D6-style). Runs one
+     * HAND_test step, ensures a cold page exists (demoting a hot page if the clock is all
+     * hot), then sweeps HAND_cold: a referenced cold page in its test period is PROMOTED to
+     * hot; a referenced cold page not in test gets a second chance (a fresh test period); the
+     * first UNREFERENCED cold page is evicted -- to the bounded history iff it was in a test
+     * period. Sets `_evKey`/`_evVal` for the onEvict fire-after. Only ever called at capacity.
+     */
+    _evictOne() {
+        if (this._nCold === 0) this._handHotDemote(); // guarantee an eviction candidate exists
+        for (;;) {
+            const c = this._handCold;
+            const st = this._st[c];
+            if (st & CLOCKPRO_HOT) {
+                this._handCold = this._advance(this._handCold); // the cold hand skips hot pages
+                continue;
+            }
+            if (st & CLOCKPRO_REF) {
+                if (st & CLOCKPRO_TEST) {
+                    // referenced during its test period -> the page earned hot status.
+                    this._promoteCold(c);
+                    this._handCold = this._advance(this._handCold);
+                    this._handTestStep();               // reference activity -> step the test hand
+                    if (this._nHot > this._mHot || this._nCold === 0) this._handHotDemote();
+                    continue;
+                }
+                // referenced, not in test -> second chance, restart the test period.
+                this._st[c] = CLOCKPRO_TEST;
+                this._handCold = this._advance(this._handCold);
+                this._handTestStep();                   // reference activity -> step the test hand
+                continue;
+            }
+            // an unreferenced cold page -> the victim.
+            this._evKey = this._keys[c];
+            this._evVal = this._vals[c];
+            const wasTest = (st & CLOCKPRO_TEST) !== 0;
+            this._removeSlot(c);                    // repair hands + unlink + nCold--
+            this._store.delete(this._evKey);
+            if (wasTest) this._histAdd(this._evKey); // a test page leaves as a non-resident test page
+            this._st[c] = 0;
+            this._size--;
+            return c;
+        }
+    }
+
+    // --- public API (all zero-alloc on the hot path) --------------------------
+
+    /** Look up a key AND set its reference bit (ClockPro's second-chance flag). The whole
+     *  hot path is a single `_st` store -- 0 link writes (D25.5). @returns the value, or
+     *  undefined if absent (see D7). A get never consults the non-resident history. */
+    get(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const s = this._store.get(key);
+        if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
+            this._reap(s);
+            return undefined;
+        }
+        this._st[s] |= CLOCKPRO_REF; // the whole hot path: one state store, no relink
+        if (this._stats !== null) this._stats.hits++; // live hit (0019)
+        return this._vals[s];
+    }
+
+    /**
+     * Insert or update. An update rewrites the value and sets the reference bit (like a hit,
+     * D25.5). A new key still in the bounded non-resident history is re-admitted as a HOT
+     * page and RAISES the adaptive hot target (D25.3); a brand-new key enters as a cold page
+     * in a test period. At capacity one resident is evicted first (its slot reused in place).
+     * onEvict fires LAST (0002). The positional `ttlMs` (0017) overrides the ttl default.
+     */
+    put(key, value, ttlMs) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        let expiresAt;
+        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
+        this._store._ver++; // D18.6 -- put mutates; invalidate iterators
+        const store = this._store;
+        const existing = store.get(key);
+        if (existing >= 0) {                  // update-in-place + set the reference bit
+            this._vals[existing] = value;
+            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            this._st[existing] |= CLOCKPRO_REF;
+            if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
+            return;
+        }
+
+        const inHist = this._hist.has(key);
+        let s;
+        let evicted = false;
+        if (this._size === this._capacity) {
+            s = this._evictOne();             // evict one resident -> reuse its slot; sets _evKey/_evVal
+            evicted = true;
+        } else {
+            s = store.allocSlot();
+        }
+
+        if (inHist) {
+            this._hist.consume(key);
+            this._mHot++; if (this._mHot > this._capacity) this._mHot = this._capacity; // raise (D25.3)
+        }
+        this._keys[s] = key;
+        this._vals[s] = value;
+        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        store.set(key, s);
+        this._pushFront(s);
+
+        if (inHist) {
+            // a non-resident test page re-referenced -> re-admit as HOT (the recency win).
+            this._st[s] = CLOCKPRO_HOT;
+            this._nHot++;
+            if (this._nHot > this._mHot) this._handHotDemote();
+        } else {
+            // a brand-new page -> cold, in a test period.
+            this._st[s] = CLOCKPRO_TEST;
+            this._nCold++;
+        }
+        this._size++;
+        if (this._stats !== null) this._stats.puts++; // successful insert (outcome-based); 0019
+
+        if (evicted) {
+            if (this._stats !== null) this._stats.evictions++; // capacity eviction (0019)
+            const evKey = this._evKey, evVal = this._evVal;
+            this._evKey = undefined; this._evVal = undefined; // retention hygiene
+            this._inOnEvict = true;
+            try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+        }
+    }
+
+    /** True if key is present (RESIDENT). History keys are NOT present. Reference-NEUTRAL. A
+     *  stale entry is a MISS and is reaped in place (decisions/0017, D17.3). */
+    has(key) {
+        const s = this._store.get(key);
+        if (s < 0) return false;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return false;
+        }
+        return true;
+    }
+
+    /** Read a value WITHOUT setting the reference bit. undefined if absent (see D7). A stale
+     *  entry is a MISS and is reaped in place (decisions/0017, D17.3). */
+    peek(key) {
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return undefined;
+        }
+        return this._vals[s];
+    }
+
+    /** Reap an expired slot in place (decisions/0017): repair hands, unlink from the ring,
+     *  drop from the index, free the slot, and fire onEvict LAST via the 0002 guard. A reap
+     *  is NOT a capacity victim, so it is never recorded in the history (like delete). */
+    _reap(s) {
+        this._store._ver++; // D18.6 -- a reap is a structural mutation; invalidate iterators
+        const evKey = this._keys[s];
+        const evVal = this._vals[s];
+        this._removeSlot(s);
+        this._store.delete(evKey);
+        this._st[s] = 0;
+        this._store.freeSlot(s);
+        this._size--;
+        if (this._stats !== null) this._stats.evictions++; // reap = eviction (0019, D19.2)
+        this._inOnEvict = true;
+        try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+    }
+
+    /** Evict every expired resident entry now (decisions/0017, D17.5). COLD, O(size). */
+    purgeStale() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG);
+        if (this._exp === null) return 0;
+        const now = this._clock();
+        const exp = this._exp;
+        const victims = [];
+        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
+        return victims.length;
+    }
+
+    /** Remove a key. Returns true if it was present. Frees the slot; NOT recorded in history. */
+    delete(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const s = store.get(key);
+        if (s < 0) return false;
+        store._ver++; // D18.6 -- a real delete is a structural mutation; invalidate iterators
+        this._removeSlot(s);
+        store.delete(key);
+        this._st[s] = 0;
+        store.freeSlot(s);
+        this._size--;
+        return true;
+    }
+
+    /** Empty the cache. Rebuilds the free list, empties the ring + history, resets the hands,
+     *  the counts and the adaptive target. Allocates nothing. O(capacity). */
+    clear() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
+        this._store.reset();
+        this._head = NIL; this._tail = NIL;
+        this._handCold = NIL; this._handHot = NIL; this._handTest = NIL;
+        this._nHot = 0; this._nCold = 0; this._size = 0;
+        this._mHot = 0;
+        this._st.fill(0);
+        this._hist.clear();
+    }
+
+    // --- opt-in runtime stats (decisions/0019, D19): cold accessors -----------
+
+    /** The live stats holder (decisions/0019, D19.3), returned BY REFERENCE (borrowed).
+     *  Fail closed on an instance built without { stats: true }. */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE (decisions/0019). Fail closed on a non-stats instance. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        const st = this._stats;
+        st.hits = 0; st.misses = 0; st.evictions = 0; st.puts = 0;
+    }
+
+    // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
+
+    /** The per-member iteration ROSTER (decisions/0018 / 0025): the clock walked newest
+     *  (`_head`) -> oldest (`_tail`) over the shared `_next` column -- RESIDENT only (the
+     *  non-resident history is EXCLUDED). NOT recency order (a clock does not track it);
+     *  recency-neutral, stale-skipping, fail-closed via `_ver` -- the shared CacheIterator
+     *  walks it unchanged (the NIL terminus, not the wrap, is what iteration follows). */
+    _iterHeads() { return [this._head]; }
+
+    keys() { return iterKeys(this); }
+    values() { return iterValues(this); }
+    entries() { return iterEntries(this); }
+    [Symbol.iterator]() { return iterEntries(this); }
+
+    // --- snapshot / restore (decisions/0021, D21 + 0025): COLD, may allocate --
+
+    /** Serialize to a plain snapshot (decisions/0021, D21 + D25.6): the clock newest..oldest
+     *  (values/expiry) + each page's per-slot `_st` byte, the THREE hand positions, the
+     *  adaptive `_mHot`, AND the bounded non-resident history (keys only, oldest..newest).
+     *  Dropping the hands, `_mHot`, the test bits or the history is a fail-OPEN future-
+     *  eviction bug, so ALL are captured (the t9 controls prove the round-trip catches it). */
+    dump() {
+        const snap = snapBase(this, "ClockPro");
+        snap.ring = snapList(this, this._head, false);
+        const st = [];
+        for (let i = 0; i < snap.ring.slots.length; i++) st.push(this._st[snap.ring.slots[i]]);
+        snap.st = st;
+        snap.handCold = this._handCold;
+        snap.handHot = this._handHot;
+        snap.handTest = this._handTest;
+        snap.mHot = this._mHot;
+        snap.hist = snapArcGhost(this._hist);
+        return snap;
+    }
+
+    /** Reconstruct a FRESH ClockPro from a snapshot (decisions/0021, D21 + D25.6). Fail
+     *  closed on any tag/shape mismatch, a malformed/short `st` column, a `_st` byte that is
+     *  not a valid tag (0..7, never HOT|TEST), an `mHot` out of [0,cap], a hand that does not
+     *  reference a resident slot (or is set on an empty clock), or a history over its bound. */
+    static restore(snap, opts) {
+        const cap = snapRead(snap, "ClockPro", opts);
+        const inst = new ClockPro(cap, snapOpts(snap, opts));
+        const occ = snapCheckOccupy(cap, snap.ttl, [[snap.ring, "ring"]]);
+        // Shape the ClockPro-specific aux (fail closed -- "null is not zero").
+        if (!Array.isArray(snap.st) || snap.st.length !== snap.ring.slots.length) {
+            throw new Error(SNAP_BAD + "clockpro st must be an array aligned to the ring");
+        }
+        for (let i = 0; i < snap.st.length; i++) {
+            const b = snap.st[i];
+            if (!Number.isInteger(b) || b < 0 || b > 7) {
+                throw new Error(SNAP_BAD + "clockpro st[" + i + "] = " + String(b) + " (must be an integer 0..7)");
+            }
+            if ((b & CLOCKPRO_HOT) && (b & CLOCKPRO_TEST)) {
+                throw new Error(SNAP_BAD + "clockpro st[" + i + "] is both hot and in a test period (invalid)");
+            }
+        }
+        if (!Number.isInteger(snap.mHot) || snap.mHot < 0 || snap.mHot > cap) {
+            throw new Error(SNAP_BAD + "clockpro mHot out of [0," + cap + "]: " + String(snap.mHot));
+        }
+        if (!Array.isArray(snap.hist)) throw new Error(SNAP_BAD + "clockpro history (hist) must be an array");
+        if (snap.hist.length > cap) {
+            throw new Error(SNAP_BAD + "clockpro history (" + snap.hist.length + ") exceeds capacity (" + cap + ")");
+        }
+
+        const R = snapRestoreList(inst, snap.ring, null, 0);
+        inst._head = R.head; inst._tail = R.tail; inst._size = R.size;
+        let nHot = 0, nCold = 0;
+        for (let i = 0; i < snap.ring.slots.length; i++) {
+            const s = snap.ring.slots[i];
+            inst._st[s] = snap.st[i];
+            if (snap.st[i] & CLOCKPRO_HOT) nHot++; else nCold++;
+        }
+        inst._nHot = nHot; inst._nCold = nCold;
+
+        // The three hands: NIL iff the clock is empty, else a resident slot (fail closed).
+        const hands = [["handCold", snap.handCold], ["handHot", snap.handHot], ["handTest", snap.handTest]];
+        for (let i = 0; i < hands.length; i++) {
+            const nm = hands[i][0], h = hands[i][1];
+            if (R.size === 0) {
+                if (h !== NIL) throw new Error(SNAP_BAD + "clockpro " + nm + " set on an empty clock");
+            } else if (!Number.isInteger(h) || h < 0 || h >= cap || occ[h] === 0) {
+                throw new Error(SNAP_BAD + "clockpro " + nm + " " + String(h) + " does not reference a resident slot");
+            }
+        }
+        inst._handCold = snap.handCold;
+        inst._handHot = snap.handHot;
+        inst._handTest = snap.handTest;
+
+        const gInt = typeof inst._store._ck === "function";
+        for (let i = 0; i < snap.hist.length; i++) {
+            if (gInt) inst._store._ck(snap.hist[i]); // fail closed on a non-int history key
+            inst._histAdd(snap.hist[i]);
+        }
+        // Set the adaptive target AFTER replaying the history so a bounded-history drop during
+        // replay (which lowers _mHot) cannot perturb the captured value.
+        inst._mHot = snap.mHot;
+
+        inst._store.rebuildFreeList(occ);
+        return inst;
+    }
+
+    // --- test/debug only (never call on a hot path) ---------------------------
+
+    /** Free-stack length, delegated to the store (conservation invariant). */
+    _freeListLength() {
+        return this._store.freeListLength();
+    }
+
+    /**
+     * The key the NEXT over-capacity insert would evict, computed WITHOUT mutating any link,
+     * bit, hand, count or `_mHot` (the non-destructive twin of `_evictOne`). It clones the
+     * `_st` bytes and copies the hands / counts / `_mHot` into locals, then replays the EXACT
+     * `_evictOne` sweep (HAND_test step + HAND_cold sweep with HAND_hot demotions) reading the
+     * unchanged `_next` topology, returning the victim's key. TEST-ONLY (drives the torture
+     * differential); it MAY allocate (the `_st` clone) precisely because it is never a hot or
+     * measured path.
+     */
+    _peekVictim() {
+        if (this._size === 0) return undefined;
+        const next = this._next, keys = this._keys, st = this._st.slice();
+        const head = this._head;
+        let handCold = this._handCold, handHot = this._handHot, handTest = this._handTest;
+        let nHot = this._nHot, nCold = this._nCold, mHot = this._mHot;
+        const advance = (s) => { const n = next[s]; return n !== NIL ? n : head; };
+        const demote = () => {
+            for (;;) {
+                const h = handHot;
+                if (h === NIL) return;
+                const s = st[h];
+                if (s & CLOCKPRO_HOT) {
+                    if (s & CLOCKPRO_REF) { st[h] = CLOCKPRO_HOT; handHot = advance(handHot); }
+                    else { st[h] = CLOCKPRO_TEST; nHot--; nCold++; handHot = advance(handHot); return; }
+                } else { handHot = advance(handHot); }
+            }
+        };
+        const testStep = () => {
+            if (handTest === NIL) return;
+            const s = st[handTest];
+            if ((s & CLOCKPRO_HOT) === 0 && (s & CLOCKPRO_TEST) !== 0) {
+                st[handTest] &= ~CLOCKPRO_TEST; if (mHot > 0) mHot--;
+            }
+            handTest = advance(handTest);
+        };
+        if (nCold === 0) demote();
+        for (;;) {
+            const c = handCold;
+            const s = st[c];
+            if (s & CLOCKPRO_HOT) { handCold = advance(handCold); continue; }
+            if (s & CLOCKPRO_REF) {
+                if (s & CLOCKPRO_TEST) {
+                    st[c] = CLOCKPRO_HOT; nCold--; nHot++;
+                    handCold = advance(handCold);
+                    testStep();
+                    if (nHot > mHot || nCold === 0) demote();
+                    continue;
+                }
+                st[c] = CLOCKPRO_TEST; handCold = advance(handCold); testStep(); continue;
+            }
+            return keys[c];
+        }
     }
 }
 

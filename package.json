@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-lru",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "1.11.0",
+  "version": "1.12.0",
   "description": "Zero-dependency, zero-GC cache family under one LiteCache<K,V> surface: a classic LRU reference member and the modern SIEVE headline, tree-shakeable to one policy, with a shipped bench + Belady OPT measurement tool.",
   "type": "module",
   "main": "./Lru.js",
@@ -30,10 +30,11 @@
     "test:types": "tsc -p test/types/tsconfig.json",
     "torture": "node --expose-gc test/torture.mjs",
     "torture:controls": "node test/controls.mjs",
+    "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs",
     "bench": "node benchmark/Bench.mjs",
     "demo": "node demo/Visualize.mjs",
     "demo:serve": "node demo/serve.mjs",
-    "verify": "npm test && npm run test:types && npm run torture && npm run torture:controls"
+    "verify": "npm test && npm run test:types && npm run torture && npm run torture:controls && npm run test:perf"
   },
   "keywords": [
     "lru",
@@ -70,6 +71,7 @@
   "devDependencies": {
     "@zakkster/lite-gc-profiler": "^1.16.0",
     "@zakkster/lite-leak": "^1.10.0",
+    "@zakkster/lite-perf-gate": "^1.4.2",
     "typescript": "^7.0.2"
   },
   "engines": {

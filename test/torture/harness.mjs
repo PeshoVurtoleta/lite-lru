@@ -25,10 +25,11 @@
  */
 
 import { measureOps, checkNoGc, measureAllocs, checkAllocs } from '@zakkster/lite-gc-profiler';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../../Lru.js';
 import { makeLruOracle, svz } from './oracles/lru.mjs';
 import { makeLirsOracle } from './oracles/lirs.mjs';
 import { makeLfuOracle } from './oracles/lfu.mjs';
+import { makeClockProOracle } from './oracles/clockpro.mjs';
 import { makeFifoOracle, makeFifoReal } from './oracles/fifo.mjs';
 import { makeSieveOracle } from './oracles/sieve.mjs';
 import { makeS3FifoOracle } from './oracles/s3fifo.mjs';
@@ -511,6 +512,45 @@ export const lfuTtlPolicy = {
     oracle: (cap, o) => makeLfuOracle(cap, o),
 };
 
+/** Wrap a real ClockPro as a uniform driver. victim via `_peekVictim` (the non-destructive
+ *  twin of the HAND_cold eviction sweep, test-only introspection, never a hot path). */
+export function wrapClockPro(cache) {
+    return {
+        get: (k) => cache.get(k),
+        put: (k, v, t) => cache.put(k, v, t),
+        has: (k) => cache.has(k),
+        peek: (k) => cache.peek(k),
+        delete: (k) => cache.delete(k),
+        size: () => cache.size,
+        victim: () => cache._peekVictim(),
+        raw: cache,
+    };
+}
+
+/** The ClockPro policy (decisions/0025): the CLOCK-approximation-of-LIRS member + its own
+ *  independent clock/three-hand/bounded-history oracle. Default backing (Map): arbitrary keys. */
+export const clockProPolicy = {
+    name: 'clockpro',
+    real: (cap) => wrapClockPro(new ClockPro(cap)),
+    oracle: (cap) => makeClockProOracle(cap),
+};
+
+/** The ClockPro policy on the INTEGER substrate backing (`keys: 'int'`), driven against the
+ *  SAME clockpro oracle: the strict-zero backing (incl. the int history ring) must return
+ *  byte-identical values + victims (decisions/0011 + 0025). */
+export const clockProIntPolicy = {
+    name: 'clockpro-int',
+    real: (cap) => wrapClockPro(new ClockPro(cap, { keys: 'int' })),
+    oracle: (cap) => makeClockProOracle(cap),
+};
+
+/** ClockPro with an opt-in TTL default (decisions/0017). */
+export const clockProTtlPolicy = {
+    name: 'clockpro-ttl',
+    real: (cap, o) => wrapClockPro(new ClockPro(cap, o)),
+    oracle: (cap, o) => makeClockProOracle(cap, o),
+};
+
 /* -------------------------------------------------------------------------- *
  * The PARAMETERIZED differential runner (the whole point of S1).
  *
@@ -800,6 +840,52 @@ export class CountedLfu extends Lfu {
 export const LFU_WRITES_FASTPATH = 1;
 export const LFU_WRITES_MAX = 14;
 
+/**
+ * A ClockPro subclass whose ring columns `_next`/`_prev` AND the per-page state column `_st`
+ * are wrapped in counting Proxies -- used ONLY in the T6 ClockPro counter sub-tier, NEVER on
+ * a measured zero-alloc path (a Proxy allocates + traps and would poison the gate). It pins
+ * ClockPro's headline: a HIT relinks NOTHING (0 `_next`/`_prev` stores) and sets exactly ONE
+ * `_st` byte (the reference bit) -- the Sieve/S3Fifo lazy-promotion discipline. The Proxy
+ * writes through to the same underlying buffer the store reads, so alloc/free stay consistent.
+ */
+export class CountedClockPro extends ClockPro {
+    constructor(capacity, options) {
+        super(capacity, options);
+        this._writes = 0;   // _next / _prev link stores
+        this._stWrites = 0; // _st state stores
+        const self = this;
+        const countStores = (arr, isSt) => new Proxy(arr, {
+            set(t, prop, value) {
+                if (typeof prop === 'string' && prop !== 'length' && String(+prop) === prop) {
+                    if (isSt) self._stWrites++; else self._writes++;
+                }
+                t[prop] = value;
+                return true;
+            },
+        });
+        this._next = countStores(this._next, false);
+        this._prev = countStores(this._prev, false);
+        this._st = countStores(this._st, true);
+    }
+    resetWrites() { this._writes = 0; this._stWrites = 0; }
+    writes() { return this._writes; }
+    stWrites() { return this._stWrites; }
+}
+
+/** ClockPro hit baselines (measured; a REAL regression pin). The headline: a hit relinks
+ *  NOTHING (0 link stores) and sets exactly ONE state byte (the reference bit). */
+export const CLOCKPRO_WRITES_HIT_LINKS = 0;
+export const CLOCKPRO_WRITES_HIT_ST = 1;
+
+/** NOT a bound -- a per-STREAM regression TRIPWIRE only. A ClockPro miss+evict is amortized
+ *  O(1) (classic CLOCK) but WORST-CASE O(capacity) `_st` writes on a full-scan-then-insert
+ *  (fill to capacity, reference every resident page, then insert -- HAND_cold + HAND_hot must
+ *  sweep the whole clock clearing reference bits, ~2*capacity writes). This constant only
+ *  tripwires the t6 `cpStream` corpus (a mixed stream that never does scan-then-insert,
+ *  worst-observed ~37); it makes NO claim about the true worst case (which is O(capacity)),
+ *  unlike Lfu's PROVEN <= 14. Do not call it a bound. */
+export const CLOCKPRO_WRITES_MISS_EVICT_TRIPWIRE = 64;
+
 /* -------------------------------------------------------------------------- *
  * Snapshot / restore round-trip differential (decisions/0021, D21).
  *
@@ -826,6 +912,7 @@ export const SNAP_MEMBERS = [
     { name: 'Arc', Ctor: Arc, wrap: wrapArc },
     { name: 'Lirs', Ctor: Lirs, wrap: wrapLirs },
     { name: 'Lfu', Ctor: Lfu, wrap: wrapLfu },
+    { name: 'ClockPro', Ctor: ClockPro, wrap: wrapClockPro },
 ];
 
 /** Structural deep-equality for two snapshots, IGNORING the capture-time field `t`
