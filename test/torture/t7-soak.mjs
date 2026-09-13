@@ -11,7 +11,7 @@
  * the payload refs). The census is the teeth for that.
  */
 
-import { LiteLru, S3Fifo, WTinyLfu } from '../../Lru.js';
+import { LiteLru, S3Fifo, WTinyLfu, Slru, TwoQ } from '../../Lru.js';
 import { createLeakTracker } from '@zakkster/lite-leak';
 import { check, validate, censusOk, settleGc } from './harness.mjs';
 
@@ -134,6 +134,70 @@ export async function run() {
         check(wrefs.length > 0, () => 't7 wtinylfu: census sample was empty (nothing to prove)');
         check(censusOk(wrefs),
             () => 't7 wtinylfu: an evicted/cleared value is still live -- a retention leak');
+    }
+
+    // --- Slru soak (decisions/0015): build/clear cycles + conservation + census --
+    // Build each cycle PAST capacity (eviction + slot reuse across probation + protected,
+    // with 2-hit promotions), assert conservation mid-life, clear, assert size 0 + the
+    // free list restored + the tracker released, and prove the evicted/cleared VALUE
+    // objects are collectible. size()===0 and _freeListLength()===capacity each cycle.
+    {
+        const lrefs = [];
+        const ltracker = createLeakTracker({ name: 'slru-soak' });
+        for (let cyc = 0; cyc < 1024; cyc++) {
+            const cache = new Slru(CAP);
+            const h = ltracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
+            for (let i = 0; i < CAP * 3; i++) {
+                const val = { c: cyc, i };
+                cache.put(i, val);
+                if ((i & 1) === 0) { cache.get(i); cache.get(i); } // promote some to protected
+                if ((cyc & 63) === 0 && (i & 7) === 0) lrefs.push(new WeakRef(val));
+            }
+            check(cache.size === CAP, () => 't7 slru: not full mid-life (size ' + cache.size + ')');
+            validate(cache); // conservation mid-life (both segments)
+            cache.clear();
+            check(cache.size === 0, () => 't7 slru: size != 0 after clear (cycle ' + cyc + ')');
+            check(cache._freeListLength() === CAP, () => 't7 slru: free list != capacity after clear (cycle ' + cyc + ')');
+            validate(cache);
+            ltracker.untrack(h);
+        }
+        check(ltracker.size() === 0, () => 't7 slru: leak tracker size ' + ltracker.size() + ' != 0');
+        await settleGc(6);
+        check(lrefs.length > 0, () => 't7 slru: census sample was empty (nothing to prove)');
+        check(censusOk(lrefs), () => 't7 slru: an evicted/cleared value is still live -- a retention leak');
+    }
+
+    // --- TwoQ soak (decisions/0015): build/clear cycles + the GHOST-retains-no-values
+    // census. The A1out ghost fingerprints A1in-evicted keys; it must retain only KEYS
+    // (bounded to ghostCap), NEVER values. Push distinct int keys so every A1in eviction
+    // records a fresh ghost key, sample the evicted VALUE objects, and prove they are
+    // collectible after teardown even though their keys may still sit in the ghost.
+    {
+        const qrefs = [];
+        const qtracker = createLeakTracker({ name: 'twoq-soak' });
+        for (let cyc = 0; cyc < 1024; cyc++) {
+            const cache = new TwoQ(CAP, { keys: 'int' });
+            const h = qtracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
+            for (let i = 0; i < CAP * 3; i++) {
+                const val = { c: cyc, i };
+                cache.put(cyc * 100000 + i, val); // distinct int keys => real ghost churn
+                if ((cyc & 63) === 0 && (i & 7) === 0) qrefs.push(new WeakRef(val));
+            }
+            check(cache.size === CAP, () => 't7 twoq: not full mid-life (size ' + cache.size + ')');
+            check(cache._gLen <= cache._ghostCap, () => 't7 twoq: ghost exceeded bound (' + cache._gLen + ')');
+            validate(cache); // conservation mid-life (both queues + ghost bound)
+            cache.clear();
+            check(cache.size === 0, () => 't7 twoq: size != 0 after clear (cycle ' + cyc + ')');
+            check(cache._freeListLength() === CAP, () => 't7 twoq: free list != capacity after clear (cycle ' + cyc + ')');
+            check(cache._gLen === 0, () => 't7 twoq: ghost not empty after clear (cycle ' + cyc + ')');
+            validate(cache);
+            qtracker.untrack(h);
+        }
+        check(qtracker.size() === 0, () => 't7 twoq: leak tracker size ' + qtracker.size() + ' != 0');
+        await settleGc(6);
+        check(qrefs.length > 0, () => 't7 twoq: census sample was empty (nothing to prove)');
+        check(censusOk(qrefs),
+            () => 't7 twoq: an evicted value is still live -- the A1out ghost is retaining values (leak)');
     }
 
     // --- TTL soak (decisions/0017): expiry churn + conservation + purgeStale + census

@@ -29,7 +29,7 @@
  * @license MIT
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, VERSION } from '../Lru.js';
+import {LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, VERSION} from '../Lru.js';
 
 /* -------------------------------------------------------------------------- *
  * Seeded PRNG -- xorshift32, the same generator the torture harness uses, so a
@@ -41,9 +41,11 @@ import { LiteLru, Sieve, S3Fifo, WTinyLfu, VERSION } from '../Lru.js';
 export function makePrng(seed) {
     let x = (seed >>> 0) || 1;
     return function next() {
-        x ^= x << 13; x >>>= 0;
+        x ^= x << 13;
+        x >>>= 0;
         x ^= x >> 17;
-        x ^= x << 5; x >>>= 0;
+        x ^= x << 5;
+        x >>>= 0;
         return x >>> 0;
     };
 }
@@ -145,8 +147,8 @@ export function scanTrace(opts) {
  */
 export function beladyOpt(trace, capacity) {
     const n = trace.length;
-    if (n === 0) return { hits: 0, misses: 0, hitRate: 0 };
-    if (capacity <= 0) return { hits: 0, misses: n, hitRate: 0 };
+    if (n === 0) return {hits: 0, misses: 0, hitRate: 0};
+    if (capacity <= 0) return {hits: 0, misses: n, hitRate: 0};
 
     // 1. Next-use precomputation (one reverse pass). nextUse[i] = the next index
     //    at which trace[i] recurs, or n ("never again").
@@ -189,16 +191,18 @@ export function beladyOpt(trace, capacity) {
         const lastNu = heapNextUse[heapSize];
         if (heapSize > 0) {
             let idx = 0;
-            for (;;) {
+            for (; ;) {
                 const left = (idx << 1) + 1;
                 const right = left + 1;
                 let largest = idx;
                 let largestNu = lastNu;
                 if (left < heapSize && heapNextUse[left] > largestNu) {
-                    largest = left; largestNu = heapNextUse[left];
+                    largest = left;
+                    largestNu = heapNextUse[left];
                 }
                 if (right < heapSize && heapNextUse[right] > largestNu) {
-                    largest = right; largestNu = heapNextUse[right];
+                    largest = right;
+                    largestNu = heapNextUse[right];
                 }
                 if (largest === idx) break;
                 heapKeys[idx] = heapKeys[largest];
@@ -246,7 +250,7 @@ export function beladyOpt(trace, capacity) {
         if (heapSize >= maxHeapCap) rebuildHeap(resident);
     }
 
-    return { hits, misses, hitRate: hits / n };
+    return {hits, misses, hitRate: hits / n};
 }
 
 /* -------------------------------------------------------------------------- *
@@ -279,7 +283,7 @@ function instrument(cache, counter) {
  *  the average metadata stores a HIT incurs (LRU relinks; SIEVE sets one byte). */
 function measureRatio(CacheClass, trace, capacity) {
     const cache = new CacheClass(capacity);
-    const counter = { n: 0 };
+    const counter = {n: 0};
     instrument(cache, counter);
     let hits = 0, misses = 0, hitWrites = 0;
     for (let i = 0; i < trace.length; i++) {
@@ -321,10 +325,12 @@ function measureTiming(CacheClass, trace, capacity) {
 }
 
 const MEMBERS = [
-    { name: 'LiteLru', ctor: LiteLru },
-    { name: 'Sieve', ctor: Sieve },
-    { name: 'S3Fifo', ctor: S3Fifo },
-    { name: 'WTinyLfu', ctor: WTinyLfu },
+    {name: 'LiteLru', ctor: LiteLru},
+    {name: 'Sieve', ctor: Sieve},
+    {name: 'S3Fifo', ctor: S3Fifo},
+    {name: 'WTinyLfu', ctor: WTinyLfu},
+    {name: 'Slru', ctor: Slru},
+    {name: 'TwoQ', ctor: TwoQ},
 ];
 
 /* -------------------------------------------------------------------------- *
@@ -340,17 +346,17 @@ function defaultWorkloads(opts) {
         {
             name: 'zipf',
             capacity,
-            trace: zipfTrace({ length, keyspace: capacity * 16, exponent: 1.0, seed: seed ^ 0x11 }),
+            trace: zipfTrace({length, keyspace: capacity * 16, exponent: 1.0, seed: seed ^ 0x11}),
         },
         {
             name: 'loop',
             capacity,
-            trace: loopTrace({ length, span: capacity * 4 }),
+            trace: loopTrace({length, span: capacity * 4}),
         },
         {
             name: 'scan',
             capacity,
-            trace: scanTrace({ length, hotSize: (capacity >> 1) || 1, hotFraction: 0.5, seed: seed ^ 0x22 }),
+            trace: scanTrace({length, hotSize: (capacity >> 1) || 1, hotFraction: 0.5, seed: seed ^ 0x22}),
         },
     ];
 }
@@ -368,7 +374,7 @@ export function runBench(opts) {
     const capacity = o.capacity === undefined ? 256 : o.capacity;
     const length = o.length === undefined ? 200000 : o.length;
     const seed = o.seed === undefined ? 0x9e3779b9 : (o.seed >>> 0) || 1;
-    const workloads = o.workloads || defaultWorkloads({ capacity, length, seed });
+    const workloads = o.workloads || defaultWorkloads({capacity, length, seed});
 
     const results = [];
     for (let w = 0; w < workloads.length; w++) {
@@ -394,7 +400,7 @@ export function runBench(opts) {
             name: wl.name,
             capacity: cap,
             ops: wl.trace.length,
-            opt: { hits: opt.hits, hitRatio: opt.hitRate },
+            opt: {hits: opt.hits, hitRatio: opt.hitRate},
             members,
         });
     }
@@ -403,7 +409,7 @@ export function runBench(opts) {
         version: VERSION,
         node: process.version,
         arch: process.arch,
-        config: { capacity, length, seed },
+        config: {capacity, length, seed},
         workloads: results,
     };
 }
@@ -452,7 +458,8 @@ function printBench(out) {
 
 // Run the printer only when invoked directly (node benchmark/Bench.mjs / npm run bench),
 // not when imported. Kept dependency-free: node:url is a builtin.
-import { pathToFileURL } from 'node:url';
+import {pathToFileURL} from 'node:url';
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
     printBench(runBench());
 }

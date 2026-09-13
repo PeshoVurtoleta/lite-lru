@@ -17,7 +17,9 @@ import {
     runDifferential, lruPolicy, lruIntPolicy, fifoPolicy,
     sievePolicy, sieveIntPolicy, s3fifoPolicy, s3fifoIntPolicy,
     wtinylfuPolicy, wtinylfuIntPolicy,
+    slruPolicy, slruIntPolicy, twoqPolicy, twoqIntPolicy,
     lruTtlPolicy, sieveTtlPolicy, s3fifoTtlPolicy, wtinylfuTtlPolicy,
+    slruTtlPolicy, twoqTtlPolicy,
     SEED, die,
 } from './harness.mjs';
 
@@ -88,6 +90,32 @@ export function run() {
     fuzzPolicy(wtinylfuPolicy, wConfigs);
     fuzzPolicy(wtinylfuIntPolicy, wConfigs);
 
+    // The Slru MEMBER proof (decisions/0015): the Segmented-LRU member on BOTH backings
+    // against its own independent probation/protected oracle -- same value AND same next
+    // victim AND same size after every op. Caps 1..9 stress the 80/20 rounding + the
+    // protectedCap==capacity degenerate edge (cap 1/2); 64 is a normal split
+    // (protectedCap 51 / probation 13) where the promote-on-2nd-hit + demote both fire.
+    const slruConfigs = [];
+    for (let cap = 1; cap <= 9; cap++) {
+        slruConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0xb0 + cap });
+    }
+    slruConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0xbf });
+    fuzzPolicy(slruPolicy, slruConfigs);
+    fuzzPolicy(slruIntPolicy, slruConfigs);
+
+    // The TwoQ MEMBER proof (decisions/0015): the full-2Q member on BOTH backings against
+    // its own independent A1in/Am/A1out-ghost oracle -- same value AND same next victim
+    // AND same size after every op. The int backing also exercises the strict-zero A1out
+    // ghost ring + membership table. Caps 1..9 stress the 25% rounding + the ghostCap==0
+    // (cap 1) degenerate edge; 64 is a normal split (a1inCap 16 / amCap 48 / ghost 48).
+    const twoqConfigs = [];
+    for (let cap = 1; cap <= 9; cap++) {
+        twoqConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0xc0 + cap });
+    }
+    twoqConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0xcf });
+    fuzzPolicy(twoqPolicy, twoqConfigs);
+    fuzzPolicy(twoqIntPolicy, twoqConfigs);
+
     // The SEAM proof: the SAME runner drives a second policy unchanged.
     fuzzPolicy(fifoPolicy, [
         { cap: 1, keyspace: 4, ops: OPS, salt: 0x61 },
@@ -109,4 +137,6 @@ export function run() {
     fuzzPolicy(sieveTtlPolicy, ttlConfigs);
     fuzzPolicy(s3fifoTtlPolicy, ttlConfigs);
     fuzzPolicy(wtinylfuTtlPolicy, ttlConfigs);
+    fuzzPolicy(slruTtlPolicy, ttlConfigs);
+    fuzzPolicy(twoqTtlPolicy, ttlConfigs);
 }

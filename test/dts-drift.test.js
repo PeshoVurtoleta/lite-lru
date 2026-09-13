@@ -111,6 +111,16 @@ function wtinylfuImplementsLiteCache(dtsText) {
   return /class WTinyLfu<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
 }
 
+/** True if the d.ts declares `class Slru<...> implements LiteCache<...>`. */
+function slruImplementsLiteCache(dtsText) {
+  return /class Slru<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
+}
+
+/** True if the d.ts declares `class TwoQ<...> implements LiteCache<...>`. */
+function twoqImplementsLiteCache(dtsText) {
+  return /class TwoQ<[^>]*>\s+implements LiteCache<[^>]*>/.test(dtsText);
+}
+
 /** True if BOTH sources declare a `Sieve` class (the second named export). */
 function jsDeclaresSieve(jsText) {
   return /export class Sieve\b/.test(jsText);
@@ -133,6 +143,22 @@ function jsDeclaresWTinyLfu(jsText) {
 }
 function dtsDeclaresWTinyLfu(dtsText) {
   return /export class WTinyLfu\b/.test(dtsText);
+}
+
+/** True if BOTH sources declare an `Slru` class (the fifth named export). */
+function jsDeclaresSlru(jsText) {
+  return /export class Slru\b/.test(jsText);
+}
+function dtsDeclaresSlru(dtsText) {
+  return /export class Slru\b/.test(dtsText);
+}
+
+/** True if BOTH sources declare a `TwoQ` class (the sixth named export). */
+function jsDeclaresTwoQ(jsText) {
+  return /export class TwoQ\b/.test(jsText);
+}
+function dtsDeclaresTwoQ(dtsText) {
+  return /export class TwoQ\b/.test(dtsText);
 }
 
 /** Symmetric-difference report between two sets: [] when equal. */
@@ -222,6 +248,38 @@ test('(f) WTinyLfu surface: WTinyLfu is a named export in BOTH sources, members 
   assert.ok(wtinylfuImplementsLiteCache(DTS), 'class WTinyLfu must `implements LiteCache<...>`');
 });
 
+test('(g) Slru surface: Slru is a named export in BOTH sources, members agree, implements LiteCache', () => {
+  assert.ok(jsDeclaresSlru(JS), 'Lru.js must `export class Slru` (the fifth named export)');
+  assert.ok(dtsDeclaresSlru(DTS), 'Lru.d.ts must `export class Slru`');
+  const js = classMembers(JS, 'Slru');
+  const dts = classMembers(DTS, 'Slru');
+  const diffs = setDiff(js, dts, 'Lru.js', 'Lru.d.ts');
+  assert.deepEqual(diffs, [], diffs.join('; '));
+  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'purgeStale', 'stats', 'resetStats', 'keys', 'values', 'entries', 'size', 'capacity']) {
+    assert.ok(js.has(nm), 'Lru.js class Slru is missing public member ' + nm);
+    assert.ok(dts.has(nm), 'Lru.d.ts class Slru is missing member ' + nm);
+  }
+  assert.equal(js.size, 14, 'expected exactly 14 public members in Slru (Lru.js), saw ' + js.size);
+  assert.equal(dts.size, 14, 'expected exactly 14 members in Slru (Lru.d.ts), saw ' + dts.size);
+  assert.ok(slruImplementsLiteCache(DTS), 'class Slru must `implements LiteCache<...>`');
+});
+
+test('(h) TwoQ surface: TwoQ is a named export in BOTH sources, members agree, implements LiteCache', () => {
+  assert.ok(jsDeclaresTwoQ(JS), 'Lru.js must `export class TwoQ` (the sixth named export)');
+  assert.ok(dtsDeclaresTwoQ(DTS), 'Lru.d.ts must `export class TwoQ`');
+  const js = classMembers(JS, 'TwoQ');
+  const dts = classMembers(DTS, 'TwoQ');
+  const diffs = setDiff(js, dts, 'Lru.js', 'Lru.d.ts');
+  assert.deepEqual(diffs, [], diffs.join('; '));
+  for (const nm of ['get', 'put', 'has', 'peek', 'delete', 'clear', 'purgeStale', 'stats', 'resetStats', 'keys', 'values', 'entries', 'size', 'capacity']) {
+    assert.ok(js.has(nm), 'Lru.js class TwoQ is missing public member ' + nm);
+    assert.ok(dts.has(nm), 'Lru.d.ts class TwoQ is missing member ' + nm);
+  }
+  assert.equal(js.size, 14, 'expected exactly 14 public members in TwoQ (Lru.js), saw ' + js.size);
+  assert.equal(dts.size, 14, 'expected exactly 14 members in TwoQ (Lru.d.ts), saw ' + dts.size);
+  assert.ok(twoqImplementsLiteCache(DTS), 'class TwoQ must `implements LiteCache<...>`');
+});
+
 // --- teeth: each check must reject a mutated COPY (non-vacuity) --------------
 
 test('control: unmutated text reports zero diffs / all-present (vacuity)', () => {
@@ -231,11 +289,15 @@ test('control: unmutated text reports zero diffs / all-present (vacuity)', () =>
   assert.deepEqual(setDiff(classMembers(JS, 'Sieve'), classMembers(DTS, 'Sieve'), 'a', 'b'), []);
   assert.deepEqual(setDiff(classMembers(JS, 'S3Fifo'), classMembers(DTS, 'S3Fifo'), 'a', 'b'), []);
   assert.deepEqual(setDiff(classMembers(JS, 'WTinyLfu'), classMembers(DTS, 'WTinyLfu'), 'a', 'b'), []);
+  assert.deepEqual(setDiff(classMembers(JS, 'Slru'), classMembers(DTS, 'Slru'), 'a', 'b'), []);
+  assert.deepEqual(setDiff(classMembers(JS, 'TwoQ'), classMembers(DTS, 'TwoQ'), 'a', 'b'), []);
   assert.ok(hasLiteCacheInterface(DTS));
   assert.ok(liteLruImplementsLiteCache(DTS));
   assert.ok(sieveImplementsLiteCache(DTS));
   assert.ok(s3fifoImplementsLiteCache(DTS));
   assert.ok(wtinylfuImplementsLiteCache(DTS));
+  assert.ok(slruImplementsLiteCache(DTS));
+  assert.ok(twoqImplementsLiteCache(DTS));
 });
 
 test('control: desyncing the package.json version makes version parity fail', () => {
@@ -277,4 +339,14 @@ test('control: dropping a method from the d.ts Sieve class makes Sieve member pa
   const mutated = DTS.replace(/\n\s*clear\(\): void;/g, '');
   const diffs = setDiff(classMembers(JS, 'Sieve'), classMembers(mutated, 'Sieve'), 'Lru.js', 'Lru.d.ts');
   assert.ok(diffs.length > 0, 'dropping clear() from the d.ts Sieve class did not fail member parity');
+});
+
+test('control: breaking Slru implements clause fails the Slru surface check', () => {
+  const mutated = DTS.replace(/class Slru<[^>]*>\s+implements LiteCache<[^>]*>/, 'class Slru<K = unknown, V = unknown>');
+  assert.ok(!slruImplementsLiteCache(mutated), 'de-implementing LiteCache on Slru did not fail the surface check');
+});
+
+test('control: breaking TwoQ implements clause fails the TwoQ surface check', () => {
+  const mutated = DTS.replace(/class TwoQ<[^>]*>\s+implements LiteCache<[^>]*>/, 'class TwoQ<K = unknown, V = unknown>');
+  assert.ok(!twoqImplementsLiteCache(mutated), 'de-implementing LiteCache on TwoQ did not fail the surface check');
 });

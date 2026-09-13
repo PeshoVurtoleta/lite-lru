@@ -9,8 +9,8 @@
  *   E single-capacity cache: every put evicts; head===tail always.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ } from './harness.mjs';
 
 export function run() {
     // --- A: re-hit the MRU N times (the head-re-hit fast path) -------------------
@@ -227,12 +227,93 @@ export function run() {
         void wrapWTinyLfu(c);
     }
 
+    // --- K: Slru degenerate caps + a cap-sized scan evicts 0 protected (decisions/0015)
+    {
+        const SLRU_PROTECTED = 1;
+        for (const cap of [1, 2, 3]) {
+            const c = new Slru(cap);
+            for (let i = 0; i < 500; i++) {
+                c.put(i, i);
+                check(c.size === Math.min(cap, i + 1), () => 't2 K: slru cap-' + cap + ' size drift at ' + i);
+                check(c.get(i) === i, () => 't2 K: slru cap-' + cap + ' just-inserted key missing');
+                validate(c);
+            }
+            c.clear();
+            check(c.size === 0, () => 't2 K: slru cap-' + cap + ' not empty after clear');
+            validate(c);
+        }
+        // A proven-hot SET in protected survives an unbounded distinct one-hit flood.
+        const N = 64; const HOT = 8;
+        const c = new Slru(N);
+        for (let h = 0; h < HOT; h++) { const k = 'hot' + h; c.put(k, h); c.get(k); c.get(k); } // -> protected
+        while (c.size < N) c.put('warm' + c.size, c.size);
+        check(c.size === N, () => 't2 K: slru not full before the scan');
+        for (let i = 0; i < 8000; i++) {
+            for (let h = 0; h < HOT; h++) check(c.get('hot' + h) === h, () => 't2 K: hot key ' + h + ' lost mid-scan at ' + i);
+            c.put('scan' + i, i);
+            check(c.size === N, () => 't2 K: slru drifted from capacity during the scan');
+            if ((i & 511) === 0) validate(c);
+        }
+        for (let h = 0; h < HOT; h++) {
+            check(c.has('hot' + h), () => 't2 K: protected hot key ' + h + ' evicted by the scan (no scan resistance)');
+            check(c._seg[c._store.get('hot' + h)] === SLRU_PROTECTED, () => 't2 K: hot key ' + h + ' left protected');
+        }
+        let survivors = 0;
+        for (let i = 0; i < 8000; i++) if (c.has('scan' + i)) survivors++;
+        check(survivors < N, () => 't2 K: too many scan keys survived (' + survivors + ') -- eviction not exercised');
+        validate(c);
+        void wrapSlru(c);
+    }
+
+    // --- L: TwoQ degenerate caps + a cap-sized scan evicts 0 Am (decisions/0015) -
+    {
+        const TWOQ_AM = 1;
+        for (const cap of [1, 2, 3]) {
+            const c = new TwoQ(cap);
+            for (let i = 0; i < 500; i++) {
+                c.put(i, i);
+                check(c.size === Math.min(cap, i + 1), () => 't2 L: twoq cap-' + cap + ' size drift at ' + i);
+                check(c.get(i) === i, () => 't2 L: twoq cap-' + cap + ' just-inserted key missing');
+                check(c._gLen <= c._ghostCap, () => 't2 L: twoq cap-' + cap + ' ghost exceeded bound');
+                validate(c);
+            }
+            c.clear();
+            check(c.size === 0, () => 't2 L: twoq cap-' + cap + ' not empty after clear');
+            check(c._gLen === 0, () => 't2 L: twoq cap-' + cap + ' ghost not empty after clear');
+            validate(c);
+        }
+        // A proven-hot SET in Am (via the ghost path) survives a distinct one-hit flood.
+        const N = 64; const HOT = 8;
+        const c = new TwoQ(N);
+        const hot = [];
+        for (let h = 0; h < HOT; h++) hot.push('hot' + h);
+        for (const k of hot) c.put(k, 0);                  // A1in
+        for (let i = 0; i < N; i++) c.put('flush' + i, i); // flush hot out of A1in -> ghost
+        for (let h = 0; h < HOT; h++) c.put(hot[h], h);    // second sighting -> Am
+        for (const k of hot) check(c._seg[c._store.get(k)] === TWOQ_AM, () => 't2 L: hot key ' + k + ' not in Am');
+        while (c.size < N) c.put('warm' + c.size, c.size);
+        check(c.size === N, () => 't2 L: twoq not full before the scan');
+        for (let i = 0; i < 8000; i++) {
+            for (let h = 0; h < HOT; h++) check(c.get('hot' + h) === h, () => 't2 L: hot key ' + h + ' lost mid-scan at ' + i);
+            c.put('scan' + i, i);
+            check(c.size === N, () => 't2 L: twoq drifted from capacity during the scan');
+            check(c._gLen <= c._ghostCap, () => 't2 L: twoq ghost exceeded bound during the scan');
+            if ((i & 511) === 0) validate(c);
+        }
+        for (let h = 0; h < HOT; h++) check(c.has('hot' + h), () => 't2 L: Am hot key ' + h + ' evicted by the scan (no scan resistance)');
+        let survivors = 0;
+        for (let i = 0; i < 8000; i++) if (c.has('scan' + i)) survivors++;
+        check(survivors < N, () => 't2 L: too many scan keys survived (' + survivors + ') -- eviction not exercised');
+        validate(c);
+        void wrapTwoQ(c);
+    }
+
     // --- J: the LAZY-SEMANTICS TRIPLE as executable laws (decisions/0017, D17.3) --
     // For EVERY member: an expired entry is a MISS through get/has/peek alike, and each
     // of the three REAPS it in place (fires onEvict once, size drops). A fresh Infinity
     // sibling is untouched by any of them. validate() nets each reap.
     {
-        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu]];
+        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ]];
         // one probe method per fresh cache (each reap is destructive, so isolate them)
         const probes = [
             ['get', (c, k) => c.get(k), undefined],

@@ -7,6 +7,8 @@
 ![Zero-GC](https://img.shields.io/badge/Zero--GC-Engine-00C853?style=for-the-badge&logo=leaf&logoColor=white)
 [![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-lru?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-lru)
 [![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-lru?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-lru)
+[![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-lru?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-lru)
+![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Types-informational)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
@@ -20,13 +22,15 @@ npm install @zakkster/lite-lru
 ```
 
 ```js
-import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '@zakkster/lite-lru';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '@zakkster/lite-lru';
 
 // Same surface, different eviction policy. Swap the constructor, nothing else.
 const cache = new LiteLru(3);            // classic recency (the reference member)
 // const cache = new Sieve(3);           // <- modern lazy-promotion FIFO (the headline)
 // const cache = new S3Fifo(3);          // <- admission-controlled FIFO + ghost queue
 // const cache = new WTinyLfu(3);        // <- frequency admission (window + SLRU + Count-Min)
+// const cache = new Slru(3);            // <- Segmented LRU (probation FIFO + protected LRU)
+// const cache = new TwoQ(3);            // <- 2Q (A1in FIFO + Am LRU + A1out ghost)
 
 cache.put('a', 1);
 cache.put('b', 2);
@@ -91,7 +95,9 @@ The honest competitive read: `lru-cache` is already typed-array-backed and featu
 - **`Sieve`** -- the modern headline (Zhang et al., NSDI'24, "SIEVE is simpler than LRU"): a lazy-promotion FIFO ring with one visited bit per entry and a single moving hand. A hit sets the bit and does **nothing structural** -- zero relinks -- where classic LRU rewrites a small constant number of links. At capacity the hand sweeps FIFO order, grants each visited entry one second chance, and evicts the first unvisited entry in place.
 - **`S3Fifo`** -- the admission-controlled member (Yang et al., SOSP'23, "FIFO queues are all you need for cache eviction"): quick-demotion + lazy-promotion over a small probation FIFO, a main FIFO, and a bounded keys-only ghost queue. A hit sets a visited bit and does **nothing structural** (zero relinks). Newcomers enter the small queue; a proven entry graduates to main, an unproven one is evicted with its key remembered in the ghost, and a key seen again while in the ghost is admitted straight to main. Scan-resistant, and often closer to Belady OPT than LRU on skewed/web traffic.
 - **`WTinyLfu`** -- the frequency-admission member (Einziger et al., "TinyLFU"; the Caffeine approach): a small admission WINDOW (an LRU, ~1% of capacity) in front of a segmented main cache (SLRU: a probation segment + a protected segment), gated by a fixed 4-row 4-bit Count-Min frequency sketch. `get`/`put` bump the sketch and promote within the segment (a probation hit is promoted to protected). At capacity the window's victim is admitted into the main cache only if the sketch estimates it MORE frequent than the main cache's victim; ties reject (favor the incumbent). A one-hit-wonder never out-frequencies the proven-hot set -- scan- AND frequency-resistant, the best fit for skewed (Zipf) traffic. A hit does slightly MORE work than SIEVE/S3-FIFO (a segment relink + a sketch bump) -- still zero allocation.
-- **One `LiteCache<K,V>` surface** -- all four members expose exactly `get` / `put` / `has` / `peek` / `delete` / `clear`, plus `size` and `capacity`. The recency/lazy-promotion/admission difference is INTERNAL. Types ship in [`Lru.d.ts`](./Lru.d.ts); the interface is the type-checked contract that makes the one-line swap safe.
+- **`Slru`** -- the simplest scan-resistant baseline (Segmented LRU): a probation FIFO (~20%) in front of a protected LRU (~80%). A newcomer enters probation; the **promote-on-2nd-hit** rule holds -- `get(X)` once leaves X in probation, `get(X)` twice promotes X to protected (a promotion that overflows protected demotes its LRU tail back to probation). A protected hit moves to protected MRU. Eviction ALWAYS prefers the probation tail, so a cap-sized distinct-key scan evicts **zero** protected entries. The textbook "here is what SIEVE/S3-FIFO/W-TinyLFU buy over the obvious one."
+- **`TwoQ`** -- the full 2Q (Johnson & Shasha, VLDB'94): an A1in FIFO (~25%) + an Am LRU + a fixed, keys-only A1out ghost of keys evicted from A1in. A newcomer enters A1in unless the key is in the ghost (a second sighting) -- then it goes straight to Am and is consumed from the ghost (the only path into Am). An A1in hit does **nothing** (pure FIFO probation); an Am hit moves to Am MRU. At capacity the reclaim step evicts the A1in tail (recording its key in the ghost) when A1in is over its target, else the Am LRU (not ghosted). A one-hit-wonder flood churns A1in only, never displacing Am.
+- **One `LiteCache<K,V>` surface** -- all six members expose exactly `get` / `put` / `has` / `peek` / `delete` / `clear`, plus `size` and `capacity`. The recency/lazy-promotion/admission difference is INTERNAL. Types ship in [`Lru.d.ts`](./Lru.d.ts); the interface is the type-checked contract that makes the one-line swap safe.
 - **`Bench.mjs`** -- a runnable ESM tool AND an importable module: `runBench(opts)` and `beladyOpt(trace, capacity)`. Feed it a trace, get per-policy hit ratio, writes-per-hit, machine-local ns/op, and percentage of Belady OPT.
 - **A `keys: 'int'` backing** -- opt in and the keyed index becomes an open-addressed typed-array table for STRICT zero allocation (even the index never allocates), with a fail-closed door for 32-bit signed integer keys.
 - **A zero-GC `onEvict` hook** -- fired once per eviction with the evicted `(key, value)`, e.g. to return the value to a pool.
@@ -133,13 +139,15 @@ Pick with the [bench tool](#measure--trust), not by intuition -- the whole point
 
 ### The members
 
-All three classes implement `LiteCache<K,V>`. Every method is O(1) (amortized on the default `Map` backing; see [construction options](#construction-options)).
+All six classes implement `LiteCache<K,V>`. Every method is O(1) (amortized on the default `Map` backing; see [construction options](#construction-options)).
 
 ```ts
 new LiteLru<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
 new Sieve<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
 new S3Fifo<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
 new WTinyLfu<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
+new Slru<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
+new TwoQ<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
 
 cache.get(key: K): V | undefined            // returns the value AND applies the member's hit policy
 cache.put(key: K, value: V, ttlMs?): void   // insert/update (+ optional per-entry TTL); evicts the victim at capacity
@@ -178,7 +186,7 @@ interface LiteCacheOptions<K, V> {
 
 ### TTL -- opt-in, lazy expiry
 
-TTL is **opt-in, lazy, and pay-for-what-you-use**. A cache that never asks for it is byte-identical to the pre-TTL build -- no extra column, no per-op check that costs anything. When you do opt in, expiry is **lazy**: an entry expires the next time a `get`/`has`/`peek` touches it (a stale touch is a MISS and reaps the entry in place, firing `onEvict`). **No timers. No async. No background sweep.** All four members support it identically (decisions/0017).
+TTL is **opt-in, lazy, and pay-for-what-you-use**. A cache that never asks for it is byte-identical to the pre-TTL build -- no extra column, no per-op check that costs anything. When you do opt in, expiry is **lazy**: an entry expires the next time a `get`/`has`/`peek` touches it (a stale touch is a MISS and reaps the entry in place, firing `onEvict`). **No timers. No async. No background sweep.** All six members support it identically (decisions/0017).
 
 ```ts
 import { LiteLru } from '@zakkster/lite-lru';
@@ -210,7 +218,7 @@ for (const k of cache.keys()) { /* ... */ }
 for (const v of cache.values()) { /* ... */ }
 ```
 
-**Our iterators allocate nothing per step; `lru-cache`'s allocate.** There is no generator anywhere (a generator allocates an `IteratorResult` object per `yield`). Instead a single hand-written iterator reuses one `{ value, done }` result, mutated in place, across every `next()`. The gate proves it: `>= 10,000` `next()` steps at capacity measure **0 B/op per step** on all four members. (Not "lock-free" -- just zero per-step allocation.)
+**Our iterators allocate nothing per step; `lru-cache`'s allocate.** There is no generator anywhere (a generator allocates an `IteratorResult` object per `yield`). Instead a single hand-written iterator reuses one `{ value, done }` result, mutated in place, across every `next()`. The gate proves it: `>= 10,000` `next()` steps at capacity measure **0 B/op per step** on all six members. (Not "lock-free" -- just zero per-step allocation.)
 
 **Per-member iteration order** (only `LiteLru` is true recency):
 
@@ -220,6 +228,8 @@ for (const v of cache.values()) { /* ... */ }
 | `Sieve` | newest -> oldest | FIFO insertion order, NOT recency |
 | `S3Fifo` | MAIN newest->oldest, THEN SMALL newest->oldest | two FIFO rings; the keys-only ghost is excluded |
 | `WTinyLfu` | WINDOW, THEN PROTECTED, THEN PROBATION (each MRU->LRU) | three segments concatenated, not one global order |
+| `Slru` | PROTECTED, THEN PROBATION (each MRU->LRU) | two segments concatenated, not one global order |
+| `TwoQ` | Am, THEN A1in (each MRU->LRU) | two queues concatenated; the keys-only A1out ghost is excluded |
 
 - **Borrowed-tuple caveat (`entries()` / `[Symbol.iterator]`).** The yielded `[key, value]` tuple is **borrowed and reused** across steps -- read it (or copy it) before the next step. **Only a copying map materializes:** `Array.from(cache.entries(), ([k, v]) => [k, v])` or a manual per-step `[k, v]` copy. A plain `[...cache.entries()]` / `Array.from(cache)` with **no map function** collects N references to the *same* reused tuple, which the completed walk then nulls -- so every element reads `[undefined, undefined]`, not the data. A bare spread of `entries()` is a bug; copy the pair. `keys()` and `values()` yield the scalar directly, so `[...cache.keys()]` and `[...cache.values()]` **do** materialize correctly (no aliasing hazard).
 - **Recency-neutral.** A walk is a read, like `peek`: it applies no promotion / visited bump / sketch bump / segment relink, so iterating does not change the next eviction victim.
@@ -245,7 +255,7 @@ interface CacheStats { hits: number; misses: number; evictions: number; puts: nu
 - **`hits`** -- a `get(key)` that found a live resident entry. **`misses`** -- a `get(key)` that did not (absent, or stale under TTL). **`evictions`** -- an entry removed by the policy: a capacity eviction on `put`, or a stale reap. **`puts`** -- every `put(...)` call (insert or update).
 - **Exact integers to 2^53.** Plain JS number fields (not an `Int32Array` that would wrap at 2^31). For any realistic cache they never overflow.
 - **`has`/`peek` are hit/miss-neutral.** They are inspections, not accesses -- they never register a hit or a miss. (A stale `has`/`peek` under TTL still reaps the expired entry, which is a genuine eviction and is counted as one.)
-- **A stale-TTL `get` is a MISS and an EVICTION.** It counts one miss and reaps the expired entry in place (one eviction) -- consistent across all four members.
+- **A stale-TTL `get` is a MISS and an EVICTION.** It counts one miss and reaps the expired entry in place (one eviction) -- consistent across all six members.
 - **The holder is borrowed (copy what you keep).** `stats()` returns the live per-instance holder **by reference**, not a snapshot -- its counters keep advancing and `resetStats()` zeroes that same object in place (a previously borrowed reference stays valid and reads back zeros). For a point-in-time snapshot, copy it: `const snap = { ...cache.stats() }`.
 - **Fail closed.** `stats()` / `resetStats()` on a cache built without `{ stats: true }` throw a `[lite-lru]`-tagged `Error` (there is no holder -- a caller bug, not a silent return of zeros). `null` is not zero.
 - **`writesPerHit` is not here.** It is a member-specific, out-of-band **measured** number (see below), not a runtime counter -- turning it into one would require a store on every hit, exactly the hot-path write the zero-GC law forbids.
@@ -276,9 +286,9 @@ Run directly, it prints a table; imported, it returns structured results and pri
 
 | Constant  | Value     | Meaning                                                       |
 | --------- | --------- | ------------------------------------------------------------ |
-| `VERSION` | `'1.5.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
+| `VERSION` | `'1.6.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
 
-All four members and `VERSION` are named exports; `LiteLru` is also the default export.
+All six members and `VERSION` are named exports; `LiteLru` is also the default export.
 
 ---
 
@@ -410,7 +420,7 @@ Hit % and % of OPT are deterministic (seeded trace, deterministic policies); `ns
 **143 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
 
 ```bash
-npm test               # 612 node:test cases (all members, laws, TTL, iteration, stats, boundary, dts drift)
+npm test               # 888 node:test cases (all members, laws, TTL, iteration, stats, boundary, dts drift)
 npm run test:types     # tsc: the LiteCache<K,V> surface + one-line-swap type-check
 npm run torture        # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + gated numbers
 npm run torture:controls  # the deliberately-broken variants -- every gate must fail

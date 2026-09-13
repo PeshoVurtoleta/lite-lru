@@ -401,6 +401,112 @@ export class WTinyLfu<K = unknown, V = unknown> implements LiteCache<K, V> {
   get capacity(): number;
 }
 
+/**
+ * A fixed-capacity Segmented-LRU cache with O(1) get/put/has/peek/delete over a
+ * probation FIFO (~20%) in front of a protected LRU (~80%), decisions/0015. The
+ * simplest scan-resistant baseline member of the family and an implementation of
+ * `LiteCache`.
+ *
+ * Newcomers enter probation. A probation entry is PROMOTED to protected on its SECOND
+ * hit (`get` once leaves it in probation; `get` twice promotes it -- `put(update)`
+ * counts as a hit); a promotion that overflows protected demotes protected's LRU tail
+ * back to probation. A protected hit moves to protected MRU. At capacity a new key
+ * evicts the probation tail (or the protected tail only when probation is empty), so a
+ * distinct one-hit-wonder scan never displaces a protected entry. `has`/`peek` are
+ * promotion-neutral. Same `LiteCache` surface as `LiteLru`, so `new LiteLru(n)` swaps
+ * for `new Slru(n)` and stays type-checked -- the policy difference is INTERNAL.
+ *
+ * See `LiteCache` for the D7 undefined-value contract and `LiteCacheOptions.onEvict`
+ * for the reentrancy contract -- both hold here. The optional `keys: 'int'` backing
+ * (decisions/0011) applies identically: 32-bit signed integer keys, strict zero-GC.
+ *
+ * @typeParam K key type (any value; SameValueZero equality via the internal Map)
+ * @typeParam V value type
+ */
+export class Slru<K = unknown, V = unknown> implements LiteCache<K, V> {
+  /**
+   * @param capacity max entries; must be an integer >= 1 (else throws RangeError,
+   *                 fail-closed -- null is not zero).
+   * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
+   */
+  constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  get(key: K): V | undefined;
+  put(key: K, value: V, ttlMs?: number): void;
+  has(key: K): boolean;
+  peek(key: K): V | undefined;
+  delete(key: K): boolean;
+  clear(): void;
+  purgeStale(): number;
+  /** Live runtime counters (decisions/0019). BORROWED holder -- copy what you keep;
+   *  throws on an instance built without { stats: true } (fail-closed). */
+  stats(): CacheStats;
+  /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
+  resetStats(): void;
+  keys(): IterableIterator<K>;
+  values(): IterableIterator<V>;
+  entries(): IterableIterator<[K, V]>;
+  /** Iterable protocol == entries(); the yielded [K, V] tuple is BORROWED/reused
+   *  (decisions/0018) -- copy what you keep. Only a copying map materializes
+   *  (Array.from(c.entries(), ([k,v])=>[k,v])); a bare spread reads all-undefined. */
+  [Symbol.iterator](): IterableIterator<[K, V]>;
+  get size(): number;
+  get capacity(): number;
+}
+
+/**
+ * A fixed-capacity 2Q cache (Johnson & Shasha, VLDB'94) with O(1) amortized
+ * get/put/has/peek/delete over an A1in FIFO (~25%) + an Am LRU + a fixed A1out ghost
+ * of keys evicted from A1in (decisions/0015). A scan-resistant baseline member of the
+ * family and an implementation of `LiteCache`.
+ *
+ * Newcomers enter A1in UNLESS the key is in the A1out ghost (a second sighting of a
+ * recently-A1in-evicted key) -> straight to Am, consumed from the ghost (the ONLY path
+ * into Am). An A1in hit does NOTHING (pure FIFO probation -- no promotion); an Am hit
+ * moves to Am MRU. At capacity one reclaim step evicts the A1in tail (recording its key
+ * in the ghost) when A1in is over its target or Am is empty, else the Am LRU (not
+ * ghosted). A distinct one-hit-wonder flood churns A1in only, never displacing Am.
+ * `has`/`peek` are neutral; the ghost holds KEYS only, never values, and is bounded at
+ * construction. Same `LiteCache` surface as `LiteLru`, so `new LiteLru(n)` swaps for
+ * `new TwoQ(n)` and stays type-checked -- the policy difference is INTERNAL.
+ *
+ * See `LiteCache` for the D7 undefined-value contract and `LiteCacheOptions.onEvict`
+ * for the reentrancy contract -- both hold here. The optional `keys: 'int'` backing
+ * (decisions/0011) applies identically: 32-bit signed integer keys, strict zero-GC
+ * (including the int A1out ghost ring + membership table).
+ *
+ * @typeParam K key type (any value; SameValueZero equality via the internal Map)
+ * @typeParam V value type
+ */
+export class TwoQ<K = unknown, V = unknown> implements LiteCache<K, V> {
+  /**
+   * @param capacity max entries; must be an integer >= 1 (else throws RangeError,
+   *                 fail-closed -- null is not zero).
+   * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
+   */
+  constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  get(key: K): V | undefined;
+  put(key: K, value: V, ttlMs?: number): void;
+  has(key: K): boolean;
+  peek(key: K): V | undefined;
+  delete(key: K): boolean;
+  clear(): void;
+  purgeStale(): number;
+  /** Live runtime counters (decisions/0019). BORROWED holder -- copy what you keep;
+   *  throws on an instance built without { stats: true } (fail-closed). */
+  stats(): CacheStats;
+  /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
+  resetStats(): void;
+  keys(): IterableIterator<K>;
+  values(): IterableIterator<V>;
+  entries(): IterableIterator<[K, V]>;
+  /** Iterable protocol == entries(); the yielded [K, V] tuple is BORROWED/reused
+   *  (decisions/0018) -- copy what you keep. Only a copying map materializes
+   *  (Array.from(c.entries(), ([k,v])=>[k,v])); a bare spread reads all-undefined. */
+  [Symbol.iterator](): IterableIterator<[K, V]>;
+  get size(): number;
+  get capacity(): number;
+}
+
 /** The package version (kept in lock-step with package.json + Lru.js). */
 export const VERSION: string;
 

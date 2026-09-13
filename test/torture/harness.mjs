@@ -25,12 +25,14 @@
  */
 
 import { measureOps, checkNoGc, measureAllocs, checkAllocs } from '@zakkster/lite-gc-profiler';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../../Lru.js';
 import { makeLruOracle, svz } from './oracles/lru.mjs';
 import { makeFifoOracle, makeFifoReal } from './oracles/fifo.mjs';
 import { makeSieveOracle } from './oracles/sieve.mjs';
 import { makeS3FifoOracle } from './oracles/s3fifo.mjs';
 import { makeWTinyLfuOracle } from './oracles/wtinylfu.mjs';
+import { makeSlruOracle } from './oracles/slru.mjs';
+import { makeTwoQOracle } from './oracles/twoq.mjs';
 
 export { validate } from '../validate.mjs';
 
@@ -280,6 +282,68 @@ export const wtinylfuIntPolicy = {
     oracle: (cap) => makeWTinyLfuOracle(cap),
 };
 
+/** Wrap a real Slru as a uniform driver. victim = the key the next over-capacity
+ *  insert would evict, read via the non-mutating `_peekVictim` (test-only). */
+export function wrapSlru(cache) {
+    return {
+        get: (k) => cache.get(k),
+        put: (k, v, t) => cache.put(k, v, t),
+        has: (k) => cache.has(k),
+        peek: (k) => cache.peek(k),
+        delete: (k) => cache.delete(k),
+        size: () => cache.size,
+        victim: () => cache._peekVictim(),
+        raw: cache,
+    };
+}
+
+/** The Slru policy (decisions/0015): the Segmented-LRU member + its own independent
+ *  probation/protected oracle. Default backing (Map): arbitrary keys. */
+export const slruPolicy = {
+    name: 'slru',
+    real: (cap) => wrapSlru(new Slru(cap)),
+    oracle: (cap) => makeSlruOracle(cap),
+};
+
+/** The Slru policy on the INTEGER substrate backing (`keys: 'int'`), driven against the
+ *  SAME slru oracle: the strict-zero backing must return byte-identical values + victims. */
+export const slruIntPolicy = {
+    name: 'slru-int',
+    real: (cap) => wrapSlru(new Slru(cap, { keys: 'int' })),
+    oracle: (cap) => makeSlruOracle(cap),
+};
+
+/** Wrap a real TwoQ as a uniform driver. victim via `_peekVictim` (test-only). */
+export function wrapTwoQ(cache) {
+    return {
+        get: (k) => cache.get(k),
+        put: (k, v, t) => cache.put(k, v, t),
+        has: (k) => cache.has(k),
+        peek: (k) => cache.peek(k),
+        delete: (k) => cache.delete(k),
+        size: () => cache.size,
+        victim: () => cache._peekVictim(),
+        raw: cache,
+    };
+}
+
+/** The TwoQ policy (decisions/0015): the full-2Q member + its own independent
+ *  A1in/Am/A1out-ghost oracle. Default backing (Map): arbitrary keys. */
+export const twoqPolicy = {
+    name: 'twoq',
+    real: (cap) => wrapTwoQ(new TwoQ(cap)),
+    oracle: (cap) => makeTwoQOracle(cap),
+};
+
+/** The TwoQ policy on the INTEGER substrate backing (`keys: 'int'`), driven against the
+ *  SAME twoq oracle: the strict-zero backing (incl. the int A1out ghost ring +
+ *  membership table) must return byte-identical values + victims. */
+export const twoqIntPolicy = {
+    name: 'twoq-int',
+    real: (cap) => wrapTwoQ(new TwoQ(cap, { keys: 'int' })),
+    oracle: (cap) => makeTwoQOracle(cap),
+};
+
 /* -------------------------------------------------------------------------- *
  * TTL policies (decisions/0017). The factories FORWARD a construction-options arg
  * `o` (the { ttl, clock } the runner injects) to BOTH the real cache and its oracle,
@@ -314,6 +378,20 @@ export const wtinylfuTtlPolicy = {
     name: 'wtinylfu-ttl',
     real: (cap, o) => wrapWTinyLfu(new WTinyLfu(cap, o)),
     oracle: (cap, o) => makeWTinyLfuOracle(cap, o),
+};
+
+/** Slru with an opt-in TTL default (decisions/0017). */
+export const slruTtlPolicy = {
+    name: 'slru-ttl',
+    real: (cap, o) => wrapSlru(new Slru(cap, o)),
+    oracle: (cap, o) => makeSlruOracle(cap, o),
+};
+
+/** TwoQ with an opt-in TTL default (decisions/0017). */
+export const twoqTtlPolicy = {
+    name: 'twoq-ttl',
+    real: (cap, o) => wrapTwoQ(new TwoQ(cap, o)),
+    oracle: (cap, o) => makeTwoQOracle(cap, o),
 };
 
 /* -------------------------------------------------------------------------- *

@@ -74,7 +74,7 @@ LiteMGLRU, meta-policy; distilled into DEBATE items 13-15).
 | SIEVE | **built + gated (S4)** |
 | S3-FIFO | **built + gated (S5)** |
 | W-TinyLFU | **built + gated (S6)** |
-| 2Q / SLRU | S7 |
+| 2Q / SLRU (Slru + TwoQ) | **built + gated (S7)** |
 | ARC (flagged -- stresses the fixed-capacity law) | S8 |
 | README + llms.txt + CHANGELOG + shipped benchmark/trace-replay tool | **built + gated (S9)** |
 | zero-GC TTL (opt-in expiry column) -- cross-cutting | **built + gated (S10)** |
@@ -605,13 +605,37 @@ DONE WHEN
   the win with provenance; the headline trio (SIEVE/S3-FIFO/W-TinyLFU) is complete
 
 ===============================================================================
-# S7 -- v1.3.0 -- 2Q / SLRU (the simplest scan-resistant baseline)
+# S7 -- v1.6.0 -- 2Q / SLRU (the simplest scan-resistant baseline)
 ===============================================================================
 ```markdown
-version_target: 1.3.0
-status: planned
+version_target: 1.6.0
+status: built + gated (VERSION stays 1.5.0 until /release 1.6.0)
+gc_maxMajor: 0
+gc_maxPauseMs: 4
+alloc_bytes_per_op: 0
+leak_cycles: 4096
+decisions: [D15]
 depends_on: [S3, S4]
 ```
+WHAT LANDED (S7, working tree, uncommitted; VERSION still 1.5.0 until /release 1.6.0):
+  - Two scan-resistant baseline members as TWO thin named exports over the shared
+    substrate (D15.1, NOT a mode flag): `Slru` (Segmented LRU -- probation FIFO ~20% +
+    protected LRU ~80%, promote-on-2nd-hit, protected-overflow demotes to probation)
+    and `TwoQ` (full 2Q -- A1in FIFO ~25% + Am LRU + a fixed keys-only A1out ghost
+    reusing the S3-FIFO `_gRing` pattern; ghost admits straight to Am; A1in hits do not
+    promote). Both on the SAME `LiteCache<K,V>` surface (14 members each), TTL +
+    iteration + stats + `keys:'int'` inherited.
+  - decisions/0015-2q-slru.md (D15.1..D15.5); Lru.d.ts (`Slru<K,V>` + `TwoQ<K,V>`) +
+    dts-drift (g)/(h) + implements controls; oracles/{slru,twoq}.mjs (independent
+    brute); harness policies (slru/twoq + int + ttl); validate segment/ghost terms;
+    tiers t0 (promote-on-2nd-hit + iteration order), t2 (cap-sized scan evicts 0
+    protected/Am + degenerate caps), t5 (differential, both backings, caps 1..9 + 64 +
+    TTL), t6 (Gate SLRU/TWOQ), t7 (build/clear soak + census), t9 (slru-promote-on-
+    first-hit + twoq-unbounded-ghost controls, each fails); test/Slru.test.js +
+    test/TwoQ.test.js; benchmark/Bench.mjs MEMBERS 4 -> 6 + Bench.test.js contract
+    4 -> 6; README/llms.txt/CHANGELOG.
+  - Gates: npm test 729/729; test:types (tsc) clean; torture "ok"/exit 0 (Gate SLRU
+    0.00000 B/op, Gate TWOQ 0.00000 B/op); controls "ok"/exit 0.
 PURPOSE
   The classic, well-understood scan/one-hit filter that sits between LRU and the
   modern trio: a probationary segment (FIFO or short LRU) for newcomers, a

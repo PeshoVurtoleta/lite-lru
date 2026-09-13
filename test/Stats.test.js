@@ -1,7 +1,8 @@
 /**
  * @zakkster/lite-lru -- node:test boundary suite for opt-in runtime stats
- * (decisions/0019, session S12). Parameterized over ALL FOUR family members
- * (LiteLru, Sieve, S3Fifo, WTinyLfu) so a counting regression in any one member's
+ * (decisions/0019, session S12; extended S7-QA to the S7 Slru/TwoQ members,
+ * decisions/0015 D15.5). Parameterized over ALL SIX family members (LiteLru,
+ * Sieve, S3Fifo, WTinyLfu, Slru, TwoQ) so a counting regression in any one member's
  * get/put/_reap override is caught the same way. The centrepiece is BRUTE-TALLY
  * PARITY over the T5 corpus: a seeded mixed get/put/delete/has/peek stream is driven
  * against a `{ stats: true }` cache while the four counters are INDEPENDENTLY
@@ -23,16 +24,20 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../Lru.js';
 import { validate } from './validate.mjs';
 
-/** Every family member, so each body runs FOUR TIMES over the exact same LiteCache
- *  surface (the stats contract is stated once on LiteCache, decisions/0019). */
+/** Every family member, so each body runs SIX TIMES over the exact same LiteCache
+ *  surface (the stats contract is stated once on LiteCache, decisions/0019). Slru/TwoQ
+ *  (decisions/0015, D15.5) count identically: segment movement (promotion/demotion/
+ *  ghost-admission) is NOT an eviction, so the SAME outcome-based tally proves them too. */
 const MEMBERS = [
     { name: 'LiteLru', Ctor: LiteLru },
     { name: 'Sieve', Ctor: Sieve },
     { name: 'S3Fifo', Ctor: S3Fifo },
     { name: 'WTinyLfu', Ctor: WTinyLfu },
+    { name: 'Slru', Ctor: Slru },
+    { name: 'TwoQ', Ctor: TwoQ },
 ];
 
 /** Seeded xorshift32 (same generator the torture harness uses) -- deterministic,

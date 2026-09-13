@@ -98,6 +98,18 @@ const SEG_WINDOW = 0;
 const SEG_PROBATION = 1;
 const SEG_PROTECTED = 2;
 
+/** Slru (decisions/0015, D15) segment tags: which of the two intrusive lists a slot is
+ *  in (PROBATION FIFO / PROTECTED LRU). Stored one byte per slot in `_seg` so `_detach`
+ *  fixes the RIGHT list's head/tail. A slot is in exactly one list at a time. */
+const SLRU_PROBATION = 0;
+const SLRU_PROTECTED = 1;
+
+/** TwoQ (decisions/0015, D15) segment tags: which of the two intrusive queues a resident
+ *  slot is in (A1in FIFO / Am LRU). Stored one byte per slot in `_seg`. The A1out ghost
+ *  is keys-only and holds no resident slot, so it needs no tag. */
+const TWOQ_A1IN = 0;
+const TWOQ_AM = 1;
+
 /** W-TinyLFU count-min sketch shape (decisions/0014, D14.2): 4 rows of 4-bit
  *  saturating counters packed 8-per-Uint32. One per-row seed spreads a key across the
  *  rows; `Math.imul` keeps each mix an EXACT 32-bit multiply (zero-alloc). Built once. */
@@ -194,7 +206,7 @@ function validateStats(stats) {
         "[lite-lru] unknown stats option " + String(stats) + " (did you mean true?)");
 }
 
-export const VERSION = "1.5.0";
+export const VERSION = "1.6.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -2258,6 +2270,833 @@ export class WTinyLfu {
         const victim = this._prTail;
         if (victim === NIL) return this._keys[cand];
         return this._admit(cand, victim) ? this._keys[victim] : this._keys[cand];
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * Slru -- Segmented LRU (decisions/0015, D15): a probation FIFO (~20%) in front of a
+ * protected LRU (~80%), the simplest scan-resistant baseline. The FIFTH named export
+ * in this file (same file-shape ruling: single main file + sideEffects:false + named
+ * exports = the tree-shake moat; D15.1 -- two thin exports, NOT one member with a mode
+ * flag, so each hot path stays monomorphic).
+ *
+ * Two intrusive lists threaded through the shared `_next`/`_prev` columns, tagged per
+ * slot by `_seg` (0 = probation, 1 = protected). `_next` toward the tail (LRU/oldest),
+ * `_prev` toward the head (MRU/newest). A newcomer enters PROBATION unvisited. A hit
+ * PROMOTES on the SECOND touch (D15): the first hit sets `_vis[s]` and does NOTHING
+ * structural (probation is FIFO -- no reorder); the second hit clears the bit and moves
+ * the entry to PROTECTED MRU, demoting protected's LRU tail back to probation MRU on
+ * overflow (`_protSize > protectedCap`). A protected hit moves to protected MRU.
+ * has/peek are neutral. At capacity a new key evicts the PROBATION tail (oldest), or --
+ * only when probation is empty -- the protected tail; because eviction ALWAYS prefers
+ * probation, a distinct one-hit-wonder scan never displaces a protected entry.
+ *
+ * Rides the shared `newStore` factory (default Map / opt-in keys:'int' strict-zero),
+ * the conservation invariant, the onEvict fire-after + `_inOnEvict` guard (0002), TTL
+ * (0017), zero-GC iteration (0018), and opt-in stats (0019).
+ * -------------------------------------------------------------------------- */
+
+export class Slru {
+    /**
+     * @param {number} capacity  Max entries. Must be an integer >= 1.
+     * @param {{ onEvict?: (key: any, value: any) => void, keys?: 'int' }} [options]
+     */
+    constructor(capacity, options) {
+        // Fail closed (D9), identical to the rest of the family.
+        if (!Number.isInteger(capacity) || capacity < 1) {
+            throw new RangeError(
+                "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
+            );
+        }
+
+        this._capacity = capacity;
+
+        // TTL (decisions/0017), validated fail-closed at the door -- identical to LiteLru.
+        this._clock = validateClock(options && options.clock);
+        this._ttl = validateTtl(options && options.ttl);
+
+        // Same shared substrate + int-key door as the rest of the family.
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+
+        // Cache the store's columns so the list relinks stay direct.
+        this._keys = this._store._keys;
+        this._vals = this._store._vals;
+        this._next = this._store._next; // toward the tail (LRU/oldest)
+        this._prev = this._store._prev; // toward the head (MRU/newest)
+        this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+
+        // D15 -- one segment tag per slot so `_detach` fixes the correct list, and one
+        // visited byte per slot for the promote-on-2nd-hit rule (probation only). Both
+        // fixed size, allocated once, never grown.
+        this._seg = new Uint8Array(capacity);
+        this._vis = new Uint8Array(capacity);
+
+        // D15.2 -- the 80/20 split, frozen here. protectedCap == capacity at cap 1/2
+        // (probation transiently holds newcomers; eviction still prefers probation).
+        this._protectedCap = Math.round(capacity * 0.8);
+
+        this._probHead = NIL; this._probTail = NIL; this._probSize = 0; // PROBATION FIFO
+        this._protHead = NIL; this._protTail = NIL; this._protSize = 0; // PROTECTED LRU
+        this._size = 0;                                                 // _probSize + _protSize
+
+        this._onEvict = (options && options.onEvict) || NOOP;
+        this._inOnEvict = false;
+
+        // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
+        this._stats = validateStats(options && options.stats);
+    }
+
+    /** The store factory, delegating to the shared `newStore` (decisions/0011). */
+    _makeStore(capacity, keys, hasTtl) {
+        return newStore(capacity, keys, hasTtl);
+    }
+
+    get size() { return this._size; }
+    get capacity() { return this._capacity; }
+
+    // --- intrusive list helpers (per-segment size accounting) -----------------
+
+    /** Unlink slot s from WHICHEVER list it is in (per `_seg[s]`), fixing that list's
+     *  neighbours + head/tail sentinels + size. */
+    _detach(s) {
+        const p = this._prev[s], n = this._next[s];
+        if (this._seg[s] === SLRU_PROBATION) {
+            if (p !== NIL) this._next[p] = n; else this._probHead = n;
+            if (n !== NIL) this._prev[n] = p; else this._probTail = p;
+            this._probSize--;
+        } else {
+            if (p !== NIL) this._next[p] = n; else this._protHead = n;
+            if (n !== NIL) this._prev[n] = p; else this._protTail = p;
+            this._protSize--;
+        }
+    }
+
+    /** Insert slot s at the head (MRU/newest end) of the PROBATION FIFO. */
+    _pushProbation(s) {
+        this._seg[s] = SLRU_PROBATION;
+        this._prev[s] = NIL; this._next[s] = this._probHead;
+        if (this._probHead !== NIL) this._prev[this._probHead] = s;
+        this._probHead = s; if (this._probTail === NIL) this._probTail = s;
+        this._probSize++;
+    }
+
+    /** Insert slot s at the head (MRU end) of the PROTECTED LRU. */
+    _pushProtected(s) {
+        this._seg[s] = SLRU_PROTECTED;
+        this._prev[s] = NIL; this._next[s] = this._protHead;
+        if (this._protHead !== NIL) this._prev[this._protHead] = s;
+        this._protHead = s; if (this._protTail === NIL) this._protTail = s;
+        this._protSize++;
+    }
+
+    /** On a HIT (get or put-update): protected -> protected MRU; probation -> set the
+     *  visited bit on the FIRST hit (FIFO, no reorder), PROMOTE to protected on the
+     *  SECOND hit, demoting protected's LRU tail back to probation on overflow (D15). */
+    _touch(s) {
+        if (this._seg[s] === SLRU_PROTECTED) {
+            if (this._protHead !== s) { this._detach(s); this._pushProtected(s); }
+        } else if (this._vis[s] === 0) {
+            this._vis[s] = 1; // first hit: mark, stay in probation (FIFO)
+        } else {
+            this._vis[s] = 0; // second hit: promote to protected
+            this._detach(s);
+            this._pushProtected(s);
+            if (this._protSize > this._protectedCap) { // protected full -> demote its LRU
+                const d = this._protTail;
+                this._detach(d);
+                this._vis[d] = 0;
+                this._pushProbation(d);
+            }
+        }
+    }
+
+    /** Free exactly ONE slot and return it for reuse. Evicts the PROBATION tail
+     *  (oldest), or -- only when probation is empty -- the PROTECTED LRU tail. Only
+     *  ever called at capacity, where at least one list is non-empty. */
+    _evict() {
+        const t = this._probSize > 0 ? this._probTail : this._protTail;
+        const k = this._keys[t];
+        this._detach(t);
+        this._store.delete(k);
+        return t;
+    }
+
+    // --- public API (all zero-alloc on the hot path) --------------------------
+
+    /** Look up a key AND apply the promote-on-2nd-hit rule. @returns the value, or
+     *  undefined if absent (see D7). */
+    get(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const s = this._store.get(key);
+        if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
+            this._reap(s);
+            return undefined;
+        }
+        this._touch(s);
+        if (this._stats !== null) this._stats.hits++; // live hit (0019)
+        return this._vals[s];
+    }
+
+    /**
+     * Insert or update. An update rewrites the value and counts as a hit for the
+     * promote-on-2nd-hit rule. A new key enters PROBATION; at capacity one entry is
+     * evicted (probation tail, or protected tail when probation is empty) and its slot
+     * reused in place. onEvict fires LAST (0002). The positional `ttlMs` (0017, D17.4)
+     * overrides the instance ttl default.
+     */
+    put(key, value, ttlMs) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        let expiresAt;
+        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
+        this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
+        const store = this._store;
+        const existing = store.get(key);
+        if (existing >= 0) {                 // update-in-place + touch
+            this._vals[existing] = value;
+            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            this._touch(existing);
+            if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
+            return;
+        }
+
+        let s, evKey, evVal;
+        let evicted = false;
+        if (this._size === this._capacity) {
+            s = this._evict();          // frees exactly one slot (reused in place, D6)
+            evKey = this._keys[s];
+            evVal = this._vals[s];
+            evicted = true;
+        } else {
+            s = store.allocSlot();
+        }
+
+        this._keys[s] = key;
+        this._vals[s] = value;
+        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        this._vis[s] = 0;               // a newcomer starts UNVISITED in probation
+        store.set(key, s);
+        this._pushProbation(s);         // newcomers ALWAYS enter probation
+        this._size = this._probSize + this._protSize;
+        if (this._stats !== null) this._stats.puts++; // successful insert (outcome-based); 0019
+
+        if (evicted) {
+            if (this._stats !== null) this._stats.evictions++; // capacity eviction (0019)
+            this._inOnEvict = true;
+            try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+        }
+    }
+
+    /** True if key is present (RESIDENT). Promotion-NEUTRAL. A stale entry is a MISS and
+     *  is reaped in place (decisions/0017, D17.3). */
+    has(key) {
+        const s = this._store.get(key);
+        if (s < 0) return false;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return false;
+        }
+        return true;
+    }
+
+    /** Read a value WITHOUT promoting. undefined if absent (see D7). A stale entry is a
+     *  MISS and is reaped in place (decisions/0017, D17.3). */
+    peek(key) {
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return undefined;
+        }
+        return this._vals[s];
+    }
+
+    /** Reap an expired slot in place (decisions/0017): unlink from its segment, drop from
+     *  the index, zero the visited byte, free the slot, and fire onEvict LAST via the
+     *  0002 guard. A reap is NOT an eviction victim, so it is never counted as promotion. */
+    _reap(s) {
+        this._store._ver++; // D18.6 -- a reap is a structural mutation; invalidate iterators
+        const evKey = this._keys[s];
+        const evVal = this._vals[s];
+        this._detach(s);
+        this._store.delete(evKey);
+        this._vis[s] = 0;
+        this._store.freeSlot(s);
+        this._size = this._probSize + this._protSize;
+        if (this._stats !== null) this._stats.evictions++; // reap = eviction (0019, D19.2)
+        this._inOnEvict = true;
+        try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+    }
+
+    /** Evict every expired resident entry now (decisions/0017, D17.5). COLD, O(size);
+     *  fires onEvict per victim (0002) and returns the count evicted. */
+    purgeStale() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG);
+        if (this._exp === null) return 0;
+        const now = this._clock();
+        const exp = this._exp;
+        const victims = [];
+        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
+        return victims.length;
+    }
+
+    /** Remove a key. Returns true if it was present. Frees the slot, zeroes its visited
+     *  byte, repairs the segment it was in. A delete is NOT an eviction. */
+    delete(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const s = store.get(key);
+        if (s < 0) return false;
+        store._ver++; // D18.6 -- a real delete is a structural mutation; invalidate iterators
+        this._detach(s);
+        store.delete(key);
+        this._vis[s] = 0;
+        store.freeSlot(s);
+        this._size = this._probSize + this._protSize;
+        return true;
+    }
+
+    /** Empty the cache. Rebuilds the free list, zeroes visited, empties both segments.
+     *  Allocates nothing. O(capacity). */
+    clear() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
+        this._store.reset();
+        this._vis.fill(0);
+        this._probHead = NIL; this._probTail = NIL; this._probSize = 0;
+        this._protHead = NIL; this._protTail = NIL; this._protSize = 0;
+        this._size = 0;
+    }
+
+    // --- opt-in runtime stats (decisions/0019, D19): cold accessors -----------
+
+    /** The live stats holder (decisions/0019, D19.3), returned BY REFERENCE (borrowed --
+     *  copy what you keep). Fail closed on an instance built without { stats: true }. */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE (decisions/0019); a borrowed holder stays valid.
+     *  Fail closed on a non-stats instance. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        const st = this._stats;
+        st.hits = 0; st.misses = 0; st.evictions = 0; st.puts = 0;
+    }
+
+    // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
+
+    /** The per-member iteration ROSTER (decisions/0018, D18.1 / 0015 D15.4): PROTECTED
+     *  (MRU->LRU) THEN PROBATION (MRU->LRU). Two segments concatenated -- NOT global
+     *  recency order. */
+    _iterHeads() { return [this._protHead, this._probHead]; }
+
+    keys() { return iterKeys(this); }
+    values() { return iterValues(this); }
+    entries() { return iterEntries(this); }
+    [Symbol.iterator]() { return iterEntries(this); }
+
+    // --- test/debug only (never call on a hot path) ---------------------------
+
+    /** Free-stack length, delegated to the store (conservation invariant). */
+    _freeListLength() {
+        return this._store.freeListLength();
+    }
+
+    /**
+     * The key the NEXT over-capacity insert would evict, computed WITHOUT mutating any
+     * link, size or bit (the non-destructive twin of `_evict`). Same victim `_evict`
+     * would pick: the probation tail, or the protected tail when probation is empty.
+     * TEST-ONLY (drives the torture differential); never a hot path.
+     */
+    _peekVictim() {
+        if (this._size === 0) return undefined;
+        return this._probSize > 0 ? this._keys[this._probTail] : this._keys[this._protTail];
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * TwoQ -- the full 2Q (Johnson & Shasha, VLDB'94), decisions/0015, D15: an A1in FIFO
+ * (~25%) + an Am LRU + a fixed A1out ghost of keys evicted from A1in. The SIXTH named
+ * export in this file (same file-shape ruling as Slru).
+ *
+ * Two intrusive queues threaded through the shared `_next`/`_prev` columns, tagged per
+ * slot by `_seg` (0 = A1in, 1 = Am). `_next` toward the tail (oldest/LRU), `_prev`
+ * toward the head (newest/MRU). A newcomer enters A1in (FIFO) UNLESS the key is in the
+ * A1out ghost -- a second sighting of a recently-A1in-evicted key -- in which case it
+ * is admitted straight to Am and consumed from the ghost (the ONLY path into Am). An
+ * A1in hit does NOTHING (A1in is pure FIFO probation -- no promotion); an Am hit moves
+ * the entry to Am MRU. has/peek are neutral. At capacity one reclaim step frees a slot:
+ * if A1in is at/over its target (`_a1Size > a1inCap`) OR Am is empty, evict the A1in
+ * tail and record its key in the ghost; else evict the Am LRU tail (NOT ghosted). A
+ * distinct one-hit-wonder flood churns through A1in only, never displacing Am.
+ *
+ * The A1out ghost reuses the S3-FIFO `_gRing` pattern (decisions/0013): keys only,
+ * bounded at construction (D15.3), strict zero-alloc on keys:'int', amortized on the
+ * default Map backing. Rides the shared `newStore` factory, the conservation invariant,
+ * the onEvict guard (0002), TTL (0017), iteration (0018), and stats (0019).
+ * -------------------------------------------------------------------------- */
+
+export class TwoQ {
+    /**
+     * @param {number} capacity  Max entries. Must be an integer >= 1.
+     * @param {{ onEvict?: (key: any, value: any) => void, keys?: 'int' }} [options]
+     */
+    constructor(capacity, options) {
+        // Fail closed (D9), identical to the rest of the family.
+        if (!Number.isInteger(capacity) || capacity < 1) {
+            throw new RangeError(
+                "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
+            );
+        }
+
+        this._capacity = capacity;
+
+        // TTL (decisions/0017), validated fail-closed at the door -- identical to LiteLru.
+        this._clock = validateClock(options && options.clock);
+        this._ttl = validateTtl(options && options.ttl);
+
+        // Same shared substrate + int-key door as the rest of the family.
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+
+        // Cache the store's columns so the queue relinks stay direct.
+        this._keys = this._store._keys;
+        this._vals = this._store._vals;
+        this._next = this._store._next; // toward the tail (oldest/LRU)
+        this._prev = this._store._prev; // toward the head (newest/MRU)
+        this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+
+        // D15 -- one segment tag per slot so `_detach` fixes the correct queue. Fixed
+        // size, allocated once, never grown. (TwoQ needs no visited bit -- A1in never
+        // promotes internally; Am promotion is via the ghost path only.)
+        this._seg = new Uint8Array(capacity);
+
+        // D15.2 -- the splits, frozen here. a1inCap is at least 1; ghostCap is 0 only at
+        // capacity 1 (the degenerate A1in-only edge).
+        this._a1inCap = Math.max(1, Math.round(capacity * 0.25));
+        this._amCap = capacity - this._a1inCap;
+        this._ghostCap = this._amCap;
+
+        this._a1Head = NIL; this._a1Tail = NIL; this._a1Size = 0; // A1in FIFO
+        this._amHead = NIL; this._amTail = NIL; this._amSize = 0; // Am LRU
+        this._size = 0;                                           // _a1Size + _amSize
+
+        // A1out ghost backing (D15.3): mirrors S3-FIFO (decisions/0013) exactly. int ->
+        // strict-zero open-addressed membership table + a pow2 Int32 FIFO ring. default
+        // -> a Set membership + arbitrary-key array ring (amortized: a Set resize can
+        // allocate).
+        this._ghostInt = (options && options.keys) === 'int';
+        if (this._ghostCap > 0) {
+            if (this._ghostInt) {
+                const need = Math.ceil(this._ghostCap / 0.75);
+                let gs = 1;
+                while (gs < need) gs <<= 1;
+                this._gixMask = gs - 1;
+                this._gixKey = new Int32Array(gs);
+                this._gixState = new Uint8Array(gs); // 0 = empty, 1 = occupied
+                let rs = 1;
+                while (rs < this._ghostCap) rs <<= 1; // pow2 ring so indices mask
+                this._gRingMask = rs - 1;
+                this._gRing = new Int32Array(rs);
+            } else {
+                this._gSet = new Set();                     // key -> nothing (membership)
+                this._gRingArr = new Array(this._ghostCap).fill(undefined); // FIFO order
+            }
+        }
+        this._gHead = 0; // ring index of the OLDEST ghost key
+        this._gLen = 0;  // live ghost entries (0 .. ghostCap)
+
+        this._onEvict = (options && options.onEvict) || NOOP;
+        this._inOnEvict = false;
+
+        // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
+        this._stats = validateStats(options && options.stats);
+    }
+
+    /** The store factory, delegating to the shared `newStore` (decisions/0011). */
+    _makeStore(capacity, keys, hasTtl) {
+        return newStore(capacity, keys, hasTtl);
+    }
+
+    get size() { return this._size; }
+    get capacity() { return this._capacity; }
+
+    // --- intrusive queue helpers (per-segment size accounting) ----------------
+
+    /** Unlink slot s from WHICHEVER queue it is in (per `_seg[s]`), fixing that queue's
+     *  neighbours + head/tail sentinels + size. */
+    _detach(s) {
+        const p = this._prev[s], n = this._next[s];
+        if (this._seg[s] === TWOQ_A1IN) {
+            if (p !== NIL) this._next[p] = n; else this._a1Head = n;
+            if (n !== NIL) this._prev[n] = p; else this._a1Tail = p;
+            this._a1Size--;
+        } else {
+            if (p !== NIL) this._next[p] = n; else this._amHead = n;
+            if (n !== NIL) this._prev[n] = p; else this._amTail = p;
+            this._amSize--;
+        }
+    }
+
+    /** Insert slot s at the head (newest end) of the A1in FIFO. */
+    _pushA1in(s) {
+        this._seg[s] = TWOQ_A1IN;
+        this._prev[s] = NIL; this._next[s] = this._a1Head;
+        if (this._a1Head !== NIL) this._prev[this._a1Head] = s;
+        this._a1Head = s; if (this._a1Tail === NIL) this._a1Tail = s;
+        this._a1Size++;
+    }
+
+    /** Insert slot s at the head (MRU end) of the Am LRU. */
+    _pushAm(s) {
+        this._seg[s] = TWOQ_AM;
+        this._prev[s] = NIL; this._next[s] = this._amHead;
+        if (this._amHead !== NIL) this._prev[this._amHead] = s;
+        this._amHead = s; if (this._amTail === NIL) this._amTail = s;
+        this._amSize++;
+    }
+
+    // --- A1out ghost helpers (keys only, bounded; int path strictly zero-alloc) --
+
+    /** True if key is a recently-A1in-evicted ghost key (admission -> Am). */
+    _ghostHas(key) {
+        if (this._ghostCap === 0) return false;
+        if (this._ghostInt) {
+            const st = this._gixState, ks = this._gixKey, mask = this._gixMask;
+            let b = hashInt(key, mask);
+            for (;;) {
+                if (st[b] === 0) return false;
+                if (ks[b] === key) return true;
+                b = (b + 1) & mask;
+            }
+        }
+        return this._gSet.has(key);
+    }
+
+    /** Record an A1in-evicted key in the ghost FIFO, evicting the oldest ghost key
+     *  first when full. Zero-alloc on the int path. */
+    _ghostAdd(key) {
+        const cap = this._ghostCap;
+        if (cap === 0) return;
+        if (this._gLen === cap) {
+            if (this._ghostInt) {
+                this._ghostMemDel(this._gRing[this._gHead]);
+                this._gHead = (this._gHead + 1) & this._gRingMask;
+            } else {
+                const old = this._gRingArr[this._gHead];
+                this._gSet.delete(old);
+                this._gRingArr[this._gHead] = undefined; // drop the key ref
+                this._gHead = (this._gHead + 1) % cap;
+            }
+            this._gLen--;
+        }
+        if (this._ghostInt) {
+            const pos = (this._gHead + this._gLen) & this._gRingMask;
+            this._gRing[pos] = key;
+            this._ghostMemAdd(key);
+        } else {
+            const pos = (this._gHead + this._gLen) % cap;
+            this._gRingArr[pos] = key;
+            this._gSet.add(key);
+        }
+        this._gLen++;
+    }
+
+    /** Remove a key from the ghost (it has just been re-admitted into Am). The ring
+     *  shift is COLD -- only when admitting a key that was in ghost. */
+    _ghostConsume(key) {
+        const cap = this._ghostCap;
+        if (cap === 0) return;
+        if (this._ghostInt) {
+            const mask = this._gRingMask;
+            let idx = -1;
+            for (let i = 0; i < this._gLen; i++) {
+                if (this._gRing[(this._gHead + i) & mask] === key) { idx = i; break; }
+            }
+            if (idx >= 0) {
+                for (let i = idx; i < this._gLen - 1; i++) {
+                    this._gRing[(this._gHead + i) & mask] = this._gRing[(this._gHead + i + 1) & mask];
+                }
+                this._gLen--;
+            }
+            this._ghostMemDel(key);
+        } else {
+            let idx = -1;
+            for (let i = 0; i < this._gLen; i++) {
+                if (sameKey(this._gRingArr[(this._gHead + i) % cap], key)) { idx = i; break; }
+            }
+            if (idx >= 0) {
+                for (let i = idx; i < this._gLen - 1; i++) {
+                    this._gRingArr[(this._gHead + i) % cap] = this._gRingArr[(this._gHead + i + 1) % cap];
+                }
+                this._gRingArr[(this._gHead + this._gLen - 1) % cap] = undefined;
+                this._gLen--;
+            }
+            this._gSet.delete(key);
+        }
+    }
+
+    /** Int ghost membership insert (open-addressed, no-op if already present). */
+    _ghostMemAdd(key) {
+        const st = this._gixState, ks = this._gixKey, mask = this._gixMask;
+        let b = hashInt(key, mask);
+        for (;;) {
+            if (st[b] === 0) { st[b] = 1; ks[b] = key; return; }
+            if (ks[b] === key) return;
+            b = (b + 1) & mask;
+        }
+    }
+
+    /** Int ghost membership delete (backward-shift, no tombstones). */
+    _ghostMemDel(key) {
+        const st = this._gixState, ks = this._gixKey, mask = this._gixMask;
+        let b = hashInt(key, mask);
+        for (;;) {
+            if (st[b] === 0) return;
+            if (ks[b] === key) break;
+            b = (b + 1) & mask;
+        }
+        let i = b, j = b;
+        for (;;) {
+            j = (j + 1) & mask;
+            if (st[j] === 0) break;
+            const k = hashInt(ks[j], mask);
+            const inRange = (j > i) ? (i < k && k <= j) : (i < k || k <= j);
+            if (inRange) continue;
+            st[i] = 1; ks[i] = ks[j];
+            i = j;
+        }
+        st[i] = 0;
+    }
+
+    /** Free exactly ONE slot and return it for reuse (the 2Q reclaim step). Evicts the
+     *  A1in tail (recording its key in the ghost) when A1in is at/over its target OR Am
+     *  is empty; else evicts the Am LRU tail (NOT ghosted). Only ever called at
+     *  capacity, where the chosen queue is non-empty. */
+    _evict() {
+        if (this._a1Size > this._a1inCap || this._amSize === 0) {
+            const t = this._a1Tail;
+            const k = this._keys[t];
+            this._detach(t);
+            this._store.delete(k);
+            this._ghostAdd(k); // A1in evictions -> ghost
+            return t;
+        }
+        const t = this._amTail;
+        this._detach(t);
+        this._store.delete(this._keys[t]); // Am evictions are NOT ghosted
+        return t;
+    }
+
+    // --- public API (all zero-alloc on the hot path) --------------------------
+
+    /** Look up a key. An A1in hit does NOTHING (no promotion); an Am hit moves to Am
+     *  MRU. @returns the value, or undefined if absent (see D7). */
+    get(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const s = this._store.get(key);
+        if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
+            this._reap(s);
+            return undefined;
+        }
+        // Am hit: move to MRU. A1in hit: nothing (pure FIFO probation).
+        if (this._seg[s] === TWOQ_AM && this._amHead !== s) { this._detach(s); this._pushAm(s); }
+        if (this._stats !== null) this._stats.hits++; // live hit (0019)
+        return this._vals[s];
+    }
+
+    /**
+     * Insert or update. An update rewrites the value (an Am update moves to Am MRU; an
+     * A1in update does not reorder). A new key enters A1in, UNLESS it is in the A1out
+     * ghost (proven on a second sighting) -> straight to Am, consumed from ghost. At
+     * capacity one reclaim step evicts + reuses a slot in place. onEvict fires LAST
+     * (0002). The positional `ttlMs` (0017, D17.4) overrides the instance ttl default.
+     */
+    put(key, value, ttlMs) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        let expiresAt;
+        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
+        this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
+        const store = this._store;
+        const existing = store.get(key);
+        if (existing >= 0) {                 // update-in-place
+            this._vals[existing] = value;
+            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            if (this._seg[existing] === TWOQ_AM && this._amHead !== existing) {
+                this._detach(existing); this._pushAm(existing); // Am update -> MRU
+            }
+            if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
+            return;
+        }
+
+        // Admission decision uses the ghost state AT ARRIVAL (before this eviction's own
+        // ghost write), so an eviction that bumps this key from ghost cannot flip it.
+        const toMain = this._ghostHas(key);
+        if (toMain) this._ghostConsume(key);
+
+        let s, evKey, evVal;
+        let evicted = false;
+        if (this._size === this._capacity) {
+            s = this._evict();          // frees exactly one slot (reused in place, D6)
+            evKey = this._keys[s];
+            evVal = this._vals[s];
+            evicted = true;
+        } else {
+            s = store.allocSlot();
+        }
+
+        this._keys[s] = key;
+        this._vals[s] = value;
+        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        store.set(key, s);
+        if (toMain) this._pushAm(s); else this._pushA1in(s);
+        this._size = this._a1Size + this._amSize;
+        if (this._stats !== null) this._stats.puts++; // successful insert (outcome-based); 0019
+
+        if (evicted) {
+            if (this._stats !== null) this._stats.evictions++; // capacity eviction (0019)
+            this._inOnEvict = true;
+            try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+        }
+    }
+
+    /** True if key is present (RESIDENT). Ghost keys are NOT present. A stale entry is a
+     *  MISS and is reaped in place (decisions/0017, D17.3). */
+    has(key) {
+        const s = this._store.get(key);
+        if (s < 0) return false;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return false;
+        }
+        return true;
+    }
+
+    /** Read a value WITHOUT reordering. undefined if absent (see D7). A stale entry is a
+     *  MISS and is reaped in place (decisions/0017, D17.3). */
+    peek(key) {
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return undefined;
+        }
+        return this._vals[s];
+    }
+
+    /** Reap an expired slot in place (decisions/0017): unlink from whichever queue, drop
+     *  from the index, free the slot, and fire onEvict LAST via the 0002 guard. A reap is
+     *  NOT an eviction, so it is never ghosted (like delete). */
+    _reap(s) {
+        this._store._ver++; // D18.6 -- a reap is a structural mutation; invalidate iterators
+        const evKey = this._keys[s];
+        const evVal = this._vals[s];
+        this._detach(s);
+        this._store.delete(evKey);
+        this._store.freeSlot(s);
+        this._size = this._a1Size + this._amSize;
+        if (this._stats !== null) this._stats.evictions++; // reap = eviction (0019, D19.2)
+        this._inOnEvict = true;
+        try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+    }
+
+    /** Evict every expired resident entry now (decisions/0017, D17.5). COLD, O(size);
+     *  fires onEvict per victim (0002) and returns the count evicted. */
+    purgeStale() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG);
+        if (this._exp === null) return 0;
+        const now = this._clock();
+        const exp = this._exp;
+        const victims = [];
+        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
+        return victims.length;
+    }
+
+    /** Remove a key. Returns true if it was present. Frees the slot, repairs the queue
+     *  it was in. A delete is NOT an eviction, so it is never recorded in ghost. */
+    delete(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const s = store.get(key);
+        if (s < 0) return false;
+        store._ver++; // D18.6 -- a real delete is a structural mutation; invalidate iterators
+        this._detach(s);
+        store.delete(key);
+        store.freeSlot(s);
+        this._size = this._a1Size + this._amSize;
+        return true;
+    }
+
+    /** Empty the cache. Rebuilds the free list, empties both queues and the ghost.
+     *  Allocates nothing. O(capacity). */
+    clear() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
+        this._store.reset();
+        this._a1Head = NIL; this._a1Tail = NIL; this._a1Size = 0;
+        this._amHead = NIL; this._amTail = NIL; this._amSize = 0;
+        this._size = 0;
+        if (this._ghostCap > 0) {
+            if (this._ghostInt) this._gixState.fill(0);
+            else { this._gSet.clear(); this._gRingArr.fill(undefined); }
+        }
+        this._gHead = 0;
+        this._gLen = 0;
+    }
+
+    // --- opt-in runtime stats (decisions/0019, D19): cold accessors -----------
+
+    /** The live stats holder (decisions/0019, D19.3), returned BY REFERENCE (borrowed --
+     *  copy what you keep). Fail closed on an instance built without { stats: true }. */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE (decisions/0019); a borrowed holder stays valid.
+     *  Fail closed on a non-stats instance. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        const st = this._stats;
+        st.hits = 0; st.misses = 0; st.evictions = 0; st.puts = 0;
+    }
+
+    // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
+
+    /** The per-member iteration ROSTER (decisions/0018, D18.1 / 0015 D15.4): Am
+     *  (MRU->LRU) THEN A1in (newest->oldest). The keys-only A1out ghost is EXCLUDED. */
+    _iterHeads() { return [this._amHead, this._a1Head]; }
+
+    keys() { return iterKeys(this); }
+    values() { return iterValues(this); }
+    entries() { return iterEntries(this); }
+    [Symbol.iterator]() { return iterEntries(this); }
+
+    // --- test/debug only (never call on a hot path) ---------------------------
+
+    /** Free-stack length, delegated to the store (conservation invariant). */
+    _freeListLength() {
+        return this._store.freeListLength();
+    }
+
+    /**
+     * The key the NEXT over-capacity insert would evict, computed WITHOUT mutating any
+     * link, size or the ghost (the non-destructive twin of `_evict`). Same victim
+     * `_evict` would pick: the A1in tail when A1in is at/over its target or Am is empty,
+     * else the Am LRU tail. TEST-ONLY (drives the torture differential); never a hot path.
+     */
+    _peekVictim() {
+        if (this._size === 0) return undefined;
+        if (this._a1Size > this._a1inCap || this._amSize === 0) return this._keys[this._a1Tail];
+        return this._keys[this._amTail];
     }
 }
 

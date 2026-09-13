@@ -15,8 +15,8 @@
  * corrupt structure still fails the tier.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ } from './harness.mjs';
 
 const NIL = -1;
 
@@ -266,6 +266,99 @@ export function run() {
         void wrapWTinyLfu(c); // exercise the driver wrapper on a churned cache
     }
 
+    // --- Slru laws (decisions/0015) ---------------------------------------------
+    const SLRU_PROBATION = 0, SLRU_PROTECTED = 1; // matches Lru.js tags
+
+    // SL1: promote-on-2nd-hit. A newcomer enters PROBATION; get(X) ONCE leaves X in
+    // probation (visited set); get(X) TWICE promotes X to PROTECTED. This is the pinned
+    // Slru law -- a promote-on-first-hit variant is the t9 control that MUST diverge.
+    {
+        const c = new Slru(64); // protectedCap 51
+        c.put('x', 1);
+        let s = c._store.get('x');
+        check(c._seg[s] === SLRU_PROBATION, () => 't0 SL1: newcomer did not enter PROBATION');
+        c.get('x'); // first hit
+        s = c._store.get('x');
+        check(c._seg[s] === SLRU_PROBATION, () => 't0 SL1: get(X) ONCE promoted (must stay probation)');
+        check(c._vis[s] === 1, () => 't0 SL1: first hit did not set the visited bit');
+        c.get('x'); // second hit
+        s = c._store.get('x');
+        check(c._seg[s] === SLRU_PROTECTED, () => 't0 SL1: get(X) TWICE did not promote to PROTECTED');
+        validate(c);
+    }
+
+    // SL2: scan resistance -- a cap-sized distinct-key scan evicts 0 PROTECTED entries.
+    // Promote a hot set into protected, fill probation, then run EXACTLY `cap` distinct
+    // new puts; every protected key must survive (eviction always takes from probation).
+    {
+        const N = 64;
+        const c = new Slru(N);
+        const HOT = [];
+        for (let h = 0; h < 20; h++) { const k = 'hot' + h; c.put(k, h); c.get(k); c.get(k); HOT.push(k); } // 2 hits -> protected
+        for (const k of HOT) check(c._seg[c._store.get(k)] === SLRU_PROTECTED, () => 't0 SL2: hot key ' + k + ' not in protected after 2 hits');
+        for (let i = 0; c.size < N; i++) c.put('warm' + i, i); // fill probation to capacity
+        check(c.size === N, () => 't0 SL2: slru not full before the scan');
+        for (let i = 0; i < N; i++) { // exactly cap distinct one-hit-wonders
+            c.put('scan' + i, i);
+            check(c.size === N, () => 't0 SL2: slru drifted from capacity during the scan');
+        }
+        for (const k of HOT) check(c.has(k), () => 't0 SL2: PROTECTED key ' + k + ' evicted by a cap-sized scan (no scan resistance)');
+        // Non-vacuity: the scan really evicted (probation churned).
+        let survivors = 0;
+        for (let i = 0; i < N; i++) if (c.has('scan' + i)) survivors++;
+        check(survivors < N, () => 't0 SL2: too many scan keys survived (' + survivors + ') -- eviction not exercised');
+        validate(c);
+        void wrapSlru(c);
+    }
+
+    // --- TwoQ laws (decisions/0015) ---------------------------------------------
+    const TWOQ_A1IN = 0, TWOQ_AM = 1; // matches Lru.js tags
+
+    // TQ1: a newcomer enters A1in; an A1in hit does NOT promote; the ghost path (A1in ->
+    // evicted -> A1out -> seen again) is the ONLY route into Am.
+    {
+        const c = new TwoQ(4); // a1inCap 1, amCap 3, ghostCap 3
+        c.put('a', 1);
+        check(c._seg[c._store.get('a')] === TWOQ_A1IN, () => 't0 TQ1: newcomer did not enter A1in');
+        c.get('a'); // A1in hit -- must NOT promote
+        check(c._seg[c._store.get('a')] === TWOQ_A1IN, () => 't0 TQ1: an A1in hit promoted (must not)');
+        c.put('b', 2); c.put('c', 3); c.put('d', 4); // fills to capacity (no eviction yet)
+        c.put('e', 5); // over capacity -> evicts the A1in tail 'a' into the ghost
+        check(!c.has('a'), () => 't0 TQ1: a was not evicted from A1in');
+        check(c._ghostHas('a'), () => 't0 TQ1: evicted A1in key not recorded in A1out ghost');
+        c.put('a', 11); // second sighting while in ghost -> straight to Am
+        check(c._seg[c._store.get('a')] === TWOQ_AM, () => 't0 TQ1: a ghost re-admit did not route to Am');
+        check(!c._ghostHas('a'), () => 't0 TQ1: a was not consumed from the ghost on re-admission');
+        validate(c);
+    }
+
+    // TQ2: scan resistance -- a cap-sized distinct-key scan evicts 0 Am entries. Get a hot
+    // set into Am via the ghost path, fill A1in, then run EXACTLY `cap` distinct new puts;
+    // every Am key survives (the scan churns A1in only).
+    {
+        const N = 64; // a1inCap 16
+        const c = new TwoQ(N);
+        const HOT = [];
+        for (let h = 0; h < 20; h++) HOT.push('hot' + h);
+        for (const k of HOT) c.put(k, 0);                 // enter A1in
+        for (let i = 0; i < N; i++) c.put('flush' + i, i); // flush hot keys out of A1in into ghost
+        for (let h = 0; h < HOT.length; h++) c.put(HOT[h], h); // second sighting -> Am
+        for (const k of HOT) check(c._seg[c._store.get(k)] === TWOQ_AM, () => 't0 TQ2: hot key ' + k + ' not in Am after ghost re-admit');
+        while (c.size < N) c.put('warm' + (c.size), c.size); // fill to capacity
+        check(c.size === N, () => 't0 TQ2: twoq not full before the scan');
+        for (let i = 0; i < N; i++) {
+            c.put('scan' + i, i);
+            check(c.size === N, () => 't0 TQ2: twoq drifted from capacity during the scan');
+        }
+        for (const k of HOT) check(c.has(k), () => 't0 TQ2: Am key ' + k + ' evicted by a cap-sized scan (no scan resistance)');
+        let survivors = 0;
+        for (let i = 0; i < N; i++) if (c.has('scan' + i)) survivors++;
+        check(survivors < N, () => 't0 TQ2: too many scan keys survived (' + survivors + ') -- eviction not exercised');
+        check(c._gLen <= c._ghostCap, () => 't0 TQ2: A1out ghost exceeded its bound');
+        validate(c);
+        void wrapTwoQ(c);
+    }
+
     // --- TTL laws (decisions/0017) ----------------------------------------------
 
     // T1: stale = MISS, and the MISS does NOTHING to policy state. get() on an expired
@@ -362,6 +455,31 @@ export function run() {
         for (let i = 0; i < 20; i++) c.get(i); // promote probation hits into protected
         check(c._ptHead !== NIL, () => 't0 ITER wtinylfu: PROTECTED empty (setup invalid)');
         checkIterOrder('wtinylfu', c, [c._wHead, c._ptHead, c._prHead]);
+        validate(c);
+    }
+
+    // I6 Slru -- PROTECTED (_protHead..) THEN PROBATION (_probHead..), each MRU..LRU.
+    {
+        const c = new Slru(20); // protectedCap 16
+        for (let i = 0; i < 20; i++) c.put(i, i); // all in probation, at capacity
+        for (let i = 0; i < 20; i++) { c.get(i); c.get(i); } // 2 hits each -> promote to protected
+        check(c._protHead !== NIL, () => 't0 ITER slru: PROTECTED empty (setup invalid)');
+        for (let i = 100; i < 108; i++) c.put(i, i); // fresh newcomers -> probation
+        check(c._probHead !== NIL, () => 't0 ITER slru: PROBATION empty (setup invalid)');
+        checkIterOrder('slru', c, [c._protHead, c._probHead]);
+        validate(c);
+    }
+
+    // I7 TwoQ -- Am (_amHead..) THEN A1in (_a1Head..), each MRU..LRU.
+    {
+        const c = new TwoQ(20); // a1inCap 5, ghostCap 15
+        for (let i = 0; i < 10; i++) c.put(i, i);        // enter A1in
+        for (let i = 0; i < 20; i++) c.put(1000 + i, i); // flush 0..9 out of A1in -> ghost
+        for (let i = 0; i < 10; i++) c.put(i, i);        // second sighting -> Am
+        for (let i = 100; i < 105; i++) c.put(i, i);     // fresh newcomers -> A1in
+        check(c._amHead !== NIL, () => 't0 ITER twoq: Am empty (setup invalid)');
+        check(c._a1Head !== NIL, () => 't0 ITER twoq: A1in empty (setup invalid)');
+        checkIterOrder('twoq', c, [c._amHead, c._a1Head]);
         validate(c);
     }
 

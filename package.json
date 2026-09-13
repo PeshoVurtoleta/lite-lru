@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-lru",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Zero-dependency, zero-GC cache family under one LiteCache<K,V> surface: a classic LRU reference member and the modern SIEVE headline, tree-shakeable to one policy, with a shipped bench + Belady OPT measurement tool.",
   "type": "module",
   "main": "./Lru.js",

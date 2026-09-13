@@ -7,6 +7,78 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.6.0] - 2026-09-13
+
+### Added
+
+- **Two scan-resistant baseline members, `Slru` and `TwoQ`** (decisions/0015, D15),
+  as TWO thin named exports over the shared substrate -- NOT one member with a mode
+  flag, so each hot path stays monomorphic and the tree-shake stays clean (law 7).
+  Both implement the SAME `LiteCache<K,V>` surface, so `new LiteLru(n)` swaps for
+  `new Slru(n)` or `new TwoQ(n)` and stays type-checked.
+  - **`Slru`** -- Segmented LRU: a probation FIFO in front of a protected LRU
+    (`protectedCap = round(capacity * 0.8)`). A newcomer enters probation; the
+    promote-on-2nd-hit law (D15) holds -- `get(X)` once leaves X in probation (a
+    visited bit set, no reorder), `get(X)` twice promotes X to protected
+    (`put(update)` counts as a hit); a promotion that overflows protected demotes
+    its LRU tail back to probation. A protected hit moves to protected MRU. Eviction
+    ALWAYS prefers the probation tail, so a cap-sized distinct-key scan evicts 0
+    protected entries. `has`/`peek` are promotion-neutral.
+  - **`TwoQ`** -- the full 2Q (Johnson & Shasha, VLDB'94): an A1in FIFO
+    (`a1inCap = max(1, round(capacity * 0.25))`) + an Am LRU + a fixed, keys-only
+    A1out ghost (`ghostCap = capacity - a1inCap`) reusing the S3-FIFO `_gRing`
+    pattern (strict zero-alloc on `keys: 'int'`, amortized on the default Map
+    backing). A newcomer enters A1in unless the key is in the A1out ghost (a second
+    sighting) -> straight to Am, consumed from the ghost (the ONLY path into Am). An
+    A1in hit does NOTHING (pure FIFO probation); an Am hit moves to Am MRU. At
+    capacity the reclaim step evicts the A1in tail (recording its key in the ghost)
+    when A1in is over its target or Am is empty, else the Am LRU (not ghosted). A
+    distinct one-hit-wonder flood churns A1in only, never displacing Am.
+- **`decisions/0015-2q-slru.md`** -- D15.1 two exports (not a mode flag) + why;
+  D15.2 the 80/20 and 25% splits and degenerate caps; D15.3 the A1out ghost bound
+  (fixed ring, keys only, never values) + the promote-on-2nd-hit rule; D15.4
+  iteration order; D15.5 the outcome-based stats counting (segment
+  promotion/demotion/graduation are NOT evictions).
+- **`test/torture/oracles/slru.mjs` + `test/torture/oracles/twoq.mjs`** -- independent
+  brute-force references (plain arrays), driving the differential on both backings.
+- **`test/Slru.test.js` + `test/TwoQ.test.js`** -- node:test boundary suites (policy
+  laws, fail-closed doors, degenerate caps 1/2/3, TTL/iteration/stats interop,
+  `keys: 'int'` parity, and a self-contained oracle cross-check on both backings).
+- Torture coverage for both members: t0 (promote-on-2nd-hit + iteration order laws),
+  t2 (a cap-sized distinct-key scan evicts 0 protected/Am entries + degenerate caps),
+  t5 (differential fuzz vs the new oracles, both backings, caps 1..9 + 64, + TTL),
+  t6 (`Gate SLRU` / `Gate TWOQ`, strict zero-alloc int churn), t7 (build/clear soak +
+  value-retention census), and t9 controls (`slru-promote-on-first-hit`,
+  `twoq-unbounded-ghost` -- each diverges from its oracle and fails).
+
+### Changed
+
+- `LiteCache<K,V>` gains no members; `Lru.d.ts` adds `class Slru<K,V>` and
+  `class TwoQ<K,V>` (each the same 14-member surface), and the dts-drift gate now
+  counts both (tests (g)/(h) + implements-clause controls). The named export set
+  grows from four members to six.
+- **`benchmark/Bench.mjs` now rosters all six members** (`LiteLru`, `Sieve`,
+  `S3Fifo`, `WTinyLfu`, `Slru`, `TwoQ`); the `Bench.test.js` member-count/name
+  contract moved from 4 to 6, so the shipped "measure your policy" tool never
+  silently omits a member.
+- Tests: 612 -> 888 node:test cases (both new members added to the parameterized
+  Stats / Ttl / Iteration suites, plus dedicated `Slru`/`TwoQ` boundary suites).
+  `README.md` and `llms.txt` gain `Slru`/`TwoQ` sections and the updated counts.
+
+### Gated (measured this release)
+
+- `Gate SLRU` / `Gate TWOQ`: >= 60,000 mixed int-key ops at capacity 4096 -> 0 major
+  GC, `maxPauseMs 4`, 0.00000 B/op, all backing typed-array byteLengths
+  (`_seg` / `_vis` / `_gRing` / `_ixSlot` / ...) invariant across the run, and
+  `_gLen <= _ghostCap` always. The workload provably drives the promote / demote /
+  ghost-admit / Am-hit lanes (lane-coverage counts asserted nonzero), so the
+  0.00000 B/op figure is not vacuous on the segment-transition paths.
+- Differential: 100,000 ops per config across capacities 1..9 (including the
+  degenerate `protectedCap == capacity` and `ghostCap == 0` edges) and 64, on both
+  backings, plus TTL, with zero divergence in value / size / eviction victim against
+  the independent oracles.
+- npm test 888/888; `test:types` clean; torture "ok" (exit 0); controls all fail.
+
 ## [1.5.0] - 2026-09-13
 
 ### Added

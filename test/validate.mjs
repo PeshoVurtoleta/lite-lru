@@ -58,6 +58,24 @@ export function activeListsOf(cache) {
             { name: 's3fifo-main', head: cache._mHead, tail: cache._mTail, doubly: true },
         ];
     }
+    // An Slru member (decisions/0015) threads TWO doubly-linked lists through the shared
+    // _next/_prev columns (detected by its `_probHead` PROBATION endpoint): PROTECTED and
+    // PROBATION. The SAME checker sums over both descriptors.
+    if (cache._probHead !== undefined) {
+        return [
+            { name: 'slru-protected', head: cache._protHead, tail: cache._protTail, doubly: true },
+            { name: 'slru-probation', head: cache._probHead, tail: cache._probTail, doubly: true },
+        ];
+    }
+    // A TwoQ member (decisions/0015) threads TWO doubly-linked queues through the shared
+    // _next/_prev columns (detected by its `_a1Head` A1in endpoint): Am and A1in. The
+    // keys-only A1out ghost holds no resident slot. The SAME checker sums over both.
+    if (cache._a1Head !== undefined) {
+        return [
+            { name: 'twoq-am', head: cache._amHead, tail: cache._amTail, doubly: true },
+            { name: 'twoq-a1in', head: cache._a1Head, tail: cache._a1Tail, doubly: true },
+        ];
+    }
     // A SIEVE member (decisions/0012) exposes _head/_tail on a single doubly-linked
     // FIFO ring (detected by its moving `_hand`). Classic LRU exposes the same shape
     // as a recency DLL. Both are ONE doubly-linked list -> one descriptor.
@@ -242,6 +260,46 @@ export function validate(cache, lists) {
             if (!inRing) {
                 throw new Error('[validate] sieve hand ' + hand + ' is not a live ring slot (dangling)');
             }
+        }
+    }
+
+    // --- term 9 (Slru members, decisions/0015): segments + visited range ---------
+    // A no-op unless the member exposes `_probHead`. For an Slru: the two segment sizes
+    // sum to size, protected never exceeds its cap, every `_seg` byte is 0/1, and every
+    // `_vis` byte is 0/1. The two-list population is already summed by term 3/4.
+    if (cache._probHead !== undefined) {
+        if (cache._probSize + cache._protSize !== size) {
+            throw new Error(
+                '[validate] slru probSize(' + cache._probSize + ') + protSize(' + cache._protSize +
+                ') != size(' + size + ')');
+        }
+        if (cache._protSize > cache._protectedCap) {
+            throw new Error(
+                '[validate] slru protSize(' + cache._protSize + ') > protectedCap(' +
+                cache._protectedCap + ')');
+        }
+        for (let i = 0; i < cap; i++) {
+            if (cache._seg[i] > 1) throw new Error('[validate] slru _seg[' + i + '] = ' + cache._seg[i] + ' > 1');
+            if (cache._vis[i] > 1) throw new Error('[validate] slru _vis[' + i + '] = ' + cache._vis[i] + ' > 1');
+        }
+    }
+
+    // --- term 10 (TwoQ members, decisions/0015): segments + ghost bound ----------
+    // A no-op unless the member exposes `_a1Head`. For a TwoQ: the two queue sizes sum to
+    // size, every `_seg` byte is 0/1, and the A1out ghost never exceeds its bound. The
+    // two-queue population is already summed by term 3/4.
+    if (cache._a1Head !== undefined) {
+        if (cache._a1Size + cache._amSize !== size) {
+            throw new Error(
+                '[validate] twoq a1Size(' + cache._a1Size + ') + amSize(' + cache._amSize +
+                ') != size(' + size + ')');
+        }
+        for (let i = 0; i < cap; i++) {
+            if (cache._seg[i] > 1) throw new Error('[validate] twoq _seg[' + i + '] = ' + cache._seg[i] + ' > 1');
+        }
+        if (cache._gLen > cache._ghostCap) {
+            throw new Error(
+                '[validate] twoq ghostCount(' + cache._gLen + ') > ghostCap(' + cache._ghostCap + ')');
         }
     }
 }

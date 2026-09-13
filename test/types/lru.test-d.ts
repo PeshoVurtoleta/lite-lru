@@ -9,7 +9,7 @@
  * stops happening (tsc flags an unused directive). Test-only; not in files[].
  * ASCII-only.
  */
-import LiteLru, { VERSION, Sieve, S3Fifo, WTinyLfu } from "../../Lru.js";
+import LiteLru, { VERSION, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from "../../Lru.js";
 import type { LiteCache, LiteCacheOptions } from "../../Lru.js";
 
 // A type-equality check with teeth (identity holds only for exact-equal types).
@@ -222,3 +222,46 @@ new LiteLru<number, number>(10, { ttl: 10, clock: 5 });
 
 // @ts-expect-error -- the positional ttlMs must be a number.
 ttlLru.put(4, 4, "500");
+
+// ---- Slru: the fifth family member SATISFIES the SAME LiteCache surface -------
+// (decisions/0015) The one-line policy swap: `new Slru(n)` type-checks into the SAME
+// `LiteCache` binding as every other member.
+const sl = new Slru<string, number>(10);
+const slGot = sl.get("a");
+expectTrue<Equal<typeof slGot, number | undefined>>();
+expectTrue<Equal<ReturnType<typeof sl.has>, boolean>>();
+expectTrue<Equal<typeof sl.capacity, number>>();
+const slIface: LiteCache<string, number> = new Slru<string, number>(10);
+slIface.put("k", 1);
+new Slru<number, number>(10, { keys: "int" });
+const slTtl: LiteCache<number, number> = new Slru<number, number>(10, { ttl: 5 });
+slTtl.put(1, 1, Infinity);
+
+// @ts-expect-error -- V is number; a string value is rejected on Slru too.
+sl.put("a", "not-a-number");
+
+// @ts-expect-error -- size is readonly on Slru.
+sl.size = 5;
+
+// ---- TwoQ: the sixth family member SATISFIES the SAME LiteCache surface -------
+// (decisions/0015) The one-line policy swap: `new TwoQ(n)` type-checks into the SAME
+// `LiteCache` binding as every other member.
+const tq = new TwoQ<string, number>(10);
+const tqGot = tq.get("a");
+expectTrue<Equal<typeof tqGot, number | undefined>>();
+expectTrue<Equal<ReturnType<typeof tq.has>, boolean>>();
+expectTrue<Equal<typeof tq.capacity, number>>();
+const tqIface: LiteCache<string, number> = new TwoQ<string, number>(10);
+tqIface.put("k", 1);
+new TwoQ<number, number>(10, { keys: "int" });
+const tqTtl: LiteCache<number, number> = new TwoQ<number, number>(10, { ttl: 5 });
+expectTrue<Equal<ReturnType<typeof tqTtl.purgeStale>, number>>();
+
+// @ts-expect-error -- V is number; a string value is rejected on TwoQ too.
+tq.put("a", "not-a-number");
+
+// @ts-expect-error -- 'q' is not a valid keys backing (only 'int').
+new TwoQ<number, number>(10, { keys: "q" });
+
+// @ts-expect-error -- size is readonly on TwoQ.
+tq.size = 5;

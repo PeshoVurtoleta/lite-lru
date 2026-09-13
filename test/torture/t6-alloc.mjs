@@ -31,9 +31,9 @@
  * rejects the window; T9 exercises the same alloc lane in-process.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../../Lru.js';
 import {
-    runOpsGate, runAllocsGate, BREAK, check, die,
+    runOpsGate, runAllocsGate, BREAK, check, die, makePrng,
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
     CountedSieve, SIEVE_WRITES_HIT_LINKS, SIEVE_WRITES_HIT_VIS,
     CountedS3Fifo, S3FIFO_WRITES_HIT_LINKS, S3FIFO_WRITES_HIT_VIS,
@@ -44,6 +44,71 @@ const CAP = 4096;      // power of 2 so the hot body masks its key with & MASK
 const MASK = CAP - 1;
 const OPS = 60000;
 const WARMUP = 4000;
+
+/**
+ * A MIXED, recurring int-key stream (decisions/0015) for the Slru/TwoQ gates. Built ONCE
+ * (before any measured window -- the array allocation is off the hot path), then indexed
+ * with a masked cursor so the measured closure allocates nothing. Unlike a
+ * strictly-increasing stream (which only exercises insert/evict/ghost-ADD), the mix drives
+ * the DISTINGUISHING lanes at capacity: a hot working set LARGER than the protected/Am
+ * capacity (>= 2nd hits -> promotions, and overflow -> demotions on Slru; Am-hits on TwoQ)
+ * plus cold churn and deliberate re-references of recently-evicted keys (A1out -> ghost
+ * ADMITS on TwoQ). All keys are non-negative int32 (valid keys:'int').
+ */
+function buildMixedStream(len, hotSize, a1inCap, seed) {
+    const prng = makePrng(seed);
+    const s = new Int32Array(len);
+    let cold = hotSize; // cold keys live above the hot range
+    for (let i = 0; i < len; i++) {
+        const r = prng() % 10;
+        if (r < 5) {
+            s[i] = prng() % hotSize;                 // hot recurrence -> 2nd hits, promotions, Am-hits
+        } else if (r < 8) {
+            s[i] = cold++;                           // fresh cold churn -> insert + evict-to-ghost
+        } else {
+            const back = a1inCap + (prng() % 512);   // a key evicted ~a1inCap ops ago (still in ghost)
+            let k = cold - back;
+            if (k < hotSize) k = prng() % hotSize;   // fallback early on (before enough cold churn)
+            s[i] = k;                                // re-reference -> ghost ADMIT (TwoQ) / re-hit (Slru)
+        }
+    }
+    return s;
+}
+
+const STREAM_LEN = 1 << 16; // 65536, power of two so the cursor masks
+const STREAM_MASK = STREAM_LEN - 1;
+const HOT_SIZE = 3600;      // > protectedCap(3277) so protected OVERFLOWS -> demotions fire
+const PREFILL = 40000;      // reach steady state (protected/Am filled past their caps) pre-measurement
+
+/** Segment tags, mirrored from Lru.js (decisions/0015): 0 = probation/A1in, 1 = protected/Am. */
+const SEG_A = 0, SEG_B = 1;
+
+/** An Slru whose `_touch` counts promotions + protected-overflow demotions via plain integer
+ *  field increments (zero-alloc; never on a MEASURED window -- used only for lane coverage). */
+class CoveredSlru extends Slru {
+    constructor(cap, opts) { super(cap, opts); this._promotions = 0; this._demotions = 0; }
+    _touch(s) {
+        const before = this._seg[s];
+        const protBefore = this._protSize;
+        super._touch(s);
+        if (before === SEG_A && this._seg[s] === SEG_B) {
+            this._promotions++;
+            if (this._protSize === protBefore) this._demotions++; // overflow kept protected flat -> a demote fired
+        }
+    }
+}
+
+/** A TwoQ counting ghost-ADMITs (_ghostConsume fires only on an A1out re-reference), Am-hits and
+ *  A1in-stays via plain integer increments (zero-alloc; lane coverage only, never measured). */
+class CoveredTwoQ extends TwoQ {
+    constructor(cap, opts) { super(cap, opts); this._ghostAdmits = 0; this._amHits = 0; this._a1Stays = 0; }
+    _ghostConsume(key) { this._ghostAdmits++; super._ghostConsume(key); }
+    get(key) {
+        const s = this._store.get(key);
+        if (s >= 0) { if (this._seg[s] === SEG_B) this._amHits++; else this._a1Stays++; }
+        return super.get(key);
+    }
+}
 
 /** Retained sink for the BREAK control -- survives GC so arrayBuffers grows. */
 const leak = [];
@@ -415,6 +480,164 @@ export async function run() {
                 ' cells, expected ' + WTINYLFU_WRITES_WINDOW_MRU_REHIT);
     }
 
+    // --- Gate SLRU: the Slru member -- STRICT zero-alloc across EVERY lane (decisions/0015)
+    // A strictly-increasing key stream would only exercise insert/evict; it would NEVER
+    // reach the lanes that DISTINGUISH Slru -- promote-on-2nd-hit (probation->protected)
+    // and protected-overflow demote (protected->probation). So the measured window runs a
+    // MIXED, recurring int-key stream (built ONCE, off the hot path) as the canonical cache
+    // access -- get, and put on a miss -- at capacity: a hot working set LARGER than
+    // protectedCap forces continuous 2nd-hit promotions AND overflow demotions, while cold
+    // churn drives eviction. Zero-alloc: the closure indexes a preallocated Int32Array and
+    // does int get/put only. _seg / _vis / _next / _prev / the int index buffers never grow.
+    // A separate, UN-measured coverage run over the SAME stream (a CoveredSlru counting via
+    // zero-alloc integer field increments) proves the steady-state window actually TRIGGERS
+    // the promote AND demote lanes -- so a regression that stops exercising a lane fails
+    // LOUD instead of silently reading 0 B/op.
+    const A1IN_CAP = Math.max(1, Math.round(CAP * 0.25)); // spacing base for re-references
+    const slruStream = buildMixedStream(STREAM_LEN, HOT_SIZE, A1IN_CAP, 0x5717c0de);
+    const lcache = new Slru(CAP, { keys: 'int' });
+    const lsink = new Int32Array(1);
+    let lsi = 0;
+    // The op: get, put on a miss, and a SECOND get on a hit -- so a resident probation
+    // key reaches its 2nd hit (promotion) quickly, saturating protected past its cap so
+    // overflow demotions fire steadily. Zero-alloc (stream index + int get/put only).
+    const slruHot = () => {
+        const k = slruStream[lsi & STREAM_MASK]; lsi++;
+        const v = lcache.get(k);
+        if (v === undefined) lcache.put(k, k); else { lsink[0] += v | 0; lcache.get(k); }
+    };
+    for (let i = 0; i < PREFILL; i++) slruHot(); // reach steady state (protected filled past its cap)
+    check(lcache.size === CAP, () => 't6 Gate SLRU: prefill did not reach capacity (size ' + lcache.size + ')');
+    const lNextBytes = lcache._next.buffer.byteLength;
+    const lPrevBytes = lcache._prev.buffer.byteLength;
+    const lSegBytes = lcache._seg.buffer.byteLength;
+    const lVisBytes = lcache._vis.buffer.byteLength;
+    const lIxSlotBytes = lcache._store._ixSlot.buffer.byteLength;
+    const lIxKeyBytes = lcache._store._ixKey.buffer.byteLength;
+    const gl = runOpsGate(slruHot, { ops: OPS, warmup: WARMUP });
+    check(lcache._next.buffer.byteLength === lNextBytes,
+        () => 't6 Gate SLRU: _next.buffer grew ' + lNextBytes + ' -> ' + lcache._next.buffer.byteLength);
+    check(lcache._prev.buffer.byteLength === lPrevBytes,
+        () => 't6 Gate SLRU: _prev.buffer grew ' + lPrevBytes + ' -> ' + lcache._prev.buffer.byteLength);
+    check(lcache._seg.buffer.byteLength === lSegBytes,
+        () => 't6 Gate SLRU: _seg.buffer grew ' + lSegBytes + ' -> ' + lcache._seg.buffer.byteLength);
+    check(lcache._vis.buffer.byteLength === lVisBytes,
+        () => 't6 Gate SLRU: _vis.buffer grew ' + lVisBytes + ' -> ' + lcache._vis.buffer.byteLength);
+    check(lcache._store._ixSlot.buffer.byteLength === lIxSlotBytes,
+        () => 't6 Gate SLRU: _ixSlot.buffer grew ' + lIxSlotBytes + ' -> ' + lcache._store._ixSlot.buffer.byteLength);
+    check(lcache._store._ixKey.buffer.byteLength === lIxKeyBytes,
+        () => 't6 Gate SLRU: _ixKey.buffer grew ' + lIxKeyBytes + ' -> ' + lcache._store._ixKey.buffer.byteLength);
+    check(lcache.size === CAP, () => 't6 Gate SLRU: churn did not stay at capacity (size ' + lcache.size + ')');
+    check(lcache._protSize === lcache._protectedCap,
+        () => 't6 Gate SLRU: protected did not fill to its cap (protSize ' + lcache._protSize + ' != ' + lcache._protectedCap + ') -- promotions/demotions not exercised');
+    if (!gl.report.ok) {
+        const g = gl.summary.gc;
+        die('t6 Gate SLRU (mixed churn) ops gate rejected -- verdict=' + gl.report.verdict +
+            ' source=' + gl.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gla = runAllocsGate(slruHot, { iterations: 50000, batches: 8 });
+    if (!gla.ok) {
+        die('t6 Gate SLRU (mixed churn) retained-alloc gate rejected -- verdict=' + gla.report.verdict +
+            ' settled=' + gla.result.settled + ' bytesPerCall=' + gla.bytesPerCall);
+    }
+    // Lane coverage (UN-measured): the SAME stream through a counting subclass; the counters
+    // are reset AFTER the prefill so they reflect ONLY the steady-state window.
+    const covL = new CoveredSlru(CAP, { keys: 'int' });
+    let clsi = 0;
+    const covLHot = () => {
+        const k = slruStream[clsi & STREAM_MASK]; clsi++;
+        if (covL.get(k) === undefined) covL.put(k, k); else covL.get(k);
+    };
+    for (let i = 0; i < PREFILL; i++) covLHot();
+    covL._promotions = 0; covL._demotions = 0; // count only the steady-state window
+    for (let i = 0; i < OPS; i++) covLHot();
+    check(covL._promotions > 0,
+        () => 't6 Gate SLRU: the window triggered 0 probation->protected promotions (lane not covered)');
+    check(covL._demotions > 0,
+        () => 't6 Gate SLRU: the window triggered 0 protected-overflow demotions (lane not covered)');
+    process.stderr.write('t6 Gate SLRU: ' + gla.bytesPerCall.toFixed(5) +
+        ' B/op mixed churn (' + OPS + ' ops window, capacity ' + CAP + '); lanes covered: promotions=' +
+        covL._promotions + ' demotions=' + covL._demotions + '\n');
+
+    // --- Gate TWOQ: the TwoQ member -- STRICT zero-alloc across EVERY lane (decisions/0015)
+    // As with Slru, a strictly-increasing stream would only exercise insert/evict/ghost-ADD.
+    // The measured window runs the MIXED recurring stream (canonical get + put-on-miss) at
+    // capacity so it reaches the DISTINGUISHING lanes: ghost ADMIT (a key in A1out re-
+    // referenced -> straight to Am), Am-hit (move-to-MRU), and A1in-stay. Zero-alloc: the
+    // closure indexes a preallocated stream + int get/put. _seg / _next / _prev / _ixSlot /
+    // _ixKey / the ghost buffers never grow, and `_gLen <= _ghostCap` always. A separate,
+    // UN-measured CoveredTwoQ run over the SAME stream proves the steady-state window fires
+    // the ghost-admit, Am-hit and A1in-stay lanes at least once each (loud on regression).
+    const twoqStream = buildMixedStream(STREAM_LEN, HOT_SIZE, A1IN_CAP, 0x2907beef);
+    const qcache = new TwoQ(CAP, { keys: 'int' });
+    const qsink = new Int32Array(1);
+    let qsi = 0;
+    const twoqHot = () => {
+        const k = twoqStream[qsi & STREAM_MASK]; qsi++;
+        const v = qcache.get(k);
+        if (v === undefined) qcache.put(k, k); else { qsink[0] += v | 0; qcache.get(k); }
+    };
+    for (let i = 0; i < PREFILL; i++) twoqHot(); // reach steady state
+    check(qcache.size === CAP, () => 't6 Gate TWOQ: prefill did not reach capacity (size ' + qcache.size + ')');
+    const qNextBytes = qcache._next.buffer.byteLength;
+    const qPrevBytes = qcache._prev.buffer.byteLength;
+    const qSegBytes = qcache._seg.buffer.byteLength;
+    const qIxSlotBytes = qcache._store._ixSlot.buffer.byteLength;
+    const qIxKeyBytes = qcache._store._ixKey.buffer.byteLength;
+    const qgRingBytes = qcache._gRing.buffer.byteLength;
+    const qgixKeyBytes = qcache._gixKey.buffer.byteLength;
+    const qgixStateBytes = qcache._gixState.buffer.byteLength;
+    const gq = runOpsGate(twoqHot, { ops: OPS, warmup: WARMUP });
+    check(qcache._next.buffer.byteLength === qNextBytes,
+        () => 't6 Gate TWOQ: _next.buffer grew ' + qNextBytes + ' -> ' + qcache._next.buffer.byteLength);
+    check(qcache._prev.buffer.byteLength === qPrevBytes,
+        () => 't6 Gate TWOQ: _prev.buffer grew ' + qPrevBytes + ' -> ' + qcache._prev.buffer.byteLength);
+    check(qcache._seg.buffer.byteLength === qSegBytes,
+        () => 't6 Gate TWOQ: _seg.buffer grew ' + qSegBytes + ' -> ' + qcache._seg.buffer.byteLength);
+    check(qcache._store._ixSlot.buffer.byteLength === qIxSlotBytes,
+        () => 't6 Gate TWOQ: _ixSlot.buffer grew ' + qIxSlotBytes + ' -> ' + qcache._store._ixSlot.buffer.byteLength);
+    check(qcache._store._ixKey.buffer.byteLength === qIxKeyBytes,
+        () => 't6 Gate TWOQ: _ixKey.buffer grew ' + qIxKeyBytes + ' -> ' + qcache._store._ixKey.buffer.byteLength);
+    check(qcache._gRing.buffer.byteLength === qgRingBytes,
+        () => 't6 Gate TWOQ: ghost _gRing grew ' + qgRingBytes + ' -> ' + qcache._gRing.buffer.byteLength);
+    check(qcache._gixKey.buffer.byteLength === qgixKeyBytes,
+        () => 't6 Gate TWOQ: ghost _gixKey grew ' + qgixKeyBytes + ' -> ' + qcache._gixKey.buffer.byteLength);
+    check(qcache._gixState.buffer.byteLength === qgixStateBytes,
+        () => 't6 Gate TWOQ: ghost _gixState grew ' + qgixStateBytes + ' -> ' + qcache._gixState.buffer.byteLength);
+    check(qcache.size === CAP, () => 't6 Gate TWOQ: churn did not stay at capacity (size ' + qcache.size + ')');
+    check(qcache._gLen <= qcache._ghostCap, () => 't6 Gate TWOQ: ghost exceeded its bound (' + qcache._gLen + ')');
+    check(qcache._amSize > 0, () => 't6 Gate TWOQ: Am empty (ghost-admit lane not exercised)');
+    if (!gq.report.ok) {
+        const g = gq.summary.gc;
+        die('t6 Gate TWOQ (mixed churn) ops gate rejected -- verdict=' + gq.report.verdict +
+            ' source=' + gq.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gqa = runAllocsGate(twoqHot, { iterations: 50000, batches: 8 });
+    if (!gqa.ok) {
+        die('t6 Gate TWOQ (mixed churn) retained-alloc gate rejected -- verdict=' + gqa.report.verdict +
+            ' settled=' + gqa.result.settled + ' bytesPerCall=' + gqa.bytesPerCall);
+    }
+    // Lane coverage (UN-measured): the SAME stream through a counting subclass; counters
+    // reset AFTER the prefill so they reflect ONLY the steady-state window.
+    const covQ = new CoveredTwoQ(CAP, { keys: 'int' });
+    let cqsi = 0;
+    const covQHot = () => {
+        const k = twoqStream[cqsi & STREAM_MASK]; cqsi++;
+        if (covQ.get(k) === undefined) covQ.put(k, k); else covQ.get(k);
+    };
+    for (let i = 0; i < PREFILL; i++) covQHot();
+    covQ._ghostAdmits = 0; covQ._amHits = 0; covQ._a1Stays = 0;
+    for (let i = 0; i < OPS; i++) covQHot();
+    check(covQ._ghostAdmits > 0,
+        () => 't6 Gate TWOQ: the window triggered 0 A1out->Am ghost admits (lane not covered)');
+    check(covQ._amHits > 0,
+        () => 't6 Gate TWOQ: the window triggered 0 Am-hit move-to-MRU (lane not covered)');
+    check(covQ._a1Stays > 0,
+        () => 't6 Gate TWOQ: the window triggered 0 A1in-stay hits (lane not covered)');
+    process.stderr.write('t6 Gate TWOQ: ' + gqa.bytesPerCall.toFixed(5) +
+        ' B/op mixed churn (' + OPS + ' ops window, capacity ' + CAP + '); lanes covered: ghostAdmits=' +
+        covQ._ghostAdmits + ' amHits=' + covQ._amHits + ' a1Stays=' + covQ._a1Stays + '\n');
+
     // --- Gate TTL-OFF: byte-identical hot path (decisions/0017) -------------------
     // The off-path decision (D17): a single monomorphic `this._exp === null` guard,
     // KEPT because it costs zero writes on the ttl-OFF path. Proof (a): a non-ttl cache
@@ -501,6 +724,8 @@ export async function run() {
         ['Sieve', new Sieve(CAP)],
         ['S3Fifo', new S3Fifo(CAP)],
         ['WTinyLfu', new WTinyLfu(CAP)],
+        ['Slru', new Slru(CAP)],
+        ['TwoQ', new TwoQ(CAP)],
     ];
     const iterSink = new Int32Array(1);
     for (let m = 0; m < iterMembers.length; m++) {

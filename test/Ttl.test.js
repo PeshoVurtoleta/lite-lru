@@ -1,8 +1,9 @@
 /**
  * @zakkster/lite-lru -- node:test boundary suite for opt-in TTL (decisions/0017,
- * session S10). Parameterized over ALL FOUR family members (LiteLru, Sieve,
- * S3Fifo, WTinyLfu) so a TTL regression in any one member's `get`/`put`/`has`/
- * `peek`/`purgeStale` override is caught the same way. Drives an INJECTED virtual
+ * session S10; extended S7-QA to the S7 Slru/TwoQ members). Parameterized over ALL
+ * SIX family members (LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ) so a TTL
+ * regression in any one member's `get`/`put`/`has`/`peek`/`purgeStale` override is
+ * caught the same way. Drives an INJECTED virtual
  * clock throughout -- never real-time `setTimeout`/sleep -- so the suite is fast
  * and deterministic. validate() (the conservation invariant, which already checks
  * the `_exp` column: fixed size, never grows, every FREE slot reads Infinity) runs
@@ -19,16 +20,19 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../Lru.js';
 import { validate } from './validate.mjs';
 
-/** Every family member, so each test body runs FOUR TIMES over the exact same
- *  LiteCache surface (the TTL contract is stated once on LiteCache, decisions/0017). */
+/** Every family member, so each test body runs SIX TIMES over the exact same
+ *  LiteCache surface (the TTL contract is stated once on LiteCache, decisions/0017).
+ *  Slru/TwoQ ride the identical `_exp`/`_clock`/`_reap` substrate (decisions/0015). */
 const MEMBERS = [
     { name: 'LiteLru', Ctor: LiteLru },
     { name: 'Sieve', Ctor: Sieve },
     { name: 'S3Fifo', Ctor: S3Fifo },
     { name: 'WTinyLfu', Ctor: WTinyLfu },
+    { name: 'Slru', Ctor: Slru },
+    { name: 'TwoQ', Ctor: TwoQ },
 ];
 
 /** A hoisted, mutable virtual clock -- zero-alloc per call, fully controlled by the

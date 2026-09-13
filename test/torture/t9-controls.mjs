@@ -21,9 +21,10 @@
  *   C-stats-counts-peek   a peek that credits a hit    -> brute-tally parity fails
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ } from '../../Lru.js';
 import {
-    runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, wrapWTinyLfu, validate,
+    runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, wrapWTinyLfu,
+    wrapSlru, wrapTwoQ, validate,
     lruPolicy, check, die, makePrng,
 } from './harness.mjs';
 import { makeLruOracle } from './oracles/lru.mjs';
@@ -31,6 +32,8 @@ import { makeFifoOracle } from './oracles/fifo.mjs';
 import { makeSieveOracle } from './oracles/sieve.mjs';
 import { makeS3FifoOracle } from './oracles/s3fifo.mjs';
 import { makeWTinyLfuOracle } from './oracles/wtinylfu.mjs';
+import { makeSlruOracle } from './oracles/slru.mjs';
+import { makeTwoQOracle } from './oracles/twoq.mjs';
 
 const NIL = -1;
 
@@ -132,6 +135,46 @@ class GraduateOnTouchS3Fifo extends S3Fifo {
         }
         return this._vals[s];
     }
+}
+
+/** C-slru-promote-on-first-hit (decisions/0015): an Slru whose `_touch` promotes a
+ *  probation entry to protected on the FIRST hit instead of the SECOND. The pinned law
+ *  (D15) is promote-on-2nd-hit (get once stays probation); promoting eagerly changes the
+ *  probation/protected populations, so the next-eviction victim drifts from the pure
+ *  Slru oracle. (Segments stay coherent, so this is a semantic divergence, not a crash.) */
+class PromoteOnFirstHitSlru extends Slru {
+    _touch(s) {
+        if (this._seg[s] === 1) { // SLRU_PROTECTED
+            if (this._protHead !== s) { this._detach(s); this._pushProtected(s); }
+            return;
+        }
+        // BUG: promote on the FIRST hit (no 2nd-hit gate via _vis).
+        this._detach(s);
+        this._pushProtected(s);
+        if (this._protSize > this._protectedCap) {
+            const d = this._protTail;
+            this._detach(d);
+            this._vis[d] = 0;
+            this._pushProbation(d);
+        }
+    }
+}
+
+/** C-twoq-unbounded-ghost (decisions/0015, D15.3): a TwoQ whose A1out ghost is UNBOUNDED
+ *  (it never drops the oldest key when full). The ghost bound is load-bearing: a bounded
+ *  ghost forgets old A1in-evicted keys, so a long-ago-evicted key re-enters A1in; an
+ *  unbounded ghost remembers it forever and admits it straight to Am. That divergent
+ *  admission drifts the segment populations and the next-eviction victim from the pure
+ *  (bounded) TwoQ oracle. Uses the default Map backing + a growable Set so the override is
+ *  self-consistent (the fixed ring buffers are simply unused). */
+class UnboundedGhostTwoQ extends TwoQ {
+    constructor(cap, options) {
+        super(cap, options);
+        this._ubGhost = new Set(); // BUG: unbounded membership -- never ages out
+    }
+    _ghostHas(key) { return this._ubGhost.has(key); }
+    _ghostAdd(key) { this._ubGhost.add(key); this._gLen = this._ubGhost.size; }
+    _ghostConsume(key) { this._ubGhost.delete(key); this._gLen = this._ubGhost.size; }
 }
 
 /** C9: a W-TinyLFU whose admission ALWAYS admits the candidate (never rejects on a
@@ -373,6 +416,42 @@ export function run() {
         if (r.ok) die('t9 C9: a W-TinyLFU that admits-always did NOT diverge from the wtinylfu oracle (no teeth)');
         check(r.why === 'victim' || r.why === 'value' || r.why === 'size',
             () => 't9 C9: divergence reason was ' + r.why + ' (unexpected)');
+    }
+
+    // --- C-slru-promote-on-first-hit (decisions/0015): promote-on-1st-hit -> diverges
+    // The Slru headline is promote-on-2nd-hit (get once stays probation). Promoting on the
+    // first hit changes the probation/protected populations, so the next-eviction victim
+    // MUST drift from the pure Slru oracle. Non-vacuity: the CORRECT Slru agrees (t5).
+    {
+        const brokenPolicy = {
+            name: 'slru-promote-on-first-hit',
+            real: (cap) => wrapSlru(new PromoteOnFirstHitSlru(cap)),
+            oracle: (cap) => makeSlruOracle(cap),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x51501, keyspace: 40 });
+        if (r.ok) die('t9 C-slru-promote-on-first-hit: promoting on the FIRST hit did NOT diverge from the slru oracle (no teeth)');
+    }
+
+    // --- C-twoq-unbounded-ghost (decisions/0015, D15.3): an unbounded A1out -> diverges
+    // The ghost bound is load-bearing: a bounded ghost forgets old A1in-evicted keys; an
+    // unbounded one admits a long-ago-evicted key straight to Am, drifting the victim from
+    // the pure (bounded) TwoQ oracle. Non-vacuity: the CORRECT TwoQ agrees (t5). This also
+    // proves the risk the planner flagged (an unbounded ghost drifts) is actually caught.
+    {
+        const brokenPolicy = {
+            name: 'twoq-unbounded-ghost',
+            real: (cap) => wrapTwoQ(new UnboundedGhostTwoQ(cap)),
+            oracle: (cap) => makeTwoQOracle(cap),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x2001, keyspace: 40 });
+        if (r.ok) die('t9 C-twoq-unbounded-ghost: an unbounded A1out ghost did NOT diverge from the twoq oracle (no teeth)');
+        // Teeth on validate() too: the unbounded ghost violates the conservation bound.
+        const c = new UnboundedGhostTwoQ(8);
+        for (let i = 0; i < 200; i++) c.put(i, i); // distinct keys -> ghost grows past ghostCap
+        check(c._gLen > c._ghostCap, () => 't9 C-twoq-unbounded-ghost: the ghost did not actually exceed its bound (setup invalid)');
+        let threw = false;
+        try { validate(c); } catch (e) { threw = true; }
+        if (!threw) die('t9 C-twoq-unbounded-ghost: validate() passed a ghost over its bound (the ghost-bound term is toothless)');
     }
 
     // --- C-skip-gate (decisions/0017): a get that skips the ttl gate -> diverges ---
