@@ -7,6 +7,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.9.0] - 2026-09-13
+
+### Added
+
+- **Animated policy-visualization demo** (decisions/0022, D22; ROADMAP S13): a
+  never-shipped in-repo `demo/` that steps ONE seeded trace through all seven members
+  and renders each member's structure live, drawn STRICTLY from that member's `dump()`
+  snapshot -- the snapshot is the visualization model, with no shadow re-implementation
+  of policy mechanics -- and a running "% of Belady optimal" readout per member.
+  - `demo/Visualize.mjs` (a headless engine and the `npm run demo` entry; members are
+    built with a fixed clock so frames are deterministic), `demo/renderers.mjs` (one
+    renderer per member, each projecting only fields present in `dump()`),
+    `demo/visuals.html` (the browser page; the full redraw is throttled while
+    op-stepping runs at the speed control), and `demo/serve.mjs` (a zero-dependency Node
+    server that computes the trace and Belady OPT server-side and serves the page;
+    fail-closed on bad query params, static route confined to the repo root, `/`
+    redirects to the page).
+  - `demo/Demo.test.mjs`: 24 dev-only `node:test` cases (run via
+    `node --test demo/Demo.test.mjs`; NOT part of `npm test`) proving the rendered model
+    deep-equals `dump()` for all seven members, live hit/miss parity versus a
+    from-scratch replay, the `pctOptimal` formula (fail-closed to 0 when the optimum is
+    0), bounded allocation, determinism, and the `/` entry-URL redirect.
+
+### Changed
+
+- Three-place version sync to 1.9.0 (`VERSION`, `package.json`, `llms.txt`), plus the
+  seven member `VERSION` asserts and the README constants table.
+- The shipped surface is unchanged from 1.8.0: `Lru.js`, `Lru.d.ts`, and
+  `benchmark/Bench.mjs` are byte-identical, so the published tarball differs from 1.8.0
+  only in version strings and documentation. The demo is a dev artifact excluded from
+  the tarball (the pack gate asserts `demo/` absent), and zero runtime dependencies are
+  preserved (the browser path imports only `../Lru.js`).
+
 ## [1.8.0] - 2026-09-13
 
 ### Added

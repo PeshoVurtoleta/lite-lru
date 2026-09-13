@@ -316,7 +316,7 @@ Run directly, it prints a table; imported, it returns structured results and pri
 
 | Constant  | Value     | Meaning                                                       |
 | --------- | --------- | ------------------------------------------------------------ |
-| `VERSION` | `'1.8.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
+| `VERSION` | `'1.9.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
 
 All seven members and `VERSION` are named exports; `LiteLru` is also the default export.
 
@@ -459,6 +459,19 @@ npm run verify         # test + test:types + torture + controls, the publish gat
 ```
 
 The torture suite runs tiers strictly sequentially: `t0` recency/policy laws, `t1` degenerate keys/values (the D7 undefined-value case included), `t2` adversarial sequences + the conservation invariant, `t5` differential fuzz of all members (on the default AND `keys: 'int'` backings) against independent brute-force oracles, `t6` the zero-alloc gate + the writes-per-hit counter, `t7` a ~4096-cycle soak with a WeakRef reachability census, `t8` the Belady OPT gate (the shipped `beladyOpt` differential-tested against a brute-force OPT, plus the optimality bound `optHits >= memberHits` for every member on every trace), and `t9` the controls -- each gate driven by a deliberately-broken variant that MUST fail, so no gate is decorative. `test/` and `decisions/` never enter the tarball (`npm pack --dry-run` proves it). No gate output is a FAIL.
+
+---
+
+## Watch the policies
+
+A **dev-only** demo (in `demo/`, **never in the npm tarball**) animates ONE shared trace through all seven members side by side, drawing each panel STRICTLY from that member's live `dump()` snapshot after every op -- the Sieve hand + visited bits, the S3-FIFO / 2Q / ARC ghost rings, the W-TinyLFU sketch heat, the ARC adaptive `p` bar -- with a running **% of Belady optimal** line per member. No shadow state: what you see is literally the cache's own snapshot (the same serial form `restore()` consumes). The "one interface, different policy" thesis, seen rather than read.
+
+```bash
+npm run demo           # headless: prints per-member hit% + %-of-optimal for one trace
+npm run demo:serve     # zero-dep Node server, then open http://localhost:8013/
+```
+
+The browser page (`demo/visuals.html`) imports only `../Lru.js`; a tiny zero-dep server (`demo/serve.mjs`) computes the trace + Belady OPT with `Bench.mjs` and serves them as JSON, because the page cannot import `Bench.mjs` (it uses a Node builtin). See `decisions/0022-demo.md` for the "dump() IS the visualization model" ruling.
 
 ---
 

@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lite-lru -- policy visualization</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f10;
+    --panel: #0c1512;
+    --edge: #1d2b25;
+    --text: #cfe8d8;
+    --dim: #7fa591;
+    --accent: #9fe3bf;
+    --hi: #ffcf5a;
+    --btn: #12261c;
+    --btn-edge: #2b5a44;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 0.9rem/1.55 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 1.5rem 1rem 4rem;
+  }
+  h1 { font-size: 1.2rem; margin: 0 0 0.25rem; color: #eafff2; letter-spacing: 0.03rem; }
+  .sub { color: var(--dim); margin: 0 0 0.75rem; text-align: center; max-width: 56rem; }
+  .sub code, code { color: var(--accent); }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 0.5rem 0.75rem; align-items: center;
+    justify-content: center; width: 100%; max-width: 60rem;
+    border: 1px solid var(--edge); border-radius: 0.6rem; padding: 0.75rem 1rem;
+    background: var(--panel); margin-bottom: 1rem;
+  }
+  label { color: var(--dim); display: inline-flex; gap: 0.35rem; align-items: center; }
+  select, input[type="number"] {
+    font: inherit; background: #07110c; color: var(--accent);
+    border: 1px solid var(--btn-edge); border-radius: 0.35rem; padding: 0.2rem 0.4rem;
+  }
+  input[type="number"] { width: 6rem; }
+  button {
+    font: inherit; font-size: 0.82rem; background: var(--btn); color: var(--accent);
+    border: 1px solid var(--btn-edge); border-radius: 0.35rem; padding: 0.3rem 0.75rem;
+    cursor: pointer;
+  }
+  button.on { background: #113355; border-color: #4466ff; color: #bcd0ff; }
+  @media (hover: hover) {
+    button:hover { background: #17301f; }
+    button.on:hover { background: #16305a; }
+  }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(29rem, 1fr));
+    gap: 1rem; width: 100%; max-width: 62rem;
+  }
+  .panel { border: 1px solid var(--edge); border-radius: 0.6rem; background: var(--panel); padding: 0.6rem 0.75rem 0.75rem; }
+  .phead { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.25rem; }
+  .pname { color: #eafff2; font-size: 1rem; }
+  .pstat { color: var(--dim); font-size: 0.78rem; }
+  .pstat b { color: var(--hi); }
+  canvas { display: block; width: 100%; height: auto; border-radius: 0.4rem; border: 1px solid var(--edge); background: #04120c; }
+  .status { color: var(--dim); margin: 0.5rem 0; min-height: 1.2rem; }
+  .status b { color: var(--accent); }
+  .foot { margin-top: 1.5rem; color: #46604f; font-size: 0.7rem; text-align: center; max-width: 52rem; }
+</style>
+</head>
+<body>
+  <h1>lite-lru &mdash; watch the policies</h1>
+  <p class="sub">
+    ONE shared trace fed to all seven members. Each panel is drawn STRICTLY from that
+    member's live <code>dump()</code> snapshot after every op &mdash; no shadow state. The
+    <b>% of Belady optimal</b> line is the clairvoyant ceiling no policy can beat. Served by
+    <code>demo/serve.mjs</code>; imports only <code>../Lru.js</code>.
+  </p>
+
+  <div class="controls">
+    <label>trace
+      <select id="kind">
+        <option value="zipf">zipf (skewed)</option>
+        <option value="loop">loop (scan &gt; cap)</option>
+        <option value="scan">scan (one-hit flood)</option>
+        <option value="uniform">uniform (random)</option>
+      </select>
+    </label>
+    <label>seed <input id="seed" type="number" min="1" step="1"></label>
+    <label>capacity <input id="cap" type="number" min="1" step="1"></label>
+    <label>length <input id="length" type="number" min="1" step="100"></label>
+    <button id="load">load trace</button>
+    <button id="play">play</button>
+    <button id="stepBtn">step</button>
+    <label>speed <input id="speed" type="number" min="1" max="500" step="1"></label>
+  </div>
+
+  <p class="status" id="status">loading...</p>
+
+  <div class="grid" id="grid"></div>
+
+  <p class="foot">
+    Repo-only dev artifact (decisions/0022, D22); never in the npm tarball. Occupancy only:
+    dump() omits fixed geometry (segment/ghost/window capacities, sketch rows/width), so the
+    panels draw which slots are where, visited bits, the hand, ghost keys, Arc <code>p</code>,
+    and sketch counter values &mdash; never reconstructed capacities.
+  </p>
+
+<script type="module">
+import {
+  createEngine, step, frameModel, summary, MEMBER_NAMES,
+} from './Visualize.mjs';
+import { RENDERERS } from './renderers.mjs';
+
+// --- element refs cached once at init (lite-law: $-prefixed consts) ----------
+const $kind = document.getElementById('kind');
+const $seed = document.getElementById('seed');
+const $cap = document.getElementById('cap');
+const $length = document.getElementById('length');
+const $load = document.getElementById('load');
+const $play = document.getElementById('play');
+const $step = document.getElementById('stepBtn');
+const $speed = document.getElementById('speed');
+const $status = document.getElementById('status');
+const $grid = document.getElementById('grid');
+
+const CANVAS_W = 900;
+const CANVAS_H = 440;
+
+// --- initial control values (not hardcoded in HTML) --------------------------
+const DEFAULTS = { kind: 'zipf', seed: 1, cap: 32, length: 4000, speed: 30 };
+$kind.value = DEFAULTS.kind;
+$seed.value = DEFAULTS.seed;
+$cap.value = DEFAULTS.cap;
+$length.value = DEFAULTS.length;
+$speed.value = DEFAULTS.speed;
+
+// --- one panel (header + canvas) per member ----------------------------------
+const panels = {};
+for (let i = 0; i < MEMBER_NAMES.length; i++) {
+  const name = MEMBER_NAMES[i];
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+  const head = document.createElement('div');
+  head.className = 'phead';
+  const nm = document.createElement('span');
+  nm.className = 'pname';
+  nm.textContent = name;
+  const st = document.createElement('span');
+  st.className = 'pstat';
+  head.appendChild(nm);
+  head.appendChild(st);
+  const cv = document.createElement('canvas');
+  cv.width = CANVAS_W;
+  cv.height = CANVAS_H;
+  panel.appendChild(head);
+  panel.appendChild(cv);
+  $grid.appendChild(panel);
+  panels[name] = { stat: st, ctx: cv.getContext('2d') };
+}
+
+let engine = null;
+let playing = false;
+// The op-stepping cadence is driven by the speed control (every rAF), but the full
+// canvas redraw -- clear + 7x dump() (frameModel) + summary() -- is throttled to a
+// time accumulator so a fast play does not churn GC every frame. Routing draw
+// through dump() is still required; we just draw less often.
+const REDRAW_MS = 80; // ~12.5 Hz
+let lastDrawT = 0;
+
+// One full redraw: reads each member's live snapshot via dump() (the required
+// source), repaints every canvas, and refreshes the text readouts.
+function draw() {
+  const model = frameModel(engine);
+  const rows = summary(engine);
+  const rowByName = {};
+  for (let i = 0; i < rows.length; i++) rowByName[rows[i].name] = rows[i];
+  for (let i = 0; i < MEMBER_NAMES.length; i++) {
+    const name = MEMBER_NAMES[i];
+    const p = panels[name];
+    const g = p.ctx;
+    g.clearRect(0, 0, CANVAS_W, CANVAS_H);
+    g.fillStyle = '#04120c';
+    g.fillRect(0, 0, CANVAS_W, CANVAS_H);
+    RENDERERS[name].draw(g, model.members[name], { x: 12, y: 8, w: CANVAS_W - 24, h: CANVAS_H - 16 });
+    const r = rowByName[name];
+    p.stat.innerHTML = 'hit ' + (r.hitRate * 100).toFixed(1) +
+      '% &middot; <b>' + r.pctOptimal.toFixed(1) + '% OPT</b>';
+  }
+  $status.innerHTML = 'op <b>' + engine.index + ' / ' + engine.trace.length +
+    '</b> &middot; last key <b>' + engine.lastKey + '</b> &middot; OPT hit ' +
+    (engine.opt.hitRate * 100).toFixed(1) + '%';
+}
+
+// Step the engine `speed` ops (the cadence). Returns false when the trace is done.
+function stepMany() {
+  const speed = Math.max(1, Number($speed.value) | 0);
+  let more = true;
+  for (let i = 0; i < speed && more; i++) more = step(engine);
+  return more;
+}
+
+function loop(now) {
+  if (!playing) return;
+  const more = stepMany();
+  if (now - lastDrawT >= REDRAW_MS) { draw(); lastDrawT = now; }
+  if (!more) {
+    playing = false;
+    $play.textContent = 'play';
+    $play.classList.remove('on');
+    draw(); // always show the final state
+    return;
+  }
+  requestAnimationFrame(loop);
+}
+
+async function loadTrace() {
+  playing = false;
+  $play.textContent = 'play';
+  $play.classList.remove('on');
+  $status.textContent = 'loading trace...';
+  const kind = $kind.value;
+  const seed = Math.max(1, Number($seed.value) | 0);
+  const cap = Math.max(1, Number($cap.value) | 0);
+  const length = Math.max(1, Number($length.value) | 0);
+  const url = '/trace.json?kind=' + encodeURIComponent(kind) +
+    '&seed=' + seed + '&cap=' + cap + '&length=' + length;
+  let data;
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('server ' + resp.status);
+    data = await resp.json();
+    if (data.error) throw new Error(data.error);
+  } catch (err) {
+    $status.textContent = 'failed to load /trace.json (' + err.message +
+      ') -- run: npm run demo:serve';
+    return;
+  }
+  engine = createEngine({ trace: data.trace, cap: data.cap, opt: data.opt, kind: data.kind, seed: data.seed });
+  lastDrawT = 0;
+  draw();
+}
+
+$load.addEventListener('click', loadTrace);
+// A manual step advances exactly one op and always redraws (inspection, not playback).
+$step.addEventListener('click', () => { if (engine) { step(engine); draw(); } });
+$play.addEventListener('click', () => {
+  if (!engine) return;
+  playing = !playing;
+  $play.textContent = playing ? 'pause' : 'play';
+  $play.classList.toggle('on', playing);
+  if (playing) { lastDrawT = 0; requestAnimationFrame(loop); }
+});
+
+loadTrace();
+</script>
+</body>
+</html>

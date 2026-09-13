@@ -12,7 +12,7 @@ dependencies, node:test only. Ships a runnable + importable benchmark tool
 (Bench.mjs) with Belady OPT so a caller measures which policy fits their trace
 instead of guessing.
 
-## Status: 1.8.0 - snapshot / restore across all seven members: a COLD dump() + static restore(snap, opts?) over the shared substrate (the SoA columns ARE the serial form - D21.1), with NO field added to the substrate and NO branch in get/put/has/peek, so the existing hot paths stay byte-identical. A rehydrated cache makes IDENTICAL future eviction decisions vs an un-snapshotted twin: the slot layout is captured verbatim along with every member's future-eviction aux (SIEVE hand + visited bits, S3Fifo/TwoQ/Arc keys-only ghosts, WTinyLfu Count-Min sketch + aging counter, Arc p, _seg tags, _exp when ttl on) - dropping any of it is fail-OPEN and is pinned by t9 controls. restore() is fail-closed via a {f,m,cap,keys,ttl,t} tag: wrong format/member/backing/ttl/capacity, a corrupt/short/missing column (incl. the visited-bit column), an out-of-range or duplicate slot index, and entries > cap all throw [lite-lru] and never truncate (D21.3, capacity law honored). TTL is captured VERBATIM (absolute ms-epoch deadlines, NOT rebased; the capture time t is stamped so a future opt-in rebase needs no format bump - D21.5); a restored stats holder starts fresh (D21.6). Gate SNAP 0.00000 B/op on the restored hot path, dump 26.12 B/entry (<= 96 budget), writes-per-hit 0/5/4 unchanged - atop the no-tuning adaptive member Arc (1.7.0), the scan-resistant baselines Slru/TwoQ (1.6.0), opt-in zero-GC stats (1.5.0), zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool.
+## Status: 1.9.0 - a never-shipped in-repo demo/ (S13/D22) that animates all seven members on ONE shared trace, each panel drawn STRICTLY from that member's live dump() snapshot (no shadow state - the snapshot IS the visualization model) with a running % -of-Belady-optimal readout per member: the "one interface, different policy" family story made VISIBLE (e.g. on a zipf trace S3Fifo ~82% and Arc ~82.6% of the clairvoyant optimum, the simple baselines trailing). The SHIPPED surface is byte-identical to 1.8.0 - Lru.js / Lru.d.ts / benchmark/Bench.mjs are UNCHANGED (git diff empty); the demo is a dev artifact, excluded from the npm tarball (the pack gate asserts demo/ absent) and zero runtime deps hold (the browser path imports only ../Lru.js; a tiny zero-dep Node demo/serve.mjs supplies the trace + Belady OPT). Built atop snapshot / restore (1.8.0: a COLD dump() + static restore(snap, opts?) over the shared substrate, the SoA columns ARE the serial form, no substrate field / no hot-path branch, EXACT future-eviction round-trip with every member's aux captured verbatim, fail-closed restore tag {f,m,cap,keys,ttl,t}, TTL absolute-not-rebased - full detail under "## Snapshot / restore" below), the no-tuning adaptive member Arc (1.7.0), the scan-resistant baselines Slru/TwoQ (1.6.0), opt-in zero-GC stats (1.5.0), zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool.
 
 The family is the identity from v1.0.0: classic LRU is the reference member +
 differential oracle + honest floor, SIEVE is the headline, and the shipped
@@ -316,7 +316,11 @@ drops LiteLru's body from the bundle (and vice versa). The shared substrate is
 INTERNAL, not an export; there is NO subpath-per-policy. Bench.mjs is a separate
 runnable tool, not a second implementation.
 
-## API (1.8.0)
+## Demo (decisions/0022, D22; dev-only, NEVER shipped)
+
+demo/ animates ONE shared trace through all seven members, each panel drawn STRICTLY from that member's live dump() snapshot (D22.1, no shadow state), with a running %-of-Belady-optimal line. npm run demo (headless per-member summary via demo/Visualize.mjs) and npm run demo:serve (zero-dep Node server demo/serve.mjs -> http://localhost:8013/, browser page demo/visuals.html imports only ../Lru.js). demo/ is absent from files[]; Lru.js / Lru.d.ts / Bench.mjs are consumed, never edited.
+
+## API (1.9.0)
 
 Named exports from @zakkster/lite-lru:
 
@@ -327,7 +331,7 @@ Named exports from @zakkster/lite-lru:
 - Slru: the Segmented-LRU member.
 - TwoQ: the full-2Q member.
 - Arc: the Adaptive Replacement Cache member.
-- VERSION: '1.8.0'
+- VERSION: '1.9.0'
 
 Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 

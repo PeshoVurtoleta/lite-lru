@@ -25,7 +25,7 @@ function segOf(c, key) {
 }
 
 test('Arc: VERSION is the current, un-bumped value (moves only at /release)', () => {
-    assert.equal(VERSION, '1.8.0');
+    assert.equal(VERSION, '1.9.0');
 });
 
 test('Arc: a newcomer enters T1 (recent); a hit promotes it to T2 (frequent)', () => {

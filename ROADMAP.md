@@ -85,7 +85,7 @@ LiteMGLRU, meta-policy; distilled into DEBATE items 13-15).
 | CLOCK/ClockPro (out of family), async fetch (-> `lite-lru-fetch`), size-aware (-> `lite-cache-budget`) | `DEBATE.md` items 6/8/11 (out of core) |
 | Belady OPT reference (offline harness normalization) | **built + gated (S9, t8 gate + Bench.mjs)** |
 | LiteMGLRU (userspace Multi-Gen LRU) + self-measuring meta-policy | v2 research (DEBATE 14, RESEARCH.md) |
-| animated policy-visualization demo (each member's mechanics on one trace + % of optimal; in-repo demo/, never shipped) | post-1.0.0 S13 (DEBATE 16) |
+| animated policy-visualization demo (each member's mechanics on one trace + % of optimal; in-repo demo/, never shipped) | **built + gated (S13, v1.9.0 pending /release); draws strictly from dump() (S14); shipped surface untouched** |
 
 ---
 
@@ -1041,6 +1041,122 @@ DONE WHEN
   all seven members round-trip exactly + fail closed on every corruption; the existing
   hot paths stay byte-identical; controls fail
 
+===============================================================================
+# S13 -- v1.9.0 -- animated policy-visualization demo (DEBATE 16)  [BUILT -- awaiting /release 1.9.0]
+===============================================================================
+```markdown
+version_target: 1.9.0     # additive minor; demo is a dev artifact, shipped surface UNCHANGED
+status: implemented -- gated green (demo assertions), awaiting /release 1.9.0
+alloc: N/A on shipped hot paths (Lru.js UNCHANGED; the demo is never in the tarball)
+depends_on: [S4, S5, S6, S7, S8, S14]   # all seven members + dump() as the model
+decisions: [D22 (demo medium + "dump() IS the visualization model" + never-shipped)]
+blocks: []
+```
+WHAT LANDED (S13, working tree, uncommitted; VERSION still 1.8.0 until /release 1.9.0):
+  - A never-shipped demo/ that steps ONE seeded trace through all seven members and renders
+    each frame STRICTLY from dump() (v1.8.0) -- the snapshot IS the visualization model, so
+    the picture cannot diverge from the real cache. ZERO change to the shipped surface:
+    git diff Lru.js / Lru.d.ts / benchmark/Bench.mjs empty; dump() NOT widened; NO demo-only
+    introspection hook (D22 rejects it); demo/ NOT in package.json files[] (npm pack excludes
+    it); zero runtime deps (the browser path imports ONLY ../Lru.js -- Bench.mjs imports
+    node:url and is fenced behind a Node-only dynamic import).
+  - Files: decisions/0022-demo.md (D22); demo/serve.mjs (zero-dep Node server; /trace.json
+    builds the trace + beladyOpt via Bench.mjs server-side, fail-closed on bad kind/seed/cap,
+    static route confined to the repo root -- incl. an encoded-slash ..%2f traversal probe);
+    demo/Visualize.mjs (headless engine + `npm run demo` entry; members built with a FIXED
+    clock () => 0 so dump().t is stable and frames are deterministic); demo/renderers.mjs
+    (one renderer per member, model(snap) = pick(snap, BASE_FIELDS + declared fields) --
+    occupancy only; D22.5 records that dump() omits fixed geometry (segment/ghost/window caps,
+    sketch rows/width), an accepted S13 limitation, NOT a workaround); demo/visuals.html
+    (browser page: trace panel, 7 panels, transport, %-of-optimal; full redraw throttled to
+    ~12.5Hz, op-stepping at the speed cadence, draw still routed through dump()); demo/
+    Demo.test.mjs (24 node:test cases -- dev-only, run via `node --test demo/Demo.test.mjs`,
+    NOT in the shipped test/ suite). README "Watch the policies" + one llms.txt line; package
+    .json scripts demo/demo:serve (scripts only -- no files[]/version).
+  - PIPELINE: reviewer REJECTED once -- a FLAKY load-bearing gate (assertion 1 compared two
+    independent dump() calls, each stamping t: Date.now(), failing deepStrictEqual on t when
+    the ms ticked -- ~2/3 runs red). Owner ruling: real blocker -> back to coder. Fixed with
+    a fixed clock (t stable + frames deterministic) AND by comparing the renderer model to a
+    SINGLE captured snapshot; two folded nits (fail-closed pctOptimal===0 on an all-miss
+    trace, was 100; browser redraw throttled to kill per-rAF GC churn). Reviewer re-reviewed
+    APPROVED (teeth verified: drop/invent-a-field still fails; 11/11 clean runs; the fixed
+    clock masks nothing -- assertion 2 replays through the DEFAULT Date.now clock and still
+    matches). qa closed coverage gaps (16 tests: all-7 teeth, three trace kinds, degenerate
+    caps 1-4, determinism, keys:'int', the fail-closed %-OPT branch, createEngine boundary
+    matrix, serve.mjs validation + traversal) and found + fixed a REAL demo defect -- serve
+    .mjs used `Number(param) || default`, so cap=0/length=0 silently took the default instead
+    of failing closed ("null is not zero"); fixed to distinguish absent from present-invalid
+    (demo/serve.mjs only). Also removed a stray entity-encoded tool-call artifact from D22.
+    Finally, live browser verification (owner) caught what no headless test could: the server
+    served demo/visuals.html IN PLACE at "/", so the page's relative module imports resolved
+    against "/" (404) -- fixed with a 302 "/" -> /demo/visuals.html redirect (serve.mjs) + a
+    regression test pinning the 302; all seven panels then render at the advertised "/" URL,
+    drawn live from dump() (verified S3Fifo ~82% / Arc ~82.6% of Belady OPT on the zipf trace).
+  - Gates (demo-only; torture N/A -- no hot path touched): node --test demo/Demo.test.mjs
+    24/24, deterministic across repeated + --expose-gc runs; npm test 1077/1077 (shipped suite
+    unchanged); npm pack --dry-run 8 files, demo/ absent; ASCII-clean, no stray tags.
+GOAL
+  The moat's third pillar (DEBATE 10, "the harness shipped as a user-facing tool") made
+  VISIBLE. ONE shared trace fed to ALL SEVEN members side by side; each drawn with its OWN
+  mechanics as ops stream (LiteLru head-promote relinks; Sieve visited-bit flip + hand
+  sweep on evict; S3Fifo small/main/ghost; WTinyLfu window/probation/protected + sketch
+  heat; Slru probation/protected; TwoQ A1in/Am/A1out; Arc T1/T2/B1/B2 + the adaptive p
+  bar), with a running hit-ratio-vs-Belady-OPT ("% of optimal") readout per member. The
+  "one interface, different policy" thesis SEEN, not just read.
+THE DESIGN (the S14 tie-in -- the crux; -> D22)
+  - dump() IS THE VISUALIZATION MODEL. The demo reads each member's live state via dump()
+    (S14) after each op and renders strictly from that SNAPSHOT -- the same serial form
+    restore() consumes -- so what is on screen is literally the cache's state (Sieve hand +
+    visited bits, S3Fifo/TwoQ/Arc ghosts, WTinyLfu sketch, Arc p + _seg tags, _exp). ZERO
+    new introspection surface on Lru.js. This is WHY S13 follows S14.
+  - "% of optimal" reuses beladyOpt(trace, capacity); traces reuse makePrng / zipfTrace /
+    loopTrace / scanTrace -- all from benchmark/Bench.mjs (seeded, deterministic) -- plus a
+    caller-editable custom trace. The demo consumes Bench.mjs; it never edits it.
+  - MEDIUM (D22, first planner call): recommend an animated browser page demo/visuals.html
+    (canvas/DOM + requestAnimationFrame) with a runnable demo/*.mjs entry, matching the
+    lite-binary-reader house pattern (runnable .mjs + .html visual page; npm run demo ->
+    node). The page imports ONLY ../Lru.js + ../benchmark/Bench.mjs via <script type=module>,
+    served by a tiny zero-dep demo/serve.mjs (or npx serve, dev-only, as LBR's demo:scope).
+    Zero runtime deps in what SHIPS (the demo ships nothing).
+TASKS
+  1. D22 decision record: demo medium + dump()-as-model + never-shipped posture + the
+     rejected alternative (a demo-only introspection hook on Lru.js -> REJECTED: pollutes
+     the surface and can drift from real state; dump() is the single honest source).
+  2. demo/ scaffold: a trace panel (zipf/loop/scan/custom + seed + capacity), 7 member
+     panels, transport (play/pause/step/speed), a per-member "% of optimal" readout.
+  3. Per-member renderers driven off dump() output -- one draw fn per member's snapshot
+     shape; assert every member's shape is covered (no member silently unrendered).
+  4. npm run demo script + demo/serve.mjs (zero-dep) or an npx-serve note.
+  5. Docs: a README "Watch the policies" pointer (demo is dev-only, NOT in the tarball) +
+     one llms.txt line. NO VERSION move (that lands at /release 1.9.0).
+ASSERTIONS (falsifiable)
+  - Drawn state == dump(): each member is rendered strictly from its snapshot, with a test
+    comparing drawn state to dump() (NO shadow re-implementation of mechanics that could
+    diverge from the real cache).
+  - The demo's live running hit ratio for each member == a from-scratch replay of the same
+    trace through a fresh instance (the animation cannot lie about hits/misses).
+  - pctOptimal == 100 * memberHitRate / beladyOpt(trace, cap).hitRate, same trace + cap.
+  - Lru.js AND Lru.d.ts byte-identical (git diff empty on both); benchmark/Bench.mjs
+    unchanged; zero runtime deps unchanged; the /release pack gate STILL asserts demo/
+    absent from the tarball.
+  - Deterministic: same seed -> same trace -> same frames.
+NON-GOALS
+  - NO shipped-surface change. Lru.js / Lru.d.ts / Bench.mjs are consumed, never edited. If
+    a member's internals are not visible via dump(), that is a dump() gap to fix in a member
+    session -- NEVER a demo-only introspection hook.
+  - Not a benchmark replacement (Bench.mjs stays the measurement tool; the demo is its
+    visible narration). Not shipped to npm. Not a framework (vanilla, zero deps).
+  - No torture-gate obligation (no hot-path code touched): the load-bearing gate is
+    "draw strictly from dump()" + an empty git diff on Lru.js/Lru.d.ts.
+PIPELINE NOTE
+  Not a core-module change, so planner -> coder -> reviewer -> qa applies IN SPIRIT
+  (planner spec; reviewer for honesty/retention in the demo code; qa for the assertions
+  above) but the torture gate proper is N/A. Reviewer's job here is "can the picture lie?"
+DONE WHEN
+  one trace animates all seven members side by side, each drawn strictly from dump(), with
+  a live % -of-optimal line; Lru.js / Lru.d.ts unchanged; the pack gate still excludes
+  demo/; zero runtime deps hold.
+
 ---
 
 ## 7. Decision-record index (decisions/)
@@ -1060,6 +1176,7 @@ DONE WHEN
 | D19 | opt-in stats (integer counters; off by default) | 0019 (S12) |
 | D20 | Belady OPT reference in the bench tool (offline only; brute-force correctness gate) | 0020 (S9) |
 | D21 | snapshot / restore (cold dump()/static restore(); slot-verbatim serial form; fail-closed tag; TTL captured verbatim + capture-time stamp) | 0021 (S14) |
+| D22 | animated policy-visualization demo (medium; dump() IS the visualization model; demo-only introspection hook REJECTED; never shipped; occupancy-only, dump() omits fixed geometry) | 0022 (S13) |
 | (law) | bit-packing (if any) INLINED, never a `lite-fastbit32`/package runtime dep (item 15) | 0012 (S4) |
 
 Deferred / out-of-core (get a decision record only if `DEBATE.md` promotes them):
