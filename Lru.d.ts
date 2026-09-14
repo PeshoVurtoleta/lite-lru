@@ -810,6 +810,59 @@ export class ClockPro<K = unknown, V = unknown> implements LiteCache<K, V> {
   get capacity(): number;
 }
 
+/**
+ * LruK -- LRU-K (O'Neil, O'Neil & Weikum, SIGMOD'93), K=2, decisions/0026. The eleventh
+ * family member: recency-of-recency by the K-th BACKWARD DISTANCE. A page is COLD until its
+ * 2nd reference, then WARM; it tracks the two most-recent reference timestamps in two Float64
+ * columns (`r0`/`r1`) allocated WITH the store -- a warm hit is 2 stamps + 0 link writes, a
+ * cold->warm promotion is 2 stamps + exactly 5 link writes (non-exceedable). Eviction takes
+ * the OLDEST cold page first (infinite K-distance, O(1)); only when none exists it scans the
+ * warm list for the smallest 2nd-reference time (honestly O(size) reads, O(1) writes -- NOT
+ * amortized O(1)). Fixed K=2, no knob and no correlated-reference period (CRP); the bounded
+ * keys-only history (cap = capacity, drop-oldest) re-admits a returning page as WARM. Same
+ * uniform `LiteCache<K, V>` surface as every other member -- the one-line policy swap.
+ *
+ * @typeParam K key type (any value; SameValueZero equality via the internal Map)
+ * @typeParam V value type
+ */
+export class LruK<K = unknown, V = unknown> implements LiteCache<K, V> {
+  /**
+   * @param capacity max entries; must be an integer >= 1 (else throws RangeError,
+   *                 fail-closed -- null is not zero).
+   * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
+   */
+  constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  /** Reconstruct a FRESH `LruK` from a `dump()` snapshot (decisions/0021 + 0026), incl. the
+   *  warm + cold lists, their per-slot reference-time columns (`r0`/`r1`), the logical clock,
+   *  AND the bounded non-resident history (dropping any is a fail-OPEN future-eviction bug).
+   *  Fail closed on any mismatch or bound violation. */
+  static restore<K = unknown, V = unknown>(snap: CacheSnapshot, opts?: LiteCacheOptions<K, V>): LruK<K, V>;
+  get(key: K): V | undefined;
+  put(key: K, value: V, ttlMs?: number): void;
+  has(key: K): boolean;
+  peek(key: K): V | undefined;
+  delete(key: K): boolean;
+  clear(): void;
+  purgeStale(): number;
+  /** Live runtime counters (decisions/0019). BORROWED holder -- copy what you keep;
+   *  throws on an instance built without { stats: true } (fail-closed). */
+  stats(): CacheStats;
+  /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
+  resetStats(): void;
+  /** Serialize to a plain, structurally-cloneable snapshot (decisions/0021). COLD, may
+   *  allocate (honest <= 96 B/entry; no zero-GC claim). Restore with the static restore(). */
+  dump(): CacheSnapshot;
+  keys(): IterableIterator<K>;
+  values(): IterableIterator<V>;
+  entries(): IterableIterator<[K, V]>;
+  /** Iterable protocol == entries(); the yielded [K, V] tuple is BORROWED/reused
+   *  (decisions/0018) -- copy what you keep. Only a copying map materializes
+   *  (Array.from(c.entries(), ([k,v])=>[k,v])); a bare spread reads all-undefined. */
+  [Symbol.iterator](): IterableIterator<[K, V]>;
+  get size(): number;
+  get capacity(): number;
+}
+
 /** The package version (kept in lock-step with package.json + Lru.js). */
 export const VERSION: string;
 

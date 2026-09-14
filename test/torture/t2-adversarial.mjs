@@ -9,8 +9,8 @@
  *   E single-capacity cache: every put evicts; head===tail always.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK } from './harness.mjs';
 
 export function run() {
     // --- A: re-hit the MRU N times (the head-re-hit fast path) -------------------
@@ -569,12 +569,76 @@ export function run() {
         }
     }
 
+    // --- R: LruK degenerate caps + cold-first eviction + all-warm min-r1 scan +
+    // the bounded-history bound + conservation (decisions/0026) --------------------
+    {
+        // Degenerate caps 1..4: every put churns, conservation holds, the history stays
+        // bounded, |cold| + |warm| == size, and every cold page sits at the -Infinity sentinel.
+        for (const cap of [1, 2, 3, 4]) {
+            const c = new LruK(cap);
+            for (let i = 0; i < 500; i++) {
+                c.put(i, i);
+                check(c.size === Math.min(cap, i + 1), () => 't2 R: lruk cap-' + cap + ' size drift at ' + i);
+                check(c.get(i) === i, () => 't2 R: lruk cap-' + cap + ' just-inserted key missing');
+                check(c._hist._len <= cap, () => 't2 R: lruk cap-' + cap + ' history over bound');
+                validate(c);
+            }
+            c.clear();
+            check(c.size === 0, () => 't2 R: lruk cap-' + cap + ' not empty after clear');
+            check(c._coldHead === -1 && c._coldTail === -1 && c._warmHead === -1 && c._warmTail === -1,
+                () => 't2 R: lruk cap-' + cap + ' list ends not reset after clear');
+            check(c._t === 0, () => 't2 R: lruk cap-' + cap + ' logical clock not reset after clear');
+            check(c._freeListLength() === cap, () => 't2 R: lruk cap-' + cap + ' free list != capacity after clear');
+            validate(c);
+        }
+
+        // Scan resistance: a deeply-WARM working set survives a distinct one-hit flood far larger
+        // than capacity (cold intruders are evicted from the cold tail first), at EXACTLY capacity.
+        // This is also the ADVERSARIAL all-warm state where the min-r1 victim scan runs.
+        {
+            const N = 64;
+            const c = new LruK(N, { keys: 'int' });
+            for (let i = 0; i < N; i++) c.put(i, i);
+            const hot = [0, 1, 2, 3, 4, 5, 6, 7];
+            for (const h of hot) for (let t = 0; t < 10; t++) c.get(h);
+            for (let i = 0; i < 8000; i++) {
+                for (const h of hot) check(c.get(h) === h, () => 't2 R: lruk hot key ' + h + ' lost mid-scan at ' + i);
+                c.put(1000 + i, i);
+                check(c.size === N, () => 't2 R: lruk drifted from capacity during the scan');
+                check(c._hist._len <= N, () => 't2 R: lruk history over bound during the scan');
+                if ((i & 511) === 0) validate(c);
+            }
+            for (const h of hot) check(c.has(h), () => 't2 R: lruk hot key ' + h + ' evicted by the scan (no scan resistance)');
+            validate(c);
+            void wrapLruK(c);
+        }
+
+        // All-warm min-r1 correctness at scale: make every resident warm, then verify the
+        // reported victim is exactly the warm page with the smallest _r1 (independent recompute).
+        {
+            const N = 32;
+            const c = new LruK(N, { keys: 'int' });
+            for (let i = 0; i < N; i++) { c.put(i, i); c.get(i); } // every page warm
+            check(c._coldHead === -1, () => 't2 R: setup -- a cold page remained (not all-warm)');
+            // scramble the reference order so r1 values are well mixed
+            const p = makePrng(SEED ^ 0x717c0de);
+            for (let i = 0; i < 500; i++) c.get(p() % N);
+            let want = -1, wantR1 = Infinity;
+            for (let s = c._warmHead; s !== -1; s = c._next[s]) {
+                if (c._r1[s] < wantR1) { wantR1 = c._r1[s]; want = s; }
+            }
+            check(c._peekVictim() === c._keys[want],
+                () => 't2 R: lruk all-warm victim ' + String(c._peekVictim()) + ' != min-r1 key ' + String(c._keys[want]));
+            validate(c);
+        }
+    }
+
     // --- J: the LAZY-SEMANTICS TRIPLE as executable laws (decisions/0017, D17.3) --
     // For EVERY member: an expired entry is a MISS through get/has/peek alike, and each
     // of the three REAPS it in place (fires onEvict once, size drops). A fresh Infinity
     // sibling is untouched by any of them. validate() nets each reap.
     {
-        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu], ['ClockPro', ClockPro]];
+        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu], ['ClockPro', ClockPro], ['LruK', LruK]];
         // one probe method per fresh cache (each reap is destructive, so isolate them)
         const probes = [
             ['get', (c, k) => c.get(k), undefined],
@@ -614,7 +678,7 @@ export function run() {
     {
         const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo],
             ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu],
-            ['ClockPro', ClockPro]];
+            ['ClockPro', ClockPro], ['LruK', LruK]];
         for (const [name, C] of members) {
             for (const keys of [undefined, 'int']) {
                 const o = keys ? { keys } : undefined;

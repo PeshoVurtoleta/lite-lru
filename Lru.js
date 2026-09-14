@@ -149,6 +149,14 @@ const CLOCKPRO_HOT = 1;  // bit0: 1 = hot page, 0 = cold page
 const CLOCKPRO_REF = 2;  // bit1: referenced since the last hand pass (the hot-path store)
 const CLOCKPRO_TEST = 4; // bit2: a cold page currently in its test period
 
+/** LRU-K (decisions/0026, D26) per-slot state bit, packed in a member-specific `_st` Uint8
+ *  column (mirrors LIRS/ClockPro `_st`, NOT a field on the shared SlotStore -- the other
+ *  members' hot paths stay byte-identical). bit0 = warm: the page has reached K=2 references
+ *  (its K-th backward distance is finite). A cold page (0 = < K references) has `_r1` at the
+ *  -Infinity sentinel and lives in the cold list; a warm page lives in the warm list. The
+ *  whole per-access branch is a single `_st[s] & LRUK_WARM` test. */
+const LRUK_WARM = 1; // bit0: 1 = warm (>= K=2 refs), 0 = cold (< K refs)
+
 /** W-TinyLFU count-min sketch shape (decisions/0014, D14.2): 4 rows of 4-bit
  *  saturating counters packed 8-per-Uint32. One per-row seed spreads a key across the
  *  rows; `Math.imul` keeps each mix an EXACT 32-bit multiply (zero-alloc). Built once. */
@@ -245,7 +253,7 @@ function validateStats(stats) {
         "[lite-lru] unknown stats option " + String(stats) + " (did you mean true?)");
 }
 
-export const VERSION = "1.12.0";
+export const VERSION = "1.13.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -5972,6 +5980,541 @@ export class ClockPro {
             }
             return keys[c];
         }
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * LruKHistory -- the bounded, keys-only non-resident history for LruK (decisions/0026,
+ * D26.4). Reuses the ArcGhost ring VERBATIM (like LirsHistory / ClockProHistory): a
+ * drop-oldest FIFO of at most `capacity` recently-evicted keys, strict-zero on keys:'int'.
+ * A brand-name subclass keeps the member roster + snapshot code self-documenting.
+ * -------------------------------------------------------------------------- */
+class LruKHistory extends ArcGhost {}
+
+/* -------------------------------------------------------------------------- *
+ * LruK -- LRU-K (O'Neil, O'Neil & Weikum, SIGMOD'93), K=2, decisions/0026, D26. The
+ * ELEVENTH named export in this file (same single-file ruling as the rest of the family:
+ * single main file + sideEffects:false + named exports = the tree-shake moat).
+ *
+ * LRU-K evicts by the K-th BACKWARD DISTANCE: the time of a page's K-th-most-recent
+ * reference. A page with FEWER than K references has an INFINITE backward K-distance and is
+ * evicted first (its K-th reference never happened); among finite-distance pages the one
+ * whose K-th reference is furthest in the past (the SMALLEST K-th-reference timestamp) is
+ * the victim. This member fixes K=2 (the canonical, best-studied setting -- LRU-2): a page
+ * is COLD until its 2nd reference, then WARM. There is NO knob and NO correlated-reference
+ * period (CRP): the deviations from the 1993 paper are documented in decisions/0026 (D26.1
+ * K=2, D26.6 no-CRP, D26.4 keys-only bounded history) and do NOT change which resident the
+ * policy evicts for the classic (no-CRP) LRU-2 model.
+ *
+ * STRUCTURE (all fixed at construction, zero-alloc on the hot path):
+ *   - TWO disjoint intrusive lists over the SHARED `_next`/`_prev` columns (a slot is in
+ *     exactly one): the COLD list (`_coldHead` newest .. `_coldTail` oldest = the O(1)
+ *     eviction end) holds pages with < K references; the WARM list (`_warmHead`..`_warmTail`)
+ *     holds pages with >= K references. Because the two lists partition the resident set over
+ *     the shared columns, validate()/iteration/snapshot reuse the shared machinery unchanged.
+ *   - `_r0` / `_r1` Float64 columns (allocated WITH the store, never per key): `_r0[s]` is the
+ *     most-recent reference timestamp, `_r1[s]` the SECOND-most-recent (the K=2 backward
+ *     distance). A cold page has only one reference, so `_r1[s]` sits at the -Infinity SENTINEL
+ *     (D26.3: "null is not zero" -- a cold page is not "K-distance 0", it is K-distance
+ *     infinity, and -Infinity as the stored 2nd-reference time makes a stray unified scan
+ *     rank it for eviction FIRST, exactly matching the two-phase rule).
+ *   - `_st` Uint8: bit0 warm. A warm hit is 2 stamps + 0 link writes; a cold->warm promotion
+ *     is 2 stamps + at most 5 (2..5) link writes, non-exceedable (D26.2, pinned + proven in t6).
+ *   - `_t`: a monotone Float64 logical clock (a plain number field, exact to 2^53), bumped
+ *     `++this._t` on every reference so timestamps never collide across pages.
+ *   - `_hist` (LruKHistory): the bounded keys-only non-resident history (D26.4); a put of a
+ *     key still in it re-admits the page as WARM at `_r1 = _r0 = ++_t` (it has proven >= K
+ *     references over time -- the LRU-K recency-of-recency win).
+ *
+ * VICTIM (D26.5): the cold list is checked FIRST -- its tail is an O(1) infinite-K-distance
+ * victim. Only when NO cold page exists is a LINEAR min-`_r1` scan run over the warm list:
+ * O(size) READS, O(1) writes. This is honestly NOT amortized O(1): an all-warm steady state
+ * scans the whole warm list on every eviction (t6 MEASURES the worst-observed scan length
+ * and a LRUK_EVICT_SCAN_TRIPWIRE catches regressions -- it is never claimed as a bound).
+ *
+ * Rides the shared newStore factory (default Map / opt-in keys:'int' strict-zero), the
+ * onEvict fire-after + `_inOnEvict` guard (0002), TTL (0017), zero-GC iteration (0018),
+ * stats (0019), snapshot (0021). A hit is proven zero-alloc + <= 5-link-write by the t6 gate.
+ * -------------------------------------------------------------------------- */
+
+export class LruK {
+    /**
+     * @param {number} capacity  Max resident entries. Must be an integer >= 1.
+     * @param {{ onEvict?: (key: any, value: any) => void, keys?: 'int' }} [options]
+     */
+    constructor(capacity, options) {
+        if (!Number.isInteger(capacity) || capacity < 1) {
+            throw new RangeError(
+                "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
+            );
+        }
+
+        this._capacity = capacity;
+
+        // TTL (decisions/0017), validated fail-closed -- identical to the rest of the family.
+        this._clock = validateClock(options && options.clock);
+        this._ttl = validateTtl(options && options.ttl);
+
+        // Same shared substrate + int-key door as every other member.
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+
+        // Cache the store's columns so the relinks stay direct. `_next` toward the tail
+        // (older), `_prev` toward the head (newer); the two lists are disjoint over them.
+        this._keys = this._store._keys;
+        this._vals = this._store._vals;
+        this._next = this._store._next; // SHARED: threads the COLD list AND the WARM list (disjoint) + free stack
+        this._prev = this._store._prev;
+        this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+
+        // The two reference-time columns (D26.3): most-recent (`_r0`) and second-most-recent
+        // (`_r1`, the K=2 backward distance). Member-specific, allocated WITH the store, fixed,
+        // never grown -- the other members' hot paths carry no new column (like LIRS `_st`).
+        // `_r1` starts at the -Infinity sentinel: a fresh/cold slot has no 2nd reference.
+        this._r0 = new Float64Array(capacity);
+        this._r1 = new Float64Array(capacity).fill(-Infinity);
+
+        // Per-slot state (bit0 warm). Fixed, never grown.
+        this._st = new Uint8Array(capacity);
+
+        // The COLD list (< K refs): `_coldHead` = newest, `_coldTail` = oldest = eviction end.
+        this._coldHead = NIL; this._coldTail = NIL;
+        // The WARM list (>= K refs): the min-`_r1` scan walks it; order does not steer policy.
+        this._warmHead = NIL; this._warmTail = NIL;
+
+        this._size = 0; // resident = |cold| + |warm|
+
+        // The monotone logical clock (D26.3): a plain number field (Float64 semantics), bumped
+        // on every reference so no two stamped timestamps collide -> the min-`_r1` victim is unique.
+        this._t = 0;
+
+        // The bounded non-resident history (D26.4): keys only, cap = capacity, drop-oldest.
+        this._histCap = capacity;
+        this._histInt = (options && options.keys) === 'int';
+        this._hist = new LruKHistory(capacity, this._histInt);
+
+        this._onEvict = (options && options.onEvict) || NOOP;
+        this._inOnEvict = false;
+
+        // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
+        this._stats = validateStats(options && options.stats);
+    }
+
+    /** The store factory, delegating to the shared `newStore` (decisions/0011). */
+    _makeStore(capacity, keys, hasTtl) {
+        return newStore(capacity, keys, hasTtl);
+    }
+
+    get size() { return this._size; }
+    get capacity() { return this._capacity; }
+
+    // --- the two intrusive lists (shared `_next`/`_prev`) ----------------------
+
+    /** Push slot s at the head (newest) of the COLD list. */
+    _coldPush(s) {
+        this._prev[s] = NIL; this._next[s] = this._coldHead;
+        if (this._coldHead !== NIL) this._prev[this._coldHead] = s;
+        this._coldHead = s; if (this._coldTail === NIL) this._coldTail = s;
+    }
+
+    /** Unlink slot s from the COLD list (2 link writes for an interior slot). */
+    _coldDetach(s) {
+        const p = this._prev[s], n = this._next[s];
+        if (p !== NIL) this._next[p] = n; else this._coldHead = n;
+        if (n !== NIL) this._prev[n] = p; else this._coldTail = p;
+    }
+
+    /** Push slot s at the head (newest) of the WARM list (3 link writes when warm non-empty). */
+    _warmPush(s) {
+        this._prev[s] = NIL; this._next[s] = this._warmHead;
+        if (this._warmHead !== NIL) this._prev[this._warmHead] = s;
+        this._warmHead = s; if (this._warmTail === NIL) this._warmTail = s;
+    }
+
+    /** Unlink slot s from the WARM list. */
+    _warmDetach(s) {
+        const p = this._prev[s], n = this._next[s];
+        if (p !== NIL) this._next[p] = n; else this._warmHead = n;
+        if (n !== NIL) this._prev[n] = p; else this._warmTail = p;
+    }
+
+    // --- the LRU-K policy core (COLD helpers, allocation-free) ------------------
+
+    /** Add a key to the bounded non-resident history, dropping the OLDEST at the bound
+     *  (D26.4). COLD (only the eviction path reaches it). */
+    _histAdd(key) {
+        if (this._hist._len >= this._histCap) this._hist.delLRU();
+        this._hist.addMRU(key);
+    }
+
+    /** Scan the WARM list for the min-`_r1` victim (the largest K=2 backward distance). O(size)
+     *  READS, 0 writes. `_t` is strictly monotone so every warm `_r1` is distinct -> the min is
+     *  unique and the scan is order-independent. Factored out so a torture subclass can MEASURE
+     *  the scan length (the honest O(size) characterization -- never a claimed bound). */
+    _scanWarmVictim() {
+        let best = this._warmHead;
+        let bestR1 = this._r1[best];
+        for (let s = this._next[best]; s !== NIL; s = this._next[s]) {
+            const r = this._r1[s];
+            if (r < bestR1) { bestR1 = r; best = s; }
+        }
+        return best;
+    }
+
+    /** Free exactly ONE resident slot and return it for in-place reuse (D6-style). Evicts the
+     *  cold tail when a cold page exists (O(1) -- infinite K-distance goes first, D26.5); else
+     *  the min-`_r1` warm page. The evicted key enters the bounded history (D26.4). Sets
+     *  `_evKey`/`_evVal` for the onEvict fire-after. COLD; only ever called at capacity. */
+    _evictOne() {
+        let s;
+        if (this._coldTail !== NIL) {
+            s = this._coldTail;
+            this._evKey = this._keys[s]; this._evVal = this._vals[s];
+            this._coldDetach(s);
+        } else {
+            s = this._scanWarmVictim();
+            this._evKey = this._keys[s]; this._evVal = this._vals[s];
+            this._warmDetach(s);
+        }
+        this._store.delete(this._evKey);
+        this._histAdd(this._evKey);
+        this._st[s] = 0;
+        this._r1[s] = -Infinity; // back to the cold sentinel (the slot is about to be reused)
+        this._size--;
+        return s;
+    }
+
+    /** The per-access recency step for a RESIDENT slot (get hit / put update). A warm hit is 2
+     *  stamps + 0 link writes; a cold->warm promotion is 2 stamps + at most 5 (2..5) link writes,
+     *  non-exceedable (D26.2: up to 2 for the cold detach + up to 3 for the warm push). */
+    _access(s) {
+        this._r1[s] = this._r0[s];   // the 2nd-most-recent reference time slides down (stamp 1)
+        this._r0[s] = ++this._t;     // the new most-recent reference time (stamp 2)
+        if ((this._st[s] & LRUK_WARM) === 0) {
+            // cold -> warm: this was the K-th (2nd) reference. Move lists + set the warm bit.
+            this._coldDetach(s);     // 2 link writes (interior)
+            this._st[s] |= LRUK_WARM;
+            this._warmPush(s);       // 3 link writes (warm non-empty)
+        }
+    }
+
+    // --- public API (all zero-alloc on the hot path) --------------------------
+
+    /** Look up a key AND apply the LRU-K access policy (stamp the reference times; promote to
+     *  warm on the K-th reference). @returns the value, or undefined if absent (see D7). A get
+     *  never consults the non-resident history (a missing key is a plain miss). */
+    get(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const s = this._store.get(key);
+        if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
+            this._reap(s);
+            return undefined;
+        }
+        this._access(s);
+        if (this._stats !== null) this._stats.hits++; // live hit (0019)
+        return this._vals[s];
+    }
+
+    /**
+     * Insert or update. An update rewrites the value and applies the access policy (like a
+     * hit -- a cold update becomes its K-th reference and promotes to warm). A new key still in
+     * the bounded non-resident history is re-admitted as WARM at `_r1 = _r0 = ++_t` (it has
+     * proven >= K references over time); a brand-new key enters COLD. At capacity one resident
+     * is evicted first (its slot reused in place); onEvict fires LAST (0002). The positional
+     * `ttlMs` (0017) overrides the instance ttl default.
+     */
+    put(key, value, ttlMs) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        let expiresAt;
+        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
+        this._store._ver++; // D18.6 -- put mutates; invalidate iterators
+        const store = this._store;
+        const existing = store.get(key);
+        if (existing >= 0) {                  // update-in-place + access policy
+            this._vals[existing] = value;
+            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            this._access(existing);
+            if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
+            return;
+        }
+
+        const inHist = this._hist.has(key);
+        let s;
+        let evicted = false;
+        if (this._size === this._capacity) {
+            s = this._evictOne();             // evict one resident -> reuse its slot; sets _evKey/_evVal
+            evicted = true;
+        } else {
+            s = store.allocSlot();
+        }
+
+        if (inHist) this._hist.consume(key);  // it is being re-admitted (resident again)
+        this._keys[s] = key;
+        this._vals[s] = value;
+        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        store.set(key, s);
+
+        const t = ++this._t;
+        this._r0[s] = t;
+        if (inHist) {
+            // a proven page (>= K references over time) -> re-admit WARM at r1 = r0 = t (D26.4).
+            this._r1[s] = t;
+            this._st[s] = LRUK_WARM;
+            this._warmPush(s);
+        } else {
+            // a brand-new page -> COLD, its 2nd-reference time is the -Infinity sentinel (D26.3).
+            this._r1[s] = -Infinity;
+            this._st[s] = 0;
+            this._coldPush(s);
+        }
+        this._size++;
+
+        if (this._stats !== null) this._stats.puts++; // successful insert (outcome-based); 0019
+
+        if (evicted) {
+            if (this._stats !== null) this._stats.evictions++; // capacity eviction (0019)
+            const evKey = this._evKey, evVal = this._evVal;
+            this._evKey = undefined; this._evVal = undefined; // retention hygiene
+            this._inOnEvict = true;
+            try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+        }
+    }
+
+    /** True if key is present (RESIDENT). History keys are NOT present. Policy-NEUTRAL. A stale
+     *  entry is a MISS and is reaped in place (decisions/0017, D17.3). */
+    has(key) {
+        const s = this._store.get(key);
+        if (s < 0) return false;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return false;
+        }
+        return true;
+    }
+
+    /** Read a value WITHOUT applying the policy. undefined if absent (see D7). A stale entry is
+     *  a MISS and is reaped in place (decisions/0017, D17.3). */
+    peek(key) {
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return undefined;
+        }
+        return this._vals[s];
+    }
+
+    /** Unlink a resident slot from its list (cold or warm), dropping the size. Shared by delete
+     *  + reap; NOT ghosted (a delete/reap keeps no non-resident metadata, like the family). */
+    _unlinkResident(s) {
+        if (this._st[s] & LRUK_WARM) this._warmDetach(s); else this._coldDetach(s);
+        this._st[s] = 0;
+        this._r1[s] = -Infinity;
+        this._size--;
+    }
+
+    /** Reap an expired slot in place (decisions/0017): unlink, drop from the index, free the
+     *  slot, and fire onEvict LAST via the 0002 guard. Not ghosted (like delete). */
+    _reap(s) {
+        this._store._ver++; // D18.6 -- a reap is a structural mutation; invalidate iterators
+        const evKey = this._keys[s];
+        const evVal = this._vals[s];
+        this._unlinkResident(s);
+        this._store.delete(evKey);
+        this._store.freeSlot(s);
+        if (this._stats !== null) this._stats.evictions++; // reap = eviction (0019, D19.2)
+        this._inOnEvict = true;
+        try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+    }
+
+    /** Evict every expired resident entry now (decisions/0017, D17.5). COLD, O(size). */
+    purgeStale() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG);
+        if (this._exp === null) return 0;
+        const now = this._clock();
+        const exp = this._exp;
+        const victims = [];
+        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
+        return victims.length;
+    }
+
+    /** Remove a key. Returns true if it was present. Frees the slot; NOT ghosted. */
+    delete(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const s = store.get(key);
+        if (s < 0) return false;
+        store._ver++; // D18.6 -- a real delete is a structural mutation; invalidate iterators
+        this._unlinkResident(s);
+        store.delete(key);
+        store.freeSlot(s);
+        return true;
+    }
+
+    /** Empty the cache. Rebuilds the free list, empties both lists + the history, and resets the
+     *  per-slot state + the logical clock. Allocates nothing. O(capacity). */
+    clear() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
+        this._store.reset();
+        this._coldHead = NIL; this._coldTail = NIL;
+        this._warmHead = NIL; this._warmTail = NIL;
+        this._size = 0;
+        this._t = 0;
+        this._st.fill(0);
+        this._r1.fill(-Infinity);
+        this._hist.clear();
+    }
+
+    // --- opt-in runtime stats (decisions/0019, D19): cold accessors -----------
+
+    /** The live stats holder (decisions/0019, D19.3), returned BY REFERENCE (borrowed). Fail
+     *  closed on an instance built without { stats: true }. */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE (decisions/0019). Fail closed on a non-stats instance. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        const st = this._stats;
+        st.hits = 0; st.misses = 0; st.evictions = 0; st.puts = 0;
+    }
+
+    // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
+
+    /** The per-member iteration ROSTER (decisions/0018 / 0026): the WARM list THEN the COLD
+     *  list, both threaded through the shared `_next` column -- RESIDENT only, the non-resident
+     *  history EXCLUDED. Recency-neutral, stale-skipping, fail-closed via `_ver` -- the shared
+     *  CacheIterator walks it unchanged. */
+    _iterHeads() { return [this._warmHead, this._coldHead]; }
+
+    keys() { return iterKeys(this); }
+    values() { return iterValues(this); }
+    entries() { return iterEntries(this); }
+    [Symbol.iterator]() { return iterEntries(this); }
+
+    // --- snapshot / restore (decisions/0021, D21 + 0026): COLD, may allocate --
+
+    /** Serialize to a plain snapshot (decisions/0021, D21 + D26.7): the WARM + COLD lists (each
+     *  with values/expiry), their aligned `_r0`/`_r1` reference-time columns, the logical clock
+     *  `_t`, AND the bounded non-resident history (keys only, oldest..newest). Dropping the
+     *  reference times, the clock or the history is a fail-OPEN future-eviction bug, so all are
+     *  captured (the t9 controls prove the round-trip catches it). */
+    dump() {
+        const snap = snapBase(this, "LruK");
+        snap.warm = snapList(this, this._warmHead, false);
+        snap.cold = snapList(this, this._coldHead, false);
+        snap.warmR0 = []; snap.warmR1 = [];
+        for (let i = 0; i < snap.warm.slots.length; i++) {
+            const s = snap.warm.slots[i];
+            snap.warmR0.push(this._r0[s]); snap.warmR1.push(this._r1[s]);
+        }
+        snap.coldR0 = []; snap.coldR1 = [];
+        for (let i = 0; i < snap.cold.slots.length; i++) {
+            const s = snap.cold.slots[i];
+            snap.coldR0.push(this._r0[s]); snap.coldR1.push(this._r1[s]);
+        }
+        snap.tick = this._t;
+        snap.hist = snapArcGhost(this._hist);
+        return snap;
+    }
+
+    /** Reconstruct a FRESH LruK from a snapshot (decisions/0021, D21 + D26.7). Fail closed on
+     *  any tag/shape mismatch; a malformed/short/mis-aligned reference-time column; a
+     *  non-finite `_r0` (or a `_r1` that is neither finite nor the -Infinity sentinel); a cold
+     *  page whose `_r1` is not the -Infinity sentinel; a `tick` that is not a non-negative
+     *  finite number; or a history over its bound. */
+    static restore(snap, opts) {
+        const cap = snapRead(snap, "LruK", opts);
+        const inst = new LruK(cap, snapOpts(snap, opts));
+        const occ = snapCheckOccupy(cap, snap.ttl, [[snap.warm, "warm"], [snap.cold, "cold"]]);
+
+        // Shape the LRU-K-specific aux (fail closed -- "null is not zero").
+        const ckCol = (arr, n, label, allowNegInf) => {
+            if (!Array.isArray(arr) || arr.length !== n) {
+                throw new Error(SNAP_BAD + "lruk " + label + " must be an array aligned to its list");
+            }
+            for (let i = 0; i < n; i++) {
+                const x = arr[i];
+                if (typeof x !== "number") {
+                    throw new Error(SNAP_BAD + "lruk " + label + "[" + i + "] = " + String(x) + " (must be a number)");
+                }
+                if (Number.isNaN(x)) {
+                    throw new Error(SNAP_BAD + "lruk " + label + "[" + i + "] is NaN");
+                }
+                if (!Number.isFinite(x) && !(allowNegInf && x === -Infinity)) {
+                    throw new Error(SNAP_BAD + "lruk " + label + "[" + i + "] = " + String(x) + " (must be finite)");
+                }
+            }
+        };
+        const nWarm = snap.warm.slots.length, nCold = snap.cold.slots.length;
+        ckCol(snap.warmR0, nWarm, "warmR0", false);
+        ckCol(snap.warmR1, nWarm, "warmR1", false); // warm pages have a finite 2nd-reference time
+        ckCol(snap.coldR0, nCold, "coldR0", false);
+        ckCol(snap.coldR1, nCold, "coldR1", true);  // cold pages: -Infinity sentinel only
+        for (let i = 0; i < nCold; i++) {
+            if (snap.coldR1[i] !== -Infinity) {
+                throw new Error(SNAP_BAD + "lruk coldR1[" + i + "] = " + String(snap.coldR1[i]) + " (a cold page must sit at the -Infinity sentinel)");
+            }
+        }
+        if (typeof snap.tick !== "number" || !Number.isFinite(snap.tick) || snap.tick < 0) {
+            throw new Error(SNAP_BAD + "lruk tick must be a non-negative finite number, got " + String(snap.tick));
+        }
+        if (!Array.isArray(snap.hist)) throw new Error(SNAP_BAD + "lruk history (hist) must be an array");
+        if (snap.hist.length > cap) {
+            throw new Error(SNAP_BAD + "lruk history (" + snap.hist.length + ") exceeds capacity (" + cap + ")");
+        }
+
+        const W = snapRestoreList(inst, snap.warm, null, 0);
+        for (let i = 0; i < nWarm; i++) {
+            const s = snap.warm.slots[i];
+            inst._st[s] = LRUK_WARM;
+            inst._r0[s] = snap.warmR0[i];
+            inst._r1[s] = snap.warmR1[i];
+        }
+        inst._warmHead = W.head; inst._warmTail = W.tail;
+
+        const C = snapRestoreList(inst, snap.cold, null, 0);
+        for (let i = 0; i < nCold; i++) {
+            const s = snap.cold.slots[i];
+            inst._st[s] = 0;
+            inst._r0[s] = snap.coldR0[i];
+            inst._r1[s] = snap.coldR1[i];
+        }
+        inst._coldHead = C.head; inst._coldTail = C.tail;
+
+        inst._size = W.size + C.size;
+        inst._t = snap.tick;
+
+        const gInt = typeof inst._store._ck === "function";
+        for (let i = 0; i < snap.hist.length; i++) {
+            if (gInt) inst._store._ck(snap.hist[i]); // fail closed on a non-int history key
+            inst._histAdd(snap.hist[i]);
+        }
+
+        inst._store.rebuildFreeList(occ);
+        return inst;
+    }
+
+    // --- test/debug only (never call on a hot path) ---------------------------
+
+    /** Free-stack length, delegated to the store (conservation invariant). */
+    _freeListLength() {
+        return this._store.freeListLength();
+    }
+
+    /** The key the NEXT over-capacity insert would evict, WITHOUT mutating (D26.5): the cold
+     *  tail when a cold page exists, else the min-`_r1` warm page. TEST-ONLY (drives the torture
+     *  differential); never a hot path. */
+    _peekVictim() {
+        if (this._size === 0) return undefined;
+        if (this._coldTail !== NIL) return this._keys[this._coldTail];
+        return this._keys[this._scanWarmVictim()];
     }
 }
 

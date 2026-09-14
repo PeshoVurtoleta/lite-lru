@@ -15,8 +15,8 @@
  * corrupt structure still fails the tier.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK } from './harness.mjs';
 
 const NIL = -1;
 
@@ -668,6 +668,92 @@ export function run() {
         void wrapClockPro(c);
     }
 
+    // --- LruK laws (decisions/0026) ---------------------------------------------
+
+    // LK1: the warm-hit hot path stamps the two reference-time columns and RELINKS NOTHING; a
+    // cold page's 2nd reference promotes it to the warm list. has/peek are policy-neutral.
+    // Fixed capacity: a cold page's _r1 is the -Infinity sentinel, never 0.
+    {
+        const c = new LruK(8);
+        for (let i = 0; i < 8; i++) c.put(i, i); // 8 cold pages
+        const s3 = c._store.get(3);
+        check((c._st[s3] & 1) === 0, () => 't0 LK1: a fresh page must start COLD');
+        check(c._r1[s3] === -Infinity, () => 't0 LK1: a cold page _r1 must be the -Infinity sentinel, not ' + c._r1[s3]);
+        c.get(3);                                // 2nd reference -> promote to warm
+        check((c._st[s3] & 1) !== 0, () => 't0 LK1: 2nd reference did not promote cold->warm');
+        check(c._r1[s3] !== -Infinity && Number.isFinite(c._r1[s3]),
+            () => 't0 LK1: a warm page _r1 must be a finite 2nd-reference time');
+        const r0Before = c._r0[s3];
+        c.has(3); c.peek(3);                     // policy-neutral: no stamp
+        check(c._r0[s3] === r0Before, () => 't0 LK1: has/peek stamped a reference time (must be neutral)');
+        validate(c);
+    }
+
+    // LK2: cold-before-warm eviction. A cold page (< K refs, infinite K-distance) is evicted
+    // before any warm page, and the OLDEST cold page (cold tail) is the victim.
+    {
+        let evicted;
+        const c = new LruK(3, { onEvict: (k) => { evicted = k; } });
+        c.put('a', 1); c.put('b', 2); c.put('c', 3); // cold: newest c .. oldest a
+        c.get('a'); c.get('a');                        // a is now warm (2nd ref), b/c still cold
+        check((c._st[c._store.get('a')] & 1) !== 0, () => 't0 LK2: a did not become warm');
+        c.put('d', 4);                                 // a cold page exists -> evict the oldest cold (b)
+        check(evicted === 'b', () => 't0 LK2: evicted ' + String(evicted) + ' != the oldest cold page b');
+        check(c.has('a') && c.has('c') && c.has('d'), () => 't0 LK2: a wrong page was evicted');
+        check(c.size === 3, () => 't0 LK2: size drifted from capacity');
+        validate(c);
+    }
+
+    // LK3: all-warm eviction takes the smallest 2nd-reference time (largest K=2 backward
+    // distance). put X,Y,Z; get Y,Z,X -> all warm; the next insert evicts X (its 2nd-most-recent
+    // reference is the furthest in the past), where classic LRU would evict Y (the LRU).
+    {
+        let evicted;
+        const c = new LruK(3, { onEvict: (k) => { evicted = k; } });
+        c.put('X', 1); c.put('Y', 2); c.put('Z', 3);
+        c.get('Y'); c.get('Z'); c.get('X'); // all warm; r1: X oldest, then Y, then Z
+        check(c._peekVictim() === 'X', () => 't0 LK3: min-r1 victim is ' + String(c._peekVictim()) + ', expected X');
+        c.put('W', 4);
+        check(evicted === 'X', () => 't0 LK3: evicted ' + String(evicted) + ' != the min-r1 page X (LRU would evict Y)');
+        check(c.has('Y') && c.has('Z') && c.has('W'), () => 't0 LK3: a wrong warm page was evicted');
+        check(c.size === 3, () => 't0 LK3: size drifted from capacity');
+        validate(c);
+    }
+
+    // LK4: bounded history + WARM re-admission. An evicted key is recorded (keys only, bounded);
+    // re-putting it re-admits the page as WARM at r1 = r0 = t. Resident capacity stays EXACTLY
+    // capacity throughout.
+    {
+        const c = new LruK(3);
+        c.put(1, 1); c.put(2, 2); c.put(3, 3); // cold: oldest 1
+        c.put(4, 4);                            // evicts the oldest cold (1) -> history
+        check(c._hist.has(1), () => 't0 LK4: an evicted key was not recorded in the bounded history');
+        check(c._hist._len <= c._histCap, () => 't0 LK4: history exceeded its bound');
+        c.put(1, 10);                           // re-admit a remembered key -> WARM
+        const s1 = c._store.get(1);
+        check((c._st[s1] & 1) !== 0, () => 't0 LK4: a history re-admit must be WARM');
+        check(Number.isFinite(c._r1[s1]) && c._r0[s1] === c._r1[s1],
+            () => 't0 LK4: a re-admit must set r1 = r0 = t');
+        check(!c._hist.has(1), () => 't0 LK4: a re-admitted key must be consumed from the history');
+        check(c.size === 3, () => 't0 LK4: resident capacity is not exactly capacity');
+        validate(c);
+    }
+
+    // LK5: scan/loop resistance -- a warm working set survives a distinct one-hit flood larger
+    // than capacity (cold intruders are evicted first from the cold tail; warm pages persist).
+    {
+        const N = 32;
+        const c = new LruK(N, { keys: 'int' });
+        for (let i = 0; i < N; i++) c.put(i, i);
+        const hot = [0, 1, 2, 3];
+        for (const h of hot) for (let t = 0; t < 8; t++) c.get(h); // deeply warm
+        for (let i = 0; i < 4000; i++) { for (const h of hot) c.get(h); c.put(1000 + i, i); }
+        for (const h of hot) check(c.has(h), () => 't0 LK5: warm key ' + h + ' evicted by the flood (no scan resistance)');
+        check(c.size === N, () => 't0 LK5: size drifted from capacity under the flood');
+        validate(c);
+        void wrapLruK(c);
+    }
+
     // --- TTL laws (decisions/0017) ----------------------------------------------
 
     // T1: stale = MISS, and the MISS does NOTHING to policy state. get() on an expired
@@ -853,6 +939,17 @@ export function run() {
         validate(c);
     }
 
+    // I12 LruK -- the WARM list THEN the COLD list, both over the shared _next column, RESIDENT
+    // only, the non-resident history EXCLUDED (decisions/0026). The two disjoint lists partition
+    // the resident set, so the shared CacheIterator + the manual head-walk agree exactly.
+    {
+        const c = new LruK(16);
+        for (let i = 0; i < 40; i++) c.put(i % 24, i); // churn past capacity (cold + warm mix)
+        for (let i = 0; i < 12; i++) c.get((i * 5) % 24); // promote some to warm (stamp, relink)
+        checkIterOrder('lruk', c, [c._warmHead, c._coldHead]);
+        validate(c);
+    }
+
     // I5 TTL-skip WITHOUT reap (D18.5): a walk sees only live entries, but leaves the
     // stale ones resident (size unchanged); purgeStale() is the reclamation path.
     {
@@ -872,7 +969,7 @@ export function run() {
     // --- Snapshot / restore laws (decisions/0021, D21) --------------------------
     const SNAP = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo],
         ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu],
-        ['ClockPro', ClockPro]];
+        ['ClockPro', ClockPro], ['LruK', LruK]];
 
     // SN1: round-trip identity. Build a churned mid-life state, dump, structuredClone,
     // restore, and assert dump==dump (fixed point) AND identical order/values/size via an

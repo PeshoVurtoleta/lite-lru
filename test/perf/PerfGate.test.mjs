@@ -28,7 +28,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../../Lru.js';
 import {
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
     CountedSieve, SIEVE_WRITES_HIT_LINKS, SIEVE_WRITES_HIT_VIS,
@@ -37,12 +37,13 @@ import {
     LIRS_WRITES_LIR_TOP_REHIT,
     LFU_WRITES_FASTPATH, LFU_WRITES_MAX,
     CLOCKPRO_WRITES_HIT_LINKS, CLOCKPRO_WRITES_HIT_ST,
+    CountedLruK, LRUK_WRITES_HIT_WARM, LRUK_WRITES_HIT_PROMOTE, LRUK_WRITES_HIT_STAMPS,
 } from '../torture/harness.mjs';
 
 const CAP = 4096;       // power of 2 so the hot body masks its key with & MASK
 const MASK = CAP - 1;
 
-/** The 10 shipped members, in canonical order. */
+/** The 11 shipped members, in canonical order. */
 const MEMBERS = [
     { name: 'LiteLru', Ctor: LiteLru },
     { name: 'Sieve', Ctor: Sieve },
@@ -54,6 +55,7 @@ const MEMBERS = [
     { name: 'Lirs', Ctor: Lirs },
     { name: 'Lfu', Ctor: Lfu },
     { name: 'ClockPro', Ctor: ClockPro },
+    { name: 'LruK', Ctor: LruK },
 ];
 
 /**
@@ -105,7 +107,7 @@ function putChurnScenario(m) {
     };
 }
 
-/** 20 scenarios: get-hit + put-churn for each of the 10 members. */
+/** 22 scenarios: get-hit + put-churn for each of the 11 members. */
 const scenarios = [];
 for (let i = 0; i < MEMBERS.length; i++) {
     scenarios.push(getHitScenario(MEMBERS[i]));
@@ -156,7 +158,7 @@ zgcSuite({
  */
 test('perf-gate writes-pin cross-check: harness constants match the shipped hot paths', () => {
     // Documented literals (drift guard): LRU 0/5/4, Sieve 0+1, S3Fifo 0+1,
-    // WTinyLfu 0, Lirs 0, Lfu 1/14, ClockPro 0+1.
+    // WTinyLfu 0, Lirs 0, Lfu 1/14, ClockPro 0+1, LruK 0/5 links + 2 stamps.
     assert.equal(LRU_WRITES_HEAD_REHIT, 0);
     assert.equal(LRU_WRITES_INTERIOR_REHIT, 5);
     assert.equal(LRU_WRITES_TAIL_REHIT, 4);
@@ -170,6 +172,9 @@ test('perf-gate writes-pin cross-check: harness constants match the shipped hot 
     assert.equal(LFU_WRITES_MAX, 14);
     assert.equal(CLOCKPRO_WRITES_HIT_LINKS, 0);
     assert.equal(CLOCKPRO_WRITES_HIT_ST, 1);
+    assert.equal(LRUK_WRITES_HIT_WARM, 0);
+    assert.equal(LRUK_WRITES_HIT_PROMOTE, 5);
+    assert.equal(LRUK_WRITES_HIT_STAMPS, 2);
 
     const N = 8;
 
@@ -204,4 +209,16 @@ test('perf-gate writes-pin cross-check: harness constants match the shipped hot 
         assert.equal(ct.writes(), S3FIFO_WRITES_HIT_LINKS, 'S3Fifo hit links at ' + probe);
         assert.equal(ct.visWrites(), S3FIFO_WRITES_HIT_VIS, 'S3Fifo hit vis at ' + probe);
     }
+
+    // LruK: a warm hit relinks NOTHING (0) + 2 stamps; a cold->warm promotion is exactly 5 link
+    // stores (2 cold-detach + 3 warm-push, non-exceedable) + the same 2 stamps.
+    const ck = new CountedLruK(16);
+    ck.put(100, 100); ck.get(100);              // key 100 warm
+    for (let i = 1; i <= 5; i++) ck.put(i, i);   // cold list head->tail: 5,4,3,2,1
+    ck.resetWrites(); ck.get(3);                 // interior cold, warm non-empty -> exactly 5 links
+    assert.equal(ck.writes(), LRUK_WRITES_HIT_PROMOTE, 'LruK cold->warm promotion links');
+    assert.equal(ck.stamps(), LRUK_WRITES_HIT_STAMPS, 'LruK promotion stamps');
+    ck.resetWrites(); ck.get(3);                 // now warm -> 0 links, 2 stamps
+    assert.equal(ck.writes(), LRUK_WRITES_HIT_WARM, 'LruK warm hit links');
+    assert.equal(ck.stamps(), LRUK_WRITES_HIT_STAMPS, 'LruK warm hit stamps');
 });

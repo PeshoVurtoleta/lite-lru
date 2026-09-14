@@ -31,7 +31,7 @@
  * rejects the window; T9 exercises the same alloc lane in-process.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, BREAK, check, die, makePrng,
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
@@ -41,6 +41,7 @@ import {
     CountedLirs, LIRS_WRITES_LIR_TOP_REHIT,
     CountedLfu, LFU_WRITES_FASTPATH, LFU_WRITES_MAX,
     CountedClockPro, CLOCKPRO_WRITES_HIT_LINKS, CLOCKPRO_WRITES_HIT_ST, CLOCKPRO_WRITES_MISS_EVICT_TRIPWIRE,
+    CountedLruK, LRUK_WRITES_HIT_WARM, LRUK_WRITES_HIT_PROMOTE, LRUK_WRITES_HIT_STAMPS, LRUK_EVICT_SCAN_TRIPWIRE,
 } from './harness.mjs';
 
 const CAP = 4096;      // power of 2 so the hot body masks its key with & MASK
@@ -201,6 +202,33 @@ class CoveredClockPro extends ClockPro {
         if (this._store.get(key) < 0 && this._hist.has(key)) this._histReadmits++;
         return super.put(key, value, ttlMs);
     }
+}
+
+/** A LruK counting the DISTINGUISHING lanes (decisions/0026) via plain integer field
+ *  increments (zero-alloc; lane coverage only, never on a MEASURED window): cold->warm
+ *  promotions, cold-tail evictions, all-warm min-r1 evictions, history WARM re-admits, AND the
+ *  max observed warm-scan LENGTH (the OWNER-RULING measurement -- the scan is NOT capped; its
+ *  length is measured and reported, and the maxPauseMs<=4 / worst-op timing confirms it never
+ *  blows). A well-mixed stream must exercise promotions, cold evicts and re-admits; the
+ *  dedicated all-warm stream drives the warm scan. */
+class CoveredLruK extends LruK {
+    constructor(cap, opts) {
+        super(cap, opts);
+        this._promos = 0; this._coldEvicts = 0; this._warmEvicts = 0; this._histReadmits = 0; this._maxScan = 0;
+    }
+    _access(s) { const wasCold = (this._st[s] & 1) === 0; super._access(s); if (wasCold) this._promos++; }
+    _scanWarmVictim() {
+        let n = 0; for (let x = this._warmHead; x !== -1; x = this._next[x]) n++;
+        if (n > this._maxScan) this._maxScan = n;
+        return super._scanWarmVictim();
+    }
+    _evictOne() {
+        const cold = this._coldTail !== -1;
+        const r = super._evictOne();
+        if (cold) this._coldEvicts++; else this._warmEvicts++;
+        return r;
+    }
+    put(k, v, t) { if (this._store.get(k) < 0 && this._hist.has(k)) this._histReadmits++; return super.put(k, v, t); }
 }
 
 /** Retained sink for the BREAK control -- survives GC so arrayBuffers grows. */
@@ -1433,4 +1461,151 @@ export async function run() {
         CLOCKPRO_WRITES_MISS_EVICT_TRIPWIRE + '); lanes covered: promos=' +
         covCp._promos + ' demotes=' + covCp._demotes + ' evicts=' + covCp._evicts +
         ' historyReadmits=' + covCp._histReadmits + '\n');
+
+    // --- Gate LRUK: the LruK member -- STRICT zero-alloc + MEASURED writes-per-hit + scan ------
+    // (decisions/0026) The SAME MIXED, recurring int-key stream drives every LRU-K lane at
+    // capacity: hot recurrence -> cold->warm promotions (2 stamps + 5 links) and warm re-hits (2
+    // stamps + 0 links); cold churn -> cold-tail (O(1)) evictions + bounded-history re-admits.
+    // Zero-alloc: the closure indexes a preallocated Int32Array and does int get/put only. The
+    // shared link columns `_next`/`_prev`, the two reference-time columns `_r0`/`_r1`, the state
+    // column `_st`, the int index buffers AND the history ring NEVER grow; |cold| + |warm| ==
+    // size == capacity always; the history stays bounded.
+    const lkStream = buildMixedStream(STREAM_LEN, HOT_SIZE, A1IN_CAP, 0x1b2c0de5);
+    const lkCache = new LruK(CAP, { keys: 'int' });
+    const lkSink = new Int32Array(1);
+    let lki = 0;
+    const lkHot = () => {
+        const k = lkStream[lki & STREAM_MASK]; lki++;
+        const v = lkCache.get(k);
+        if (v === undefined) lkCache.put(k, k); else { lkSink[0] += v | 0; lkCache.get(k); }
+    };
+    for (let i = 0; i < PREFILL; i++) lkHot(); // reach steady state
+    check(lkCache.size === CAP, () => 't6 Gate LRUK: prefill did not reach capacity (size ' + lkCache.size + ')');
+    const lkNextBytes = lkCache._next.buffer.byteLength;
+    const lkPrevBytes = lkCache._prev.buffer.byteLength;
+    const lkR0Bytes = lkCache._r0.buffer.byteLength;
+    const lkR1Bytes = lkCache._r1.buffer.byteLength;
+    const lkStBytes = lkCache._st.buffer.byteLength;
+    const lkIxSlotBytes = lkCache._store._ixSlot.buffer.byteLength;
+    const lkIxKeyBytes = lkCache._store._ixKey.buffer.byteLength;
+    const lkHistRingBytes = lkCache._hist._ring.buffer.byteLength;
+    const glk = runOpsGate(lkHot, { ops: OPS, warmup: WARMUP });
+    check(lkCache._next.buffer.byteLength === lkNextBytes,
+        () => 't6 Gate LRUK: _next.buffer grew ' + lkNextBytes + ' -> ' + lkCache._next.buffer.byteLength);
+    check(lkCache._prev.buffer.byteLength === lkPrevBytes,
+        () => 't6 Gate LRUK: _prev.buffer grew ' + lkPrevBytes + ' -> ' + lkCache._prev.buffer.byteLength);
+    check(lkCache._r0.buffer.byteLength === lkR0Bytes,
+        () => 't6 Gate LRUK: _r0.buffer grew ' + lkR0Bytes + ' -> ' + lkCache._r0.buffer.byteLength);
+    check(lkCache._r1.buffer.byteLength === lkR1Bytes,
+        () => 't6 Gate LRUK: _r1.buffer grew ' + lkR1Bytes + ' -> ' + lkCache._r1.buffer.byteLength);
+    check(lkCache._st.buffer.byteLength === lkStBytes,
+        () => 't6 Gate LRUK: _st.buffer grew ' + lkStBytes + ' -> ' + lkCache._st.buffer.byteLength);
+    check(lkCache._store._ixSlot.buffer.byteLength === lkIxSlotBytes,
+        () => 't6 Gate LRUK: _ixSlot.buffer grew ' + lkIxSlotBytes + ' -> ' + lkCache._store._ixSlot.buffer.byteLength);
+    check(lkCache._store._ixKey.buffer.byteLength === lkIxKeyBytes,
+        () => 't6 Gate LRUK: _ixKey.buffer grew ' + lkIxKeyBytes + ' -> ' + lkCache._store._ixKey.buffer.byteLength);
+    check(lkCache._hist._ring.buffer.byteLength === lkHistRingBytes,
+        () => 't6 Gate LRUK: history _ring grew ' + lkHistRingBytes + ' -> ' + lkCache._hist._ring.buffer.byteLength);
+    check(lkCache.size === CAP, () => 't6 Gate LRUK: churn did not stay at capacity (size ' + lkCache.size + ')');
+    check(lkCache._hist._len <= CAP,
+        () => 't6 Gate LRUK: history exceeded its bound (' + lkCache._hist._len + ')');
+    if (!glk.report.ok) {
+        const g = glk.summary.gc;
+        die('t6 Gate LRUK (mixed churn) ops gate rejected -- verdict=' + glk.report.verdict +
+            ' source=' + glk.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const glkA = runAllocsGate(lkHot, { iterations: 50000, batches: 8 });
+    if (!glkA.ok) {
+        die('t6 Gate LRUK (mixed churn) retained-alloc gate rejected -- verdict=' + glkA.report.verdict +
+            ' settled=' + glkA.result.settled + ' bytesPerCall=' + glkA.bytesPerCall);
+    }
+    // Writes-per-hit pins (the headline, decisions/0026 D26.2). A WARM hit relinks NOTHING (0
+    // `_next`/`_prev` stores) + 2 stamps; a COLD->WARM promotion is EXACTLY 5 link stores
+    // (2 cold-detach + 3 warm-push, non-exceedable) + the SAME 2 stamps.
+    const clk = new CountedLruK(16);
+    clk.put(100, 100); clk.get(100);          // key 100 warm
+    for (let i = 1; i <= 5; i++) clk.put(i, i); // cold list head->tail: 5,4,3,2,1
+    clk.resetWrites();
+    clk.get(3);                                // INTERIOR cold, warm non-empty -> exactly 5 links
+    check(clk.writes() === LRUK_WRITES_HIT_PROMOTE,
+        () => 't6 Gate LRUK: cold->warm promotion relinked ' + clk.writes() + ' cells, expected ' + LRUK_WRITES_HIT_PROMOTE);
+    check(clk.stamps() === LRUK_WRITES_HIT_STAMPS,
+        () => 't6 Gate LRUK: promotion stamped ' + clk.stamps() + ' reference times, expected ' + LRUK_WRITES_HIT_STAMPS);
+    clk.resetWrites();
+    clk.get(3);                                // now warm -> 0 links, 2 stamps
+    check(clk.writes() === LRUK_WRITES_HIT_WARM,
+        () => 't6 Gate LRUK: a warm hit relinked ' + clk.writes() + ' cells, expected ' + LRUK_WRITES_HIT_WARM);
+    check(clk.stamps() === LRUK_WRITES_HIT_STAMPS,
+        () => 't6 Gate LRUK: a warm hit stamped ' + clk.stamps() + ' reference times, expected ' + LRUK_WRITES_HIT_STAMPS);
+    // The 5-link promotion bound is PROVEN non-exceedable over a churn window: no promotion path
+    // ever relinks more than 5 cells (the honest ceiling, not just the pinned scenario).
+    const clk2 = new CountedLruK(CAP, { keys: 'int' });
+    let clk2i = 0, lkMaxPromo = 0;
+    for (let i = 0; i < STREAM_LEN; i++) {
+        const k = lkStream[i & STREAM_MASK];
+        const s = clk2._store.get(k);
+        if (s < 0) { clk2.put(k, k); continue; }
+        clk2.resetWrites();
+        clk2.get(k);
+        if (clk2.writes() > lkMaxPromo) lkMaxPromo = clk2.writes();
+    }
+    check(lkMaxPromo <= LRUK_WRITES_HIT_PROMOTE,
+        () => 't6 Gate LRUK: worst-observed hit relinked ' + lkMaxPromo + ' cells (> the non-exceedable 5)');
+    // The min-r1 WARM SCAN is O(size) READS -- NOT amortized O(1), NO claimed bound. Drive a
+    // dedicated ALL-WARM stream at capacity so every insert triggers the full-list scan, MEASURE
+    // the worst-observed scan length (per-stream tripwire, never a cap), and time the worst single
+    // op to confirm it stays under the 4 ms pause budget.
+    const advLk = new CoveredLruK(CAP, { keys: 'int' });
+    for (let i = 0; i < CAP; i++) { advLk.put(i, i); advLk.get(i); } // every resident is warm
+    check(advLk._coldHead === -1, () => 't6 Gate LRUK: adversarial setup left a cold page (not all-warm)');
+    advLk._maxScan = 0;
+    let lkWorstMs = 0;
+    for (let i = 0; i < 200; i++) {
+        const t0 = performance.now();
+        advLk.put(CAP + i, i);       // all-warm -> _evictOne scans the whole warm list
+        const d = performance.now() - t0;
+        if (d > lkWorstMs) lkWorstMs = d;
+        advLk.get(CAP + i);          // re-promote the newcomer so the set stays all-warm
+    }
+    check(advLk._maxScan >= 1000,
+        () => 't6 Gate LRUK: all-warm scan measured ' + advLk._maxScan + ' (< 1000 -- the O(size) scan lane was not covered)');
+    check(advLk._maxScan <= LRUK_EVICT_SCAN_TRIPWIRE,
+        () => 't6 Gate LRUK: all-warm scan worst-observed ' + advLk._maxScan +
+            ' exceeded the tripwire ' + LRUK_EVICT_SCAN_TRIPWIRE +
+            ' (a per-stream regression tripwire, NOT a bound; the true worst case is O(capacity))');
+    check(lkWorstMs <= 4,
+        () => 't6 Gate LRUK: all-warm worst-case scan op took ' + lkWorstMs.toFixed(3) + ' ms (> 4 ms budget) -- BLOCKER');
+    // Lane coverage. With cold-tail-first eviction + WARM re-admission, genuine cold->warm
+    // promotions are rare in a generic steady-state mixed stream (a hot key is warm after warmup;
+    // a returning key re-admits WARM, not via promotion), so a PURPOSE-BUILT driver drives all
+    // lanes honestly: each fresh cold key is either PROMOTED (a 2nd reference while resident) or
+    // left COLD (evicted cold-first), and a recently-evicted key is re-put to force a WARM
+    // re-admit. Zero-alloc is proven by the gate above; this loop is unmeasured (int get/put only).
+    const covLk = new CoveredLruK(CAP, { keys: 'int' });
+    for (let i = 0; i < CAP; i++) covLk.put(i, i); // warm up to capacity
+    covLk._promos = 0; covLk._coldEvicts = 0; covLk._warmEvicts = 0; covLk._histReadmits = 0;
+    let covNk = CAP;
+    for (let i = 0; i < OPS; i++) {
+        const k = covNk++;
+        covLk.put(k, k);                 // fresh cold insert (evicts the cold tail while cold pages exist)
+        if ((i & 1) === 0) covLk.get(k); // half get a 2nd reference -> cold->warm promotion
+        if ((i % 5) === 0) {             // re-put a recently-evicted key -> WARM re-admit
+            const old = k - 500;
+            if (old >= CAP) covLk.put(old, old);
+        }
+    }
+    check(covLk._coldEvicts >= 100,
+        () => 't6 Gate LRUK: the window triggered ' + covLk._coldEvicts + ' cold-tail evictions (< 100 -- lane not covered)');
+    check(covLk._promos >= 100,
+        () => 't6 Gate LRUK: the window triggered ' + covLk._promos + ' cold->warm promotions (< 100 -- lane not covered)');
+    check(covLk._histReadmits >= 20,
+        () => 't6 Gate LRUK: the window triggered ' + covLk._histReadmits + ' history re-admits (< 20 -- lane not covered)');
+    process.stderr.write('t6 Gate LRUK: ' + glkA.bytesPerCall.toFixed(5) +
+        ' B/op mixed churn (' + OPS + ' ops window, capacity ' + CAP + '); maxPauseMs=' +
+        glk.summary.gc.maxMs.toFixed(3) + '; writes/hit warm-links=' + LRUK_WRITES_HIT_WARM +
+        ' promote-links=' + LRUK_WRITES_HIT_PROMOTE + ' (worst-observed=' + lkMaxPromo +
+        ', non-exceedable) stamps=' + LRUK_WRITES_HIT_STAMPS + '; min-r1 warm scan O(size) reads' +
+        ' (all-warm worst-observed length=' + advLk._maxScan + ', worst op ' + lkWorstMs.toFixed(3) +
+        ' ms; tripwire=' + LRUK_EVICT_SCAN_TRIPWIRE + ', NOT a bound); lanes covered: promos=' +
+        covLk._promos + ' coldEvicts=' + covLk._coldEvicts + ' historyReadmits=' + covLk._histReadmits + '\n');
 }

@@ -21,10 +21,10 @@
  *   C-stats-counts-peek   a peek that credits a hit    -> brute-tally parity fails
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, wrapWTinyLfu,
-    wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, validate, runRoundTrip,
+    wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK, validate, runRoundTrip,
     lruPolicy, check, die, makePrng,
 } from './harness.mjs';
 import { makeLfuOracle } from './oracles/lfu.mjs';
@@ -38,6 +38,7 @@ import { makeTwoQOracle } from './oracles/twoq.mjs';
 import { makeArcOracle } from './oracles/arc.mjs';
 import { makeLirsOracle } from './oracles/lirs.mjs';
 import { makeClockProOracle } from './oracles/clockpro.mjs';
+import { makeLruKOracle } from './oracles/lruk.mjs';
 
 const NIL = -1;
 
@@ -285,6 +286,16 @@ class ApproxFreqLfu extends Lfu {
  *  Non-vacuity: the CORRECT (adaptive) ClockPro agrees (t5). */
 class NoAdaptClockPro extends ClockPro {
     put(key, value, ttlMs) { super.put(key, value, ttlMs); this._mHot = 0; } // BUG: never adapt
+}
+
+/** C-lruk-lru-tiebreak (decisions/0026): an LruK whose all-warm victim scan returns the warm
+ *  LRU (warm tail) instead of the min-`_r1` page (the largest K=2 backward distance). This is
+ *  exactly plain LRU-among-warm, NOT LRU-K, so the next-eviction victim drifts from the pure
+ *  LRU-K oracle whenever the resident set is all warm. Self-consistent (its own _peekVictim
+ *  reads the same broken scan), yet WRONG versus the oracle. Non-vacuity: the CORRECT LruK
+ *  agrees (t5). */
+class LruTiebreakLruK extends LruK {
+    _scanWarmVictim() { return this._warmTail; } // BUG: LRU tiebreak, not min-r1 (K-distance)
 }
 
 /** C-skip-gate (decisions/0017): a get that SKIPS the ttl staleness gate entirely, so a
@@ -674,6 +685,21 @@ export function run() {
         if (r.ok) die('t9 C-clockpro-no-adapt: freezing the adaptive hot target did NOT diverge from the clockpro oracle (no teeth)');
     }
 
+    // --- C-lruk-lru-tiebreak (decisions/0026): LRU-among-warm instead of min-r1 -> diverges ---
+    // LRU-K's headline is recency-of-recency: among all-warm residents it evicts the SMALLEST
+    // 2nd-reference time (the largest K=2 backward distance), NOT the plain LRU. A scan that
+    // returns the warm LRU (warm tail) collapses LRU-K into ordinary LRU, so the next-eviction
+    // victim drifts from the pure LRU-K oracle. Non-vacuity: the CORRECT LruK agrees (t5).
+    {
+        const brokenPolicy = {
+            name: 'lruk-lru-tiebreak',
+            real: (cap) => wrapLruK(new LruTiebreakLruK(cap)),
+            oracle: (cap) => makeLruKOracle(cap),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x2b1e, keyspace: 40 });
+        if (r.ok) die('t9 C-lruk-lru-tiebreak: LRU-among-warm did NOT diverge from the lruk oracle (no teeth)');
+    }
+
     // --- C-skip-gate (decisions/0017): a get that skips the ttl gate -> diverges ---
     // The lazy TTL rule (D17.3): a stale hit is a MISS, reaped in place. A get that never
     // checks staleness returns the expired value and keeps it resident, so it MUST
@@ -910,6 +936,17 @@ export function run() {
                 return inst;
             }
         }
+        // lruk-drop-r1: restore keeps the lists + values but ZEROES every warm slot's 2nd-
+        // reference time `_r1` (the K=2 backward distance). The all-warm min-r1 victim then
+        // differs from the twin (whose r1 was preserved), a fail-OPEN future-eviction bug the
+        // round-trip differential must catch. Post-restore mutation (the snapshot is valid).
+        class R1DroppedLruK extends LruK {
+            static restore(snap, opts) {
+                const inst = LruK.restore(snap, opts);
+                for (let s = inst._warmHead; s !== -1; s = inst._next[s]) inst._r1[s] = 0;
+                return inst;
+            }
+        }
 
         const controls = [
             { name: 'arc-p-dropped', broken: { Ctor: PDroppedArc, wrap: wrapArc }, real: { Ctor: Arc, wrap: wrapArc } },
@@ -919,6 +956,7 @@ export function run() {
             { name: 'clockpro-hands-dropped', broken: { Ctor: HandsDroppedClockPro, wrap: wrapClockPro }, real: { Ctor: ClockPro, wrap: wrapClockPro } },
             { name: 'clockpro-mhot-dropped', broken: { Ctor: MHotDroppedClockPro, wrap: wrapClockPro }, real: { Ctor: ClockPro, wrap: wrapClockPro } },
             { name: 'clockpro-test-bits-dropped', broken: { Ctor: TestBitsDroppedClockPro, wrap: wrapClockPro }, real: { Ctor: ClockPro, wrap: wrapClockPro } },
+            { name: 'lruk-drop-r1', broken: { Ctor: R1DroppedLruK, wrap: wrapLruK }, real: { Ctor: LruK, wrap: wrapLruK } },
         ];
         for (const ctl of controls) {
             // Non-vacuity: the CORRECT round-trip agrees with the twin (also proven in t5).

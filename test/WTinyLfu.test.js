@@ -37,7 +37,7 @@ const SEG_PROBATION = 1;
 const SEG_PROTECTED = 2;
 
 test('exports: VERSION and the named WTinyLfu export are present', async () => {
-    assert.equal(VERSION, '1.12.0');
+    assert.equal(VERSION, '1.13.0');
     const mod = await import('../Lru.js');
     assert.equal(mod.WTinyLfu, WTinyLfu);
 });

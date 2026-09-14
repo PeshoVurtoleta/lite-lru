@@ -14,7 +14,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../Lru.js';
 import { zipfTrace, loopTrace, scanTrace, beladyOpt } from '../benchmark/Bench.mjs';
 import {
     createEngine, step, runToEnd, frameModel, summary,
@@ -26,7 +26,7 @@ import { serveTrace, handle } from './serve.mjs';
 const DEMO_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = dirname(DEMO_DIR);
 
-const CTORS = { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro };
+const CTORS = { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK };
 
 function makeSpec(cap, length, seed) {
     const trace = zipfTrace({ length, keyspace: cap * 16, exponent: 1.0, seed: seed ^ 0x11 });
@@ -49,10 +49,10 @@ function replay(Ctor, trace, cap) {
 
 test('every engine member has a renderer (no member silently unrendered)', () => {
     assert.deepEqual([...MEMBER_NAMES].sort(), [...RENDERED_MEMBERS].sort());
-    assert.equal(MEMBER_DEFS.length, 10);
+    assert.equal(MEMBER_DEFS.length, 11);
 });
 
-test('assertion 1: rendered model deep-equals dump() over >= 2000 ops, all 8 (0 shadow fields)', () => {
+test('assertion 1: rendered model deep-equals dump() over >= 2000 ops, all 11 (0 shadow fields)', () => {
     const cap = 32;
     const spec = makeSpec(cap, 2500, 1);
     const engine = createEngine(spec);
@@ -96,7 +96,7 @@ test('assertion 1b: a renderer that drops or invents a field fails the deep-equa
     assert.notDeepStrictEqual(invented, snap);
 });
 
-test('assertion 2: live hits/misses == from-scratch replay, 0 divergences over >= 2000 ops, all 8', () => {
+test('assertion 2: live hits/misses == from-scratch replay, 0 divergences over >= 2000 ops, all 11', () => {
     const cap = 32;
     const spec = makeSpec(cap, 2400, 3);
     const engine = createEngine(spec);
@@ -119,7 +119,7 @@ test('assertion 3: pctOptimal === 100 * memberHitRate / beladyOpt.hitRate (|delt
     runToEnd(engine);
     const rows = summary(engine);
     const opt = beladyOpt(spec.trace, cap);
-    assert.equal(rows.length, 10);
+    assert.equal(rows.length, 11);
     for (let i = 0; i < rows.length; i++) {
         const r = rows[i];
         const expected = opt.hitRate ? (100 * r.hitRate) / opt.hitRate : 0;
@@ -241,7 +241,7 @@ function assertAllModelsMatch(engine, names, label) {
     return frame;
 }
 
-test('gap: degenerate capacities 1..4 -- all 8 members render without throwing, model==dump', () => {
+test('gap: degenerate capacities 1..4 -- all 11 members render without throwing, model==dump', () => {
     for (const cap of [1, 2, 3, 4]) {
         const trace = zipfTrace({ length: 400, keyspace: cap * 16, exponent: 1.0, seed: 0xC0FFEE ^ cap });
         const opt = beladyOpt(trace, cap);
@@ -254,7 +254,7 @@ test('gap: degenerate capacities 1..4 -- all 8 members render without throwing, 
     // dropping the cap===1 iteration from the array would silently lose that coverage.
 });
 
-test('gap: all three trace kinds (zipf/loop/scan) exercise assertion 1 for all 8 members', () => {
+test('gap: all three trace kinds (zipf/loop/scan) exercise assertion 1 for all 11 members', () => {
     const cap = 24;
     const kinds = {
         zipf: () => zipfTrace({ length: 1500, keyspace: cap * 16, exponent: 1.0, seed: 0x1a }),
@@ -270,7 +270,7 @@ test('gap: all three trace kinds (zipf/loop/scan) exercise assertion 1 for all 8
     }
 });
 
-test('gap: renderer teeth across ALL 8 members -- dropping or inventing ANY declared field fails', () => {
+test('gap: renderer teeth across ALL 11 members -- dropping or inventing ANY declared field fails', () => {
     const cap = 20;
     const trace = zipfTrace({ length: 800, keyspace: cap * 16, exponent: 1.0, seed: 0x77 });
     const opt = beladyOpt(trace, cap);
@@ -312,7 +312,7 @@ test('gap: pctOptimal fail-closed on an all-distinct (never-repeating) trace -- 
     const engine = createEngine({ trace, cap, opt, kind: 'custom' });
     runToEnd(engine);
     const rows = summary(engine);
-    assert.equal(rows.length, 10);
+    assert.equal(rows.length, 11);
     for (let i = 0; i < rows.length; i++) {
         assert.equal(rows[i].hitRate, 0, rows[i].name + ' should also have hitRate 0 on an all-distinct trace');
         // Teeth: the naive formula 100*hitRate/opt.hitRate is 0/0 = NaN here. A
@@ -368,7 +368,7 @@ test('gap: determinism -- same seed/kind/cap builds byte-identical traces and id
     }
 });
 
-test('gap: keys:"int" backing smoke -- renderer model still deep-equals dump() for all 8 members', () => {
+test('gap: keys:"int" backing smoke -- renderer model still deep-equals dump() for all 11 members', () => {
     const cap = 12;
     const trace = zipfTrace({ length: 600, keyspace: cap * 16, exponent: 1.0, seed: 0x5a });
     for (let i = 0; i < MEMBER_NAMES.length; i++) {

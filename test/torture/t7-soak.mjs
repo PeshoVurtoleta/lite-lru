@@ -11,7 +11,7 @@
  * the payload refs). The census is the teeth for that.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../../Lru.js';
 import { createLeakTracker } from '@zakkster/lite-leak';
 import { check, validate, censusOk, settleGc } from './harness.mjs';
 
@@ -352,6 +352,50 @@ export async function run() {
             () => 't7 clockpro: an evicted value is still live -- the non-resident history is retaining values (leak)');
     }
 
+    // --- LruK soak (decisions/0026): build/clear cycles + the HISTORY-retains-no-values census
+    // + the reference-time-column invariant. The two Float64 columns _r0/_r1 are allocated WITH
+    // the store and NEVER grow (byteLength == 8 * capacity throughout); the bounded non-resident
+    // history fingerprints evicted keys and must retain only KEYS (hist._len <= capacity), NEVER
+    // values. Push distinct int keys so every eviction churns the history, re-reference half so
+    // the warm list + min-r1 scan lane are exercised, sample the evicted VALUE objects, and prove
+    // they are collectible after teardown. Each cycle: conservation + column invariant mid-life,
+    // then size 0 + free list restored + history/clock reset after clear.
+    {
+        const lkrefs = [];
+        const lktracker = createLeakTracker({ name: 'lruk-soak' });
+        for (let cyc = 0; cyc < 1024; cyc++) {
+            const cache = new LruK(CAP, { keys: 'int' });
+            const h = lktracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
+            check(cache._r0.byteLength === 8 * CAP, () => 't7 lruk: _r0 column byteLength != 8*capacity (cycle ' + cyc + ')');
+            check(cache._r1.byteLength === 8 * CAP, () => 't7 lruk: _r1 column byteLength != 8*capacity (cycle ' + cyc + ')');
+            for (let i = 0; i < CAP * 3; i++) {
+                const val = { c: cyc, i };
+                cache.put(cyc * 100000 + i, val); // distinct int keys => real history churn
+                if ((i & 1) === 0) cache.get(cyc * 100000 + i); // 2nd reference -> promote to warm
+                if ((cyc & 63) === 0 && (i & 7) === 0) lkrefs.push(new WeakRef(val));
+            }
+            check(cache.size === CAP, () => 't7 lruk: not full mid-life (size ' + cache.size + ')');
+            check(cache._hist._len <= CAP, () => 't7 lruk: history exceeded bound');
+            check(cache._r0.byteLength === 8 * CAP && cache._r1.byteLength === 8 * CAP,
+                () => 't7 lruk: a reference-time column grew mid-life (cycle ' + cyc + ')');
+            validate(cache); // conservation mid-life (two disjoint lists + history bound)
+            cache.clear();
+            check(cache.size === 0, () => 't7 lruk: size != 0 after clear (cycle ' + cyc + ')');
+            check(cache._freeListLength() === CAP, () => 't7 lruk: free list != capacity after clear (cycle ' + cyc + ')');
+            check(cache._hist._len === 0, () => 't7 lruk: history not empty after clear (cycle ' + cyc + ')');
+            check(cache._t === 0, () => 't7 lruk: logical clock not reset after clear (cycle ' + cyc + ')');
+            check(cache._coldHead === -1 && cache._coldTail === -1 && cache._warmHead === -1 && cache._warmTail === -1,
+                () => 't7 lruk: list ends not reset after clear (cycle ' + cyc + ')');
+            validate(cache);
+            lktracker.untrack(h);
+        }
+        check(lktracker.size() === 0, () => 't7 lruk: leak tracker size ' + lktracker.size() + ' != 0');
+        await settleGc(6);
+        check(lkrefs.length > 0, () => 't7 lruk: census sample was empty (nothing to prove)');
+        check(censusOk(lkrefs),
+            () => 't7 lruk: an evicted value is still live -- the non-resident history is retaining values (leak)');
+    }
+
     // --- TTL soak (decisions/0017): expiry churn + conservation + purgeStale + census
     // Build each cycle PAST capacity under a virtual clock, half the entries with a
     // finite ttl (they expire mid-build) and half never-expire. Assert conservation
@@ -404,7 +448,7 @@ export async function run() {
     {
         const snaptracker = createLeakTracker({ name: 'snapshot-soak' });
         const srefs = [];
-        const MEM = [LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro];
+        const MEM = [LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK];
         for (let cyc = 0; cyc < 4096; cyc++) {
             const C = MEM[cyc % MEM.length];
             const cache = new C(CAP, { keys: 'int' });

@@ -22,7 +22,7 @@ npm install @zakkster/lite-lru
 ```
 
 ```js
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '@zakkster/lite-lru';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '@zakkster/lite-lru';
 
 // Same surface, different eviction policy. Swap the constructor, nothing else.
 const cache = new LiteLru(3);            // classic recency (the reference member)
@@ -35,6 +35,7 @@ const cache = new LiteLru(3);            // classic recency (the reference membe
 // const cache = new Lirs(3);            // <- LIRS (recency-of-recency; best loop/scan resistance)
 // const cache = new Lfu(3);             // <- EXACT LFU (O(1) least-frequently-used, LRU tie-break)
 // const cache = new ClockPro(3);        // <- CLOCK-Pro (recency-of-recency on a clock; 0-link-write hit, adaptive)
+// const cache = new LruK(3);            // <- LRU-K (K=2; the original recency-of-recency; evict by K-th backward distance)
 
 cache.put('a', 1);
 cache.put('b', 2);
@@ -107,7 +108,8 @@ The honest competitive read: `lru-cache` is already typed-array-backed and featu
 - **`Lirs`** -- LIRS (Jiang & Zhang, SIGMETRICS'02), the **recency-of-recency** member and the strongest loop/scan resister in the family: eviction is driven by a block's IRR (inter-reference recency -- the count of DISTINCT blocks referenced between its last two accesses), not plain recency. Low-IRR blocks form the hot **LIR set**; high-IRR blocks are **HIR** (a small resident reserve = list Q, the eviction candidates, plus non-resident metadata). A returning key whose metadata is still remembered is re-admitted as LIR, so a loop LARGER than capacity keeps its hot set where LRU thrashes it (bench loop = 99.2% of Belady OPT, where the other members are ~0%). Split: `L_hir = max(1, round(capacity*0.01))` resident-HIR slots, `L_lir = capacity - L_hir`; RESIDENT capacity stays EXACTLY `capacity`. **Honest deviation (decisions/0023):** the non-resident history is a SEPARATE bounded keys-only ring (drop-oldest at `capacity`) rather than metadata interleaved in the stack, so this is a bounded LIRS variant (eviction-recency membership, and stack pruning bounded to `O(L_hir)` -- measured 41 at cap 4096, never `O(capacity)`), NOT textbook-exact LIRS.
 - **`Lfu`** -- the **exact frequency** member (Shah-Matani O(1) LFU): eviction by EXACT access count, with an **LRU tie-break** within a frequency. A doubly-linked list OF frequency buckets (each a recency list of the keys at that exact count) keeps get/put/increment/evict all **O(1)** -- not O(log n), no heap. A hit relinks the key to the freq+1 bucket (zero-ALLOCATION but not zero-write -- a bucket relink, pinned at <= 14 index stores/hit; a single-key bucket with no freq+1 neighbour is relabelled in place at 1 write). Frequencies are stored per bucket in a `Float64Array` (**exact to 2^53**, no 2^31 wrap). `put`-update counts as a hit; `has`/`peek` are frequency-neutral. This is the EXACT counterpart to `WTinyLfu`'s approximate sketch: reach for it when you need a **provable** "the least-frequently-used key is the victim," not a statistical estimate (audits, quota fairness, deterministic replay).
 - **`ClockPro`** -- the **CLOCK approximation of LIRS** (Jiang, Chen & Zhang, USENIX ATC'05): recency-of-recency on a CLOCK. One circular list of resident pages + per-page reference bits + three moving hands (HAND_cold eviction, HAND_hot demotion, HAND_test test-period expiry) approximate LIRS's inter-reference-recency ordering, so -- like Sieve/S3-FIFO -- a hit sets a single reference bit and moves NOTHING (**0 link writes, 1 state store** -- the headline; pinned in the gate). The hot/cold split SELF-TUNES via an integer target (`_mHot`), raised when a page still in the bounded non-resident history is re-admitted and lowered when a test page expires unreferenced; RESIDENT capacity stays EXACTLY `capacity` (only the split moves). This is the exact/approximate pair with `Lirs` the way `Lfu`/`WTinyLfu` are for frequency: `Lirs` is the exact IRR ordering with a multi-write stack move on a hit and a fixed reserve; `ClockPro` is the clock approximation with the family's cheapest hot path and no knobs. **Honest deviation (decisions/0025):** the non-resident test-page history is a SEPARATE bounded keys-only ring (drop-oldest at `capacity`), NOT interleaved into the clock -- a bounded ClockPro variant (mirroring `Lirs`), NOT textbook-exact.
-- **One `LiteCache<K,V>` surface** -- all ten members expose exactly `get` / `put` / `has` / `peek` / `delete` / `clear`, plus `size` and `capacity`. The recency/lazy-promotion/admission/adaptive difference is INTERNAL. Types ship in [`Lru.d.ts`](./Lru.d.ts); the interface is the type-checked contract that makes the one-line swap safe.
+- **`LruK`** -- LRU-K (O'Neil, O'Neil & Weikum, SIGMOD'93), K=2, the **original recency-of-recency** member: eviction by the **K-th backward distance** -- the time of a page's K-th-most-recent reference -- so a page must prove itself with `>= K` references before it is protected. Fixed **K=2** (LRU-2), no knob and no correlated-reference period (CRP). A page is **cold** until its 2nd reference, then **warm**; two `Float64` columns track the two most-recent reference times (`_r0`, `_r1`), allocated WITH the store (never per-key). The hot path is cheap and byte-countable: a **warm hit is 0 link writes + 2 stamps**; a **cold->warm promotion is at most 5 (2..5) link writes, non-exceedable** (up to 2 cold-detach + up to 3 warm-push; 5 is the reachable maximum) **+ 2 stamps**. A cold page's `_r1` is the `-Infinity` **sentinel** (null is not zero -- a cold page is K-distance *infinite*, so it is evicted first). Eviction takes the **oldest cold page first** (O(1)); only when none exists it **linearly scans the warm list for the smallest `_r1`** -- honestly **O(size) reads**, NOT amortized O(1) and NO claimed bound (the gate measures the all-warm worst-observed scan length as a per-stream regression tripwire, never a cap). vs LRU: `put X,Y,Z; get Y,Z,X` -> the next insert evicts **X** (its 2nd-most-recent reference is furthest in the past), where classic LRU evicts **Y**. **Honest deviation (decisions/0026):** the non-resident history is a bounded keys-only ring (drop-oldest at `capacity`) that re-admits a returning page as WARM, rather than the paper's unbounded timestamped `HIST(p)` -- a bounded LRU-2 variant (mirroring `Lirs`/`ClockPro`), NOT textbook-exact.
+- **One `LiteCache<K,V>` surface** -- all eleven members expose exactly `get` / `put` / `has` / `peek` / `delete` / `clear`, plus `size` and `capacity`. The recency/lazy-promotion/admission/adaptive difference is INTERNAL. Types ship in [`Lru.d.ts`](./Lru.d.ts); the interface is the type-checked contract that makes the one-line swap safe.
 - **`Bench.mjs`** -- a runnable ESM tool AND an importable module: `runBench(opts)` and `beladyOpt(trace, capacity)`. Feed it a trace, get per-policy hit ratio, writes-per-hit, machine-local ns/op, and percentage of Belady OPT.
 - **A `keys: 'int'` backing** -- opt in and the keyed index becomes an open-addressed typed-array table for STRICT zero allocation (even the index never allocates), with a fail-closed door for 32-bit signed integer keys.
 - **A zero-GC `onEvict` hook** -- fired once per eviction with the evicted `(key, value)`, e.g. to return the value to a pool.
@@ -161,6 +163,7 @@ A starting point by workload -- not a verdict. Every member shares the same surf
 | Phase-changing traffic with no time to tune | `Arc` | Self-tuning recency/frequency split, no knobs. |
 | Loop / scan-heavy access (loops LARGER than capacity, repeated full scans) | `Lirs` | Eviction by recency-of-recency (IRR): keeps a stable hot LIR set through a loop that thrashes LRU. The best loop-resister in the family (bench loop = 99.2% of Belady OPT, where the others are ~0%). Ships a bounded non-resident history (an honest, documented deviation from textbook LIRS -- see below). |
 | Loop/scan resistance with the CHEAPEST possible hot path + no tuning | `ClockPro` | The CLOCK approximation of LIRS: recency-of-recency on a clock with a 0-link-write hit (a reference bit, like Sieve/S3-FIFO) and a self-tuning hot/cold split. Reach for it over `Lirs` when the hot-path write cost matters and an approximation is enough; ships the same bounded non-resident history deviation. |
+| Protect pages only after they PROVE reuse (>= K references), the classic way | `LruK` | LRU-K (K=2): eviction by the K-th backward distance -- a page stays cold until its 2nd reference, then warm. The original recency-of-recency policy; simpler than `Lirs`/`ClockPro`. Cheap hot path (warm hit 0 links + 2 stamps); the all-warm victim is an honest O(size) min-scan (documented, not a bound). |
 
 Then **measure your own trace with the [bench tool](#measure--trust)** -- hit ratio, % of Belady optimal, writes per hit, and alloc, all oracle-checked. The measured policy is the shipped policy.
 
@@ -170,7 +173,7 @@ Then **measure your own trace with the [bench tool](#measure--trust)** -- hit ra
 
 ### The members
 
-All ten classes implement `LiteCache<K,V>`. Every method is O(1) (amortized on the default `Map` backing; see [construction options](#construction-options)).
+All eleven classes implement `LiteCache<K,V>`. Every method is O(1) (amortized on the default `Map` backing; see [construction options](#construction-options)) -- except `LruK`'s all-warm eviction victim, an honest O(size) min-`_r1` scan (documented, never a claimed bound).
 
 ```ts
 new LiteLru<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
@@ -183,6 +186,7 @@ new Arc<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
 new Lirs<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
 new Lfu<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
 new ClockPro<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
+new LruK<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
 
 cache.get(key: K): V | undefined            // returns the value AND applies the member's hit policy
 cache.put(key: K, value: V, ttlMs?): void   // insert/update (+ optional per-entry TTL); evicts the victim at capacity
@@ -223,7 +227,7 @@ interface LiteCacheOptions<K, V> {
 
 ### TTL -- opt-in, lazy expiry
 
-TTL is **opt-in, lazy, and pay-for-what-you-use**. A cache that never asks for it is byte-identical to the pre-TTL build -- no extra column, no per-op check that costs anything. When you do opt in, expiry is **lazy**: an entry expires the next time a `get`/`has`/`peek` touches it (a stale touch is a MISS and reaps the entry in place, firing `onEvict`). **No timers. No async. No background sweep.** All ten members support it identically (decisions/0017).
+TTL is **opt-in, lazy, and pay-for-what-you-use**. A cache that never asks for it is byte-identical to the pre-TTL build -- no extra column, no per-op check that costs anything. When you do opt in, expiry is **lazy**: an entry expires the next time a `get`/`has`/`peek` touches it (a stale touch is a MISS and reaps the entry in place, firing `onEvict`). **No timers. No async. No background sweep.** All eleven members support it identically (decisions/0017).
 
 ```ts
 import { LiteLru } from '@zakkster/lite-lru';
@@ -255,7 +259,7 @@ for (const k of cache.keys()) { /* ... */ }
 for (const v of cache.values()) { /* ... */ }
 ```
 
-**Our iterators allocate nothing per step; `lru-cache`'s allocate.** There is no generator anywhere (a generator allocates an `IteratorResult` object per `yield`). Instead a single hand-written iterator reuses one `{ value, done }` result, mutated in place, across every `next()`. The gate proves it: `>= 10,000` `next()` steps at capacity measure **0 B/op per step** on all ten members. (Not "lock-free" -- just zero per-step allocation.)
+**Our iterators allocate nothing per step; `lru-cache`'s allocate.** There is no generator anywhere (a generator allocates an `IteratorResult` object per `yield`). Instead a single hand-written iterator reuses one `{ value, done }` result, mutated in place, across every `next()`. The gate proves it: `>= 10,000` `next()` steps at capacity measure **0 B/op per step** on all eleven members. (Not "lock-free" -- just zero per-step allocation.)
 
 **Per-member iteration order** (only `LiteLru` is true recency):
 
@@ -271,6 +275,7 @@ for (const v of cache.values()) { /* ... */ }
 | `Lirs` | LIR list, THEN Q (resident HIR) | resident only; the non-resident history is excluded |
 | `Lfu` | ascending frequency (lowest first), MRU->LRU per bucket | frequency-bucket order, not recency |
 | `ClockPro` | clock newest -> oldest | clock order, resident only; the non-resident history is excluded |
+| `LruK` | WARM (>= K refs), THEN COLD (< K refs) | two disjoint lists concatenated, resident only; the non-resident history is excluded |
 
 - **Borrowed-tuple caveat (`entries()` / `[Symbol.iterator]`).** The yielded `[key, value]` tuple is **borrowed and reused** across steps -- read it (or copy it) before the next step. **Only a copying map materializes:** `Array.from(cache.entries(), ([k, v]) => [k, v])` or a manual per-step `[k, v]` copy. A plain `[...cache.entries()]` / `Array.from(cache)` with **no map function** collects N references to the *same* reused tuple, which the completed walk then nulls -- so every element reads `[undefined, undefined]`, not the data. A bare spread of `entries()` is a bug; copy the pair. `keys()` and `values()` yield the scalar directly, so `[...cache.keys()]` and `[...cache.values()]` **do** materialize correctly (no aliasing hazard).
 - **Recency-neutral.** A walk is a read, like `peek`: it applies no promotion / visited bump / sketch bump / segment relink, so iterating does not change the next eviction victim.
@@ -296,7 +301,7 @@ interface CacheStats { hits: number; misses: number; evictions: number; puts: nu
 - **`hits`** -- a `get(key)` that found a live resident entry. **`misses`** -- a `get(key)` that did not (absent, or stale under TTL). **`evictions`** -- an entry removed by the policy: a capacity eviction on `put`, or a stale reap. **`puts`** -- every `put(...)` call (insert or update).
 - **Exact integers to 2^53.** Plain JS number fields (not an `Int32Array` that would wrap at 2^31). For any realistic cache they never overflow.
 - **`has`/`peek` are hit/miss-neutral.** They are inspections, not accesses -- they never register a hit or a miss. (A stale `has`/`peek` under TTL still reaps the expired entry, which is a genuine eviction and is counted as one.)
-- **A stale-TTL `get` is a MISS and an EVICTION.** It counts one miss and reaps the expired entry in place (one eviction) -- consistent across all ten members.
+- **A stale-TTL `get` is a MISS and an EVICTION.** It counts one miss and reaps the expired entry in place (one eviction) -- consistent across all eleven members.
 - **The holder is borrowed (copy what you keep).** `stats()` returns the live per-instance holder **by reference**, not a snapshot -- its counters keep advancing and `resetStats()` zeroes that same object in place (a previously borrowed reference stays valid and reads back zeros). For a point-in-time snapshot, copy it: `const snap = { ...cache.stats() }`.
 - **Fail closed.** `stats()` / `resetStats()` on a cache built without `{ stats: true }` throw a `[lite-lru]`-tagged `Error` (there is no holder -- a caller bug, not a silent return of zeros). `null` is not zero.
 - **`writesPerHit` is not here.** It is a member-specific, out-of-band **measured** number (see below), not a runtime counter -- turning it into one would require a store on every hit, exactly the hot-path write the zero-GC law forbids.
@@ -305,7 +310,7 @@ The stats-ON hot path is still strictly zero-alloc: the torture Gate STATS churn
 
 ### Snapshot -- dump / restore
 
-Persist a warm cache and bring it back **warm** (decisions/0021). `dump()` serializes the whole cache to a plain, structurally-cloneable object; the static `restore()` reconstructs a fresh instance that keeps making the **same** eviction decisions -- no cold start. All ten members, one `LiteCache<K,V>` surface. It is **cold**: no substrate field, no hot-path branch, so a cache that never dumps is byte-identical to the pre-snapshot build.
+Persist a warm cache and bring it back **warm** (decisions/0021). `dump()` serializes the whole cache to a plain, structurally-cloneable object; the static `restore()` reconstructs a fresh instance that keeps making the **same** eviction decisions -- no cold start. All eleven members, one `LiteCache<K,V>` surface. It is **cold**: no substrate field, no hot-path branch, so a cache that never dumps is byte-identical to the pre-snapshot build.
 
 ```ts
 const cache = new WTinyLfu<number, string>(1024);
@@ -320,7 +325,7 @@ const warm = WTinyLfu.restore(raw);        // same residents, same sketch, same 
 ```
 
 - **Exact round-trip.** A restored cache decides FUTURE evictions identically to the un-snapshotted twin fed the same trace. Every member captures ALL policy state: Sieve's hand + visited bits; S3-FIFO/2Q's keys-only ghost; W-TinyLFU's Count-Min sketch + aging counter; ARC's adaptive `p` and both ghosts. Dropping any of these would be a fail-OPEN correctness bug (three torture controls -- `arc-p-dropped`, `sketch-dropped`, `ghost-omitted` -- prove each diverges).
-- **A plain graph.** Plain arrays + plain numbers/values, no typed-array views, so it round-trips through `structuredClone` and (for JSON-safe keys/values) through JSON. NOTE: object keys are cloned by `structuredClone` (new identity) -- documented, not a bug; pass the `dump()` result directly to `restore()` to keep object-key identity.
+- **A plain graph.** Plain arrays + plain numbers/values, no typed-array views, so it round-trips through `structuredClone` and (for JSON-safe keys/values) through JSON. NOTE: object keys are cloned by `structuredClone` (new identity) -- documented, not a bug; pass the `dump()` result directly to `restore()` to keep object-key identity. NOTE (`LruK`): a snapshot containing COLD pages is NOT plain-JSON round-trippable -- a cold page's `_r1` is the `-Infinity` sentinel (decisions/0026 D26.3), and `JSON.stringify` silently degrades `-Infinity` to `null`; `restore()` then fails CLOSED with a numeric-column error rather than admitting a corrupt cold page. `structuredClone` preserves `-Infinity` exactly and round-trips fine -- a documented, fail-closed limitation of the JSON path, not a bug.
 - **Cold, honest budget.** `dump()` MAY allocate -- there is NO zero-GC claim on it. The budget is `<= 96 bytes/entry` (measured 26.12 B/entry for `LiteLru` at capacity 4096). A **restored** cache's hot path is strict zero-alloc again (0 B/op), and `dump()` is read-only -- it does not invalidate a walk in progress.
 - **`opts` re-derives what a snapshot can't hold.** Backing, capacity and TTL-presence come FROM the snapshot; `restore(snap, opts?)` re-derives `onEvict` / `clock` / `stats` (a restored `{ stats: true }` instance starts fresh-zeroed) and REQUIRES the `ttl` default when the snapshot has TTL on.
 - **TTL is verbatim.** Per-entry expiries are captured as ABSOLUTE deadlines and are NOT rebased -- a restored entry expires exactly when it would have without the snapshot.
@@ -350,9 +355,9 @@ Run directly, it prints a table; imported, it returns structured results and pri
 
 | Constant  | Value     | Meaning                                                       |
 | --------- | --------- | ------------------------------------------------------------ |
-| `VERSION` | `'1.12.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
+| `VERSION` | `'1.13.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
 
-All ten members and `VERSION` are named exports; `LiteLru` is also the default export.
+All eleven members and `VERSION` are named exports; `LiteLru` is also the default export.
 
 ---
 
@@ -435,8 +440,11 @@ The literature sells SIEVE on scalability, but that is a multi-core systems argu
 | `S3Fifo`  | **0** link writes   | **0** link writes | **0** link writes | exactly **1** visited byte |
 | `WTinyLfu` | **0** link writes (window MRU) | **9** link writes (probation -> protected promotion, steady state) | **8** link writes (same, at the probation tail) | segment relink + a 4-counter sketch bump |
 | `ClockPro` | **0** link writes | **0** link writes | **0** link writes | exactly **1** state byte (the reference bit) |
+| `LruK` | **0** link writes (warm hit) | **5** link writes (cold->warm promotion) | **5** link writes (cold->warm promotion) | 2 reference-time stamps (`_r0`/`_r1`); +5 links only on the K-th (cold->warm) reference |
 
-`ClockPro` joins Sieve/S3-FIFO on the cheapest hot path: a hit is 0 `_next`/`_prev` writes + exactly 1 `_st` reference-bit store, regardless of where the page sits (a `CountedClockPro` proxy pins it -- a real gate). Its EVICTION is honestly **not** a constant: it is **amortized O(1)** per miss (the classic CLOCK amortization -- HAND_cold and HAND_hot each clear at most one reference bit per step), but **worst-case O(capacity)** writes on a full-scan-then-insert (fill to capacity, reference every resident page, then insert one new key -- the sweep must clear every reference bit). We do NOT pin a constant miss+evict bound; the torture gate's per-stream "worst-observed" number is a regression tripwire on that corpus, not a cap -- exactly as `Lfu` documents its hit as zero-ALLOCATION-but-not-zero-write and `Lirs` documents its bounded-variant honesty. A `CountedLru` / `CountedSieve` / `CountedS3Fifo` / `CountedWTinyLfu` / `CountedClockPro` proxy tallies every index store in the torture gate, so these counts are a regression tripwire, not a claim. This is a real but minor corroborator -- it matters most for GC-pause-sensitive realtime and game loops -- and it is never framed as "lock-free" or as a cross-library throughput win. `WTinyLfu` deliberately does NOT compete on writes-per-hit: it trades a segment relink + a 4-counter sketch bump per hit for better admission accuracy on skewed traffic -- still zero allocation, and the honest pitch is hit ratio (measure it with the bench), not fewer writes. The "Interior hit"/"Tail hit" cells are MEASURED (via `CountedWTinyLfu`, S6) for the steady-state cost once `protected` has filled to its cap: a probation hit promotes to protected AND demotes protected's LRU back to probation (two relinks in one hit) -- 9 writes for an interior probation entry, 8 for the probation tail (one fewer detach write, the same interior/tail delta as classic LRU). A window or protected-segment hit (not shown as its own row) costs the SAME 5/4 as classic LRU's interior/tail relink, since both segments use the identical move-to-head mechanic -- pinned in `test/WTinyLfu.test.js`.
+`LruK`'s warm hit is **0 link writes + 2 stamps**; a page's K-th (2nd) reference promotes it cold->warm at **at most 5 (2..5) link writes, non-exceedable** (up to 2 cold-detach + up to 3 warm-push; 5 is the reachable maximum, pinned by `CountedLruK`) + the same 2 stamps -- so "interior"/"tail" here means "the promoting reference," not a position (a warm re-hit relinks nothing wherever it sits). Its EVICTION is honestly **not** a constant when the resident set is all-warm: the cold tail is O(1), but the all-warm min-`_r1` victim is a **linear O(size) scan** (reads, not writes) -- the gate measures the worst-observed scan length as a per-stream regression tripwire, never a claimed bound.
+
+`ClockPro` joins Sieve/S3-FIFO on the cheapest hot path: a hit is 0 `_next`/`_prev` writes + exactly 1 `_st` reference-bit store, regardless of where the page sits (a `CountedClockPro` proxy pins it -- a real gate). Its EVICTION is honestly **not** a constant: it is **amortized O(1)** per miss (the classic CLOCK amortization -- HAND_cold and HAND_hot each clear at most one reference bit per step), but **worst-case O(capacity)** writes on a full-scan-then-insert (fill to capacity, reference every resident page, then insert one new key -- the sweep must clear every reference bit). We do NOT pin a constant miss+evict bound; the torture gate's per-stream "worst-observed" number is a regression tripwire on that corpus, not a cap -- exactly as `Lfu` documents its hit as zero-ALLOCATION-but-not-zero-write and `Lirs` documents its bounded-variant honesty. A `CountedLru` / `CountedSieve` / `CountedS3Fifo` / `CountedWTinyLfu` / `CountedClockPro` / `CountedLruK` proxy tallies every index store in the torture gate, so these counts are a regression tripwire, not a claim. This is a real but minor corroborator -- it matters most for GC-pause-sensitive realtime and game loops -- and it is never framed as "lock-free" or as a cross-library throughput win. `WTinyLfu` deliberately does NOT compete on writes-per-hit: it trades a segment relink + a 4-counter sketch bump per hit for better admission accuracy on skewed traffic -- still zero allocation, and the honest pitch is hit ratio (measure it with the bench), not fewer writes. The "Interior hit"/"Tail hit" cells are MEASURED (via `CountedWTinyLfu`, S6) for the steady-state cost once `protected` has filled to its cap: a probation hit promotes to protected AND demotes protected's LRU back to probation (two relinks in one hit) -- 9 writes for an interior probation entry, 8 for the probation tail (one fewer detach write, the same interior/tail delta as classic LRU). A window or protected-segment hit (not shown as its own row) costs the SAME 5/4 as classic LRU's interior/tail relink, since both segments use the identical move-to-head mechanic -- pinned in `test/WTinyLfu.test.js`.
 
 </details>
 
@@ -482,10 +490,10 @@ Hit % and % of OPT are deterministic (seeded trace, deterministic policies); `ns
 
 ## Testing
 
-**1212 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
+**1322 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
 
 ```bash
-npm test               # 1212 node:test cases (all members, laws, TTL, iteration, stats, snapshot round-trip, boundary, dts drift)
+npm test               # 1322 node:test cases (all members, laws, TTL, iteration, stats, snapshot round-trip, boundary, dts drift)
 npm run test:types     # tsc: the LiteCache<K,V> surface + one-line-swap type-check
 npm run torture        # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + gated numbers
 npm run torture:controls  # the deliberately-broken variants -- every gate must fail
@@ -494,7 +502,7 @@ npm run bench          # per-policy hit ratio + % of Belady OPT + writes/hit
 npm run verify         # test + test:types + torture + controls + test:perf, the publish gate
 ```
 
-`npm run test:perf` is a `node:test`-native hard gate (`@zakkster/lite-perf-gate`, a dev-only devDependency -- it ships NOTHING to the tarball) that COMPLEMENTS torture `t6`. It runs 20 scenarios -- a get-hit and a put-churn for each of the ten members -- on the `keys: 'int'` backing, and proves each hot path holds at **0 scavenges across N=200000 and k*N=1.6M** (scavenge scaling is the only reliable transient-allocation detector in V8), with old-gen activity, external / arrayBuffers growth, and the int-index-backing `grows` counter all pinned to **0**. A `mustFail` object-key churn that allocates one `{ id }` per op MUST trip the gate, so the teeth are proven every run. The hard gate deliberately covers ONLY the `keys: 'int'` backing (strict zero-alloc, decisions/0011); the Map-backing hot paths are honestly **AMORTIZED** (their internal resize may scavenge) and are covered by torture `t6`, NOT by this hard gate. The retained-heap lane keeps the tool's default 64 KB because a `heapUsed` delta is inherently noisy; the zero-alloc proof lives in the scavenge / old-gen / external / counter lanes at strict 0.
+`npm run test:perf` is a `node:test`-native hard gate (`@zakkster/lite-perf-gate`, a dev-only devDependency -- it ships NOTHING to the tarball) that COMPLEMENTS torture `t6`. It runs 22 scenarios -- a get-hit and a put-churn for each of the eleven members -- on the `keys: 'int'` backing, and proves each hot path holds at **0 scavenges across N=200000 and k*N=1.6M** (scavenge scaling is the only reliable transient-allocation detector in V8), with old-gen activity, external / arrayBuffers growth, and the int-index-backing `grows` counter all pinned to **0**. A `mustFail` object-key churn that allocates one `{ id }` per op MUST trip the gate, so the teeth are proven every run. The hard gate deliberately covers ONLY the `keys: 'int'` backing (strict zero-alloc, decisions/0011); the Map-backing hot paths are honestly **AMORTIZED** (their internal resize may scavenge) and are covered by torture `t6`, NOT by this hard gate. The retained-heap lane keeps the tool's default 64 KB because a `heapUsed` delta is inherently noisy; the zero-alloc proof lives in the scavenge / old-gen / external / counter lanes at strict 0.
 
 The torture suite runs tiers strictly sequentially: `t0` recency/policy laws, `t1` degenerate keys/values (the D7 undefined-value case included), `t2` adversarial sequences + the conservation invariant, `t5` differential fuzz of all members (on the default AND `keys: 'int'` backings) against independent brute-force oracles, `t6` the zero-alloc gate + the writes-per-hit counter, `t7` a ~4096-cycle soak with a WeakRef reachability census, `t8` the Belady OPT gate (the shipped `beladyOpt` differential-tested against a brute-force OPT, plus the optimality bound `optHits >= memberHits` for every member on every trace), and `t9` the controls -- each gate driven by a deliberately-broken variant that MUST fail, so no gate is decorative. `test/` and `decisions/` never enter the tarball (`npm pack --dry-run` proves it). No gate output is a FAIL.
 
@@ -502,7 +510,7 @@ The torture suite runs tiers strictly sequentially: `t0` recency/policy laws, `t
 
 ## Watch the policies
 
-A **dev-only** demo (in `demo/`, **never in the npm tarball**) animates ONE shared trace through all ten members side by side, drawing each panel STRICTLY from that member's live `dump()` snapshot after every op -- the Sieve hand + visited bits, the S3-FIFO / 2Q / ARC ghost rings, the W-TinyLFU sketch heat, the ARC adaptive `p` bar, the LIRS LIR set / Q / bounded history -- with a running **% of Belady optimal** line per member. No shadow state: what you see is literally the cache's own snapshot (the same serial form `restore()` consumes). The "one interface, different policy" thesis, seen rather than read.
+A **dev-only** demo (in `demo/`, **never in the npm tarball**) animates ONE shared trace through all eleven members side by side, drawing each panel STRICTLY from that member's live `dump()` snapshot after every op -- the Sieve hand + visited bits, the S3-FIFO / 2Q / ARC ghost rings, the W-TinyLFU sketch heat, the ARC adaptive `p` bar, the LIRS LIR set / Q / bounded history -- with a running **% of Belady optimal** line per member. No shadow state: what you see is literally the cache's own snapshot (the same serial form `restore()` consumes). The "one interface, different policy" thesis, seen rather than read.
 
 ```bash
 npm run demo           # headless: prints per-member hit% + %-of-optimal for one trace

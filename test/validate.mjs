@@ -123,6 +123,16 @@ export function activeListsOf(cache) {
         }
         return out;
     }
+    // A LruK member (decisions/0026) threads a DISJOINT resident partition through the shared
+    // _next/_prev columns (detected by its `_coldHead` cold-list endpoint): the WARM list and
+    // the COLD list. The keys-only history holds no slot. The SAME checker sums over both, in
+    // iteration order (warm then cold).
+    if (cache._coldHead !== undefined) {
+        return [
+            { name: 'lruk-warm', head: cache._warmHead, tail: cache._warmTail, doubly: true },
+            { name: 'lruk-cold', head: cache._coldHead, tail: cache._coldTail, doubly: true },
+        ];
+    }
     // A SIEVE member (decisions/0012) exposes _head/_tail on a single doubly-linked
     // FIFO ring (detected by its moving `_hand`). Classic LRU exposes the same shape
     // as a recency DLL. Both are ONE doubly-linked list -> one descriptor.
@@ -540,6 +550,51 @@ export function validate(cache, lists) {
         }
         if (cache._hist._len > cache._histCap) {
             throw new Error('[validate] clockpro history(' + cache._hist._len + ') > histCap(' + cache._histCap + ')');
+        }
+    }
+
+    // --- term 15 (LruK members, decisions/0026): the warm/cold split + the reference-time
+    // columns + the bounded history. A no-op unless the member exposes `_coldHead`. The two
+    // disjoint lists' resident population is already summed against `size` by term 3/4 via the
+    // LruK descriptor above. This term adds the LruK-specifics: every WARM slot (`_st` bit0 set)
+    // carries a FINITE r0 AND a finite r1; every COLD slot carries bit0 clear and sits at the
+    // -Infinity r1 SENTINEL (D26.3: null is not zero); `_st` uses ONLY bit0; and the non-resident
+    // history never exceeds its construction bound (hist._len <= capacity). The reference-time
+    // columns' fixed byte length is asserted by the t6/t7 gates on real (un-proxied) instances --
+    // this term reads only INDEXED cells so it also holds for a Counted* Proxy-wrapped instance.
+    if (cache._coldHead !== undefined) {
+        const WARMB = 1;
+        const r0 = cache._r0, r1 = cache._r1;
+        // Walk the WARM list: bit0 set, finite r0 + finite r1.
+        let walked = 0;
+        for (let s = cache._warmHead; s !== NIL; s = cache._next[s]) {
+            if ((cache._st[s] & WARMB) === 0) {
+                throw new Error('[validate] lruk warm slot ' + s + ' is missing the warm bit');
+            }
+            if (!Number.isFinite(r0[s]) || !Number.isFinite(r1[s])) {
+                throw new Error('[validate] lruk warm slot ' + s + ' has a non-finite reference time (r0=' + r0[s] + ', r1=' + r1[s] + ')');
+            }
+            if (cache._st[s] & ~WARMB) {
+                throw new Error('[validate] lruk _st[' + s + '] = ' + cache._st[s] + ' uses a bit beyond bit0');
+            }
+            if (++walked > cap) throw new Error('[validate] lruk warm list has a cycle (walked > capacity)');
+        }
+        // Walk the COLD list: bit0 clear, r1 at the -Infinity sentinel.
+        walked = 0;
+        for (let s = cache._coldHead; s !== NIL; s = cache._next[s]) {
+            if (cache._st[s] & WARMB) {
+                throw new Error('[validate] lruk cold slot ' + s + ' carries the warm bit');
+            }
+            if (r1[s] !== -Infinity) {
+                throw new Error('[validate] lruk cold slot ' + s + ' r1(' + r1[s] + ') != the -Infinity sentinel');
+            }
+            if (cache._st[s] & ~WARMB) {
+                throw new Error('[validate] lruk _st[' + s + '] = ' + cache._st[s] + ' uses a bit beyond bit0');
+            }
+            if (++walked > cap) throw new Error('[validate] lruk cold list has a cycle (walked > capacity)');
+        }
+        if (cache._hist._len > cache._histCap) {
+            throw new Error('[validate] lruk history(' + cache._hist._len + ') > histCap(' + cache._histCap + ')');
         }
     }
 }

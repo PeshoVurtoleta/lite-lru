@@ -22,8 +22,9 @@ import {
     lirsPolicy, lirsIntPolicy,
     lfuPolicy, lfuIntPolicy,
     clockProPolicy, clockProIntPolicy,
+    lrukPolicy, lrukIntPolicy,
     lruTtlPolicy, sieveTtlPolicy, s3fifoTtlPolicy, wtinylfuTtlPolicy,
-    slruTtlPolicy, twoqTtlPolicy, arcTtlPolicy, lirsTtlPolicy, lfuTtlPolicy, clockProTtlPolicy,
+    slruTtlPolicy, twoqTtlPolicy, arcTtlPolicy, lirsTtlPolicy, lfuTtlPolicy, clockProTtlPolicy, lrukTtlPolicy,
     SNAP_MEMBERS, runRoundTrip,
     SEED, die,
 } from './harness.mjs';
@@ -183,6 +184,21 @@ export function run() {
     fuzzPolicy(clockProPolicy, clockProConfigs);
     fuzzPolicy(clockProIntPolicy, clockProConfigs);
 
+    // The LruK MEMBER proof (decisions/0026): the LRU-K (K=2) member on BOTH backings against
+    // its own independent cold/warm/reference-time/bounded-history oracle -- same value AND same
+    // next victim AND same live size after every op, including the cold->warm promotion, the
+    // cold-tail (infinite-K-distance) eviction, the all-warm min-r1 scan victim, and the bounded
+    // history WARM re-admit. The int backing also exercises the strict-zero history ring +
+    // membership table. Caps 1..9 stress the degenerate small caps (cap 1 -> the single-page
+    // window; the all-warm-no-cold min-r1 scan); 64 exercises a normal cold/warm split.
+    const lrukConfigs = [];
+    for (let cap = 1; cap <= 9; cap++) {
+        lrukConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0x2b0 + cap });
+    }
+    lrukConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0x2bf });
+    fuzzPolicy(lrukPolicy, lrukConfigs);
+    fuzzPolicy(lrukIntPolicy, lrukConfigs);
+
     // The SEAM proof: the SAME runner drives a second policy unchanged.
     fuzzPolicy(fifoPolicy, [
         { cap: 1, keyspace: 4, ops: OPS, salt: 0x61 },
@@ -210,6 +226,7 @@ export function run() {
     fuzzPolicy(lirsTtlPolicy, ttlConfigs);
     fuzzPolicy(lfuTtlPolicy, ttlConfigs);
     fuzzPolicy(clockProTtlPolicy, ttlConfigs);
+    fuzzPolicy(lrukTtlPolicy, ttlConfigs);
 
     // The SNAPSHOT proof (decisions/0021): for EVERY member, on BOTH backings, ttl OFF
     // and ttl ON, over the 100k corpus -- dump -> restore -> dump is a fixed point AND a

@@ -272,6 +272,25 @@ export const RENDERERS = {
             drawGhost(g, geom.x, y, s.hist, 'non-resident history');
         },
     },
+    LruK: {
+        // LruK dump() shape (decisions/0026): the WARM list + COLD list (resident, values), each
+        // with its aligned r0/r1 reference-time columns, the logical clock `tick`, and the bounded
+        // non-resident history (keys only). Occupancy + the two lists are the story -- warm pages
+        // (>= K refs) render protected, cold pages (< K refs, the O(1) eviction end) render as the
+        // probation/eviction tint; the history is keys-only.
+        fields: ['warm', 'cold', 'warmR0', 'warmR1', 'coldR0', 'coldR1', 'tick', 'hist'],
+        model(s) { return pick(s, this.fields); },
+        draw(g, s, geom) {
+            let y = geom.y + 16;
+            y = drawList(g, geom.x, y, s.warm, 'warm (>= K refs)', COL.prot);
+            y = drawList(g, geom.x, y, s.cold, 'cold (< K refs, evict oldest)', COL.prob);
+            g.fillStyle = COL.dim;
+            g.font = '11px ui-monospace, monospace';
+            g.fillText('logical clock t=' + s.tick, geom.x, y);
+            y += 14;
+            drawGhost(g, geom.x, y, s.hist, 'non-resident history');
+        },
+    },
 };
 
 /** The members this module renders. Demo.test.mjs asserts this covers every engine

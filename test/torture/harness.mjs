@@ -25,11 +25,12 @@
  */
 
 import { measureOps, checkNoGc, measureAllocs, checkAllocs } from '@zakkster/lite-gc-profiler';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../../Lru.js';
 import { makeLruOracle, svz } from './oracles/lru.mjs';
 import { makeLirsOracle } from './oracles/lirs.mjs';
 import { makeLfuOracle } from './oracles/lfu.mjs';
 import { makeClockProOracle } from './oracles/clockpro.mjs';
+import { makeLruKOracle } from './oracles/lruk.mjs';
 import { makeFifoOracle, makeFifoReal } from './oracles/fifo.mjs';
 import { makeSieveOracle } from './oracles/sieve.mjs';
 import { makeS3FifoOracle } from './oracles/s3fifo.mjs';
@@ -551,6 +552,45 @@ export const clockProTtlPolicy = {
     oracle: (cap, o) => makeClockProOracle(cap, o),
 };
 
+/** Wrap a real LruK as a uniform driver. victim via `_peekVictim` (the cold tail, else the
+ *  min-`_r1` warm page -- test-only introspection, never a hot path). */
+export function wrapLruK(cache) {
+    return {
+        get: (k) => cache.get(k),
+        put: (k, v, t) => cache.put(k, v, t),
+        has: (k) => cache.has(k),
+        peek: (k) => cache.peek(k),
+        delete: (k) => cache.delete(k),
+        size: () => cache.size,
+        victim: () => cache._peekVictim(),
+        raw: cache,
+    };
+}
+
+/** The LruK policy (decisions/0026): the LRU-K (K=2) member + its own independent
+ *  cold/warm/reference-time/bounded-history oracle. Default backing (Map): arbitrary keys. */
+export const lrukPolicy = {
+    name: 'lruk',
+    real: (cap) => wrapLruK(new LruK(cap)),
+    oracle: (cap) => makeLruKOracle(cap),
+};
+
+/** The LruK policy on the INTEGER substrate backing (`keys: 'int'`), driven against the SAME
+ *  lruk oracle: the strict-zero backing (incl. the int history ring) must return byte-identical
+ *  values + victims (decisions/0011 + 0026). */
+export const lrukIntPolicy = {
+    name: 'lruk-int',
+    real: (cap) => wrapLruK(new LruK(cap, { keys: 'int' })),
+    oracle: (cap) => makeLruKOracle(cap),
+};
+
+/** LruK with an opt-in TTL default (decisions/0017). */
+export const lrukTtlPolicy = {
+    name: 'lruk-ttl',
+    real: (cap, o) => wrapLruK(new LruK(cap, o)),
+    oracle: (cap, o) => makeLruKOracle(cap, o),
+};
+
 /* -------------------------------------------------------------------------- *
  * The PARAMETERIZED differential runner (the whole point of S1).
  *
@@ -886,6 +926,57 @@ export const CLOCKPRO_WRITES_HIT_ST = 1;
  *  unlike Lfu's PROVEN <= 14. Do not call it a bound. */
 export const CLOCKPRO_WRITES_MISS_EVICT_TRIPWIRE = 64;
 
+/**
+ * A LruK subclass whose shared link columns `_next`/`_prev` AND the two reference-time columns
+ * `_r0`/`_r1` are wrapped in counting Proxies -- used ONLY in the T6 LRU-K counter sub-tier,
+ * NEVER on a measured zero-alloc path (a Proxy allocates + traps and would poison the gate). It
+ * pins LRU-K's write budget (decisions/0026, D26.2): a WARM hit relinks NOTHING (0 `_next`/`_prev`
+ * stores) and does exactly TWO stamps (`_r1`, then `_r0`); a COLD->WARM promotion is exactly
+ * FIVE link stores (2 cold detach + 3 warm push, non-exceedable) and the SAME two stamps. The
+ * Proxy writes through to the same underlying buffers the store reads, so alloc/free stay
+ * consistent (as in CountedLru).
+ */
+export class CountedLruK extends LruK {
+    constructor(capacity, options) {
+        super(capacity, options);
+        this._writes = 0;  // _next / _prev link stores
+        this._stamps = 0;  // _r0 / _r1 reference-time stores
+        const self = this;
+        const countStores = (arr, isStamp) => new Proxy(arr, {
+            set(t, prop, value) {
+                if (typeof prop === 'string' && prop !== 'length' && String(+prop) === prop) {
+                    if (isStamp) self._stamps++; else self._writes++;
+                }
+                t[prop] = value;
+                return true;
+            },
+        });
+        this._next = countStores(this._next, false);
+        this._prev = countStores(this._prev, false);
+        this._r0 = countStores(this._r0, true);
+        this._r1 = countStores(this._r1, true);
+    }
+    resetWrites() { this._writes = 0; this._stamps = 0; }
+    writes() { return this._writes; }
+    stamps() { return this._stamps; }
+}
+
+/** LruK hit baselines (measured; a REAL regression pin, decisions/0026 D26.2). A warm hit
+ *  relinks NOTHING; a cold->warm promotion is exactly 5 link stores (non-exceedable). Both do
+ *  exactly 2 reference-time stamps. */
+export const LRUK_WRITES_HIT_WARM = 0;    // a warm hit relinks nothing
+export const LRUK_WRITES_HIT_PROMOTE = 5; // a cold->warm promotion: 2 cold-detach + 3 warm-push
+export const LRUK_WRITES_HIT_STAMPS = 2;  // both paths slide r1 then stamp r0
+
+/** NOT a bound -- a per-STREAM regression TRIPWIRE only (decisions/0026, D26.5). An LruK
+ *  miss+evict is O(1) when a cold page exists (cold-tail eviction), but WORST-CASE O(size)
+ *  READS when the resident set is ALL WARM (the min-`_r1` scan walks the whole warm list). We do
+ *  NOT pin a bound. This constant tripwires the t6 all-warm stream (worst-observed scan length);
+ *  if it is ever exceeded the change is investigated -- the true worst case is O(capacity). The
+ *  t6 all-warm stream runs at capacity 4096, where the whole warm list (up to 4096 pages) is
+ *  scanned; the tripwire sits just above that with headroom. */
+export const LRUK_EVICT_SCAN_TRIPWIRE = 4352;
+
 /* -------------------------------------------------------------------------- *
  * Snapshot / restore round-trip differential (decisions/0021, D21).
  *
@@ -913,6 +1004,7 @@ export const SNAP_MEMBERS = [
     { name: 'Lirs', Ctor: Lirs, wrap: wrapLirs },
     { name: 'Lfu', Ctor: Lfu, wrap: wrapLfu },
     { name: 'ClockPro', Ctor: ClockPro, wrap: wrapClockPro },
+    { name: 'LruK', Ctor: LruK, wrap: wrapLruK },
 ];
 
 /** Structural deep-equality for two snapshots, IGNORING the capture-time field `t`

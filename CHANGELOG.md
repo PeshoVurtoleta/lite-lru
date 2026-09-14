@@ -7,6 +7,58 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.13.0] - 2026-09-14
+
+### Added
+
+- **LRU-K (`LruK`) -- the eleventh cache member** (decisions/0026, D26; O'Neil, O'Neil &
+  Weikum, "The LRU-K Page Replacement Algorithm For Database Disk Buffering", SIGMOD'93):
+  the original recency-of-recency policy -- evict by the K-th backward distance (the time of
+  a page's K-th-most-recent reference), the freq-aware ancestor of 2Q and ARC -- on the same
+  `LiteCache<K,V>` surface, so `new LiteLru(n)` swaps for `new LruK(n)` type-checked.
+  - Fixed **K=2** (LRU-2), no knob and no correlated-reference period (D26.1, D26.6). A page
+    is COLD until its 2nd reference, then WARM. Two `Float64Array` columns `_r0` (most-recent
+    reference time) and `_r1` (2nd-most-recent = the K=2 backward distance) are allocated WITH
+    the store, never per-key. A cold page's `_r1` is the `-Infinity` sentinel (D26.3: null is
+    not zero -- a cold page is K-distance infinite and is evicted first).
+  - Hot path: a warm hit slides `_r1=_r0` then stamps `_r0=++_t` -- 0 link writes, exactly 2
+    stamps (the `Sieve`/`S3Fifo` 0-link-write headline). A cold->warm promotion unlinks the
+    cold list and pushes the warm list -- at most 5 (2..5) link writes, non-exceedable (up to
+    2 cold-detach + up to 3 warm-push; 5 is the reachable maximum, verified by static counting
+    and pinned by `CountedLruK`) + 2 stamps. `has`/`peek` are reference-neutral.
+  - Two disjoint lists (COLD, WARM) over the shared `_next`/`_prev` columns. Eviction: the
+    cold tail first (O(1)); only when no cold page exists, a linear min-`_r1` scan over the
+    warm list -- honestly O(size) reads, O(1) writes, NOT amortized O(1) and with no claimed
+    bound (t6 measures the all-warm worst-observed scan length as a per-stream regression
+    tripwire, never a cap; the true worst case is O(capacity)). Resident value capacity stays
+    EXACTLY capacity (`|cold|+|warm|==size`).
+  - Bounded keys-only non-resident history (`LruKHistory extends ArcGhost`, cap = capacity,
+    drop-oldest, D26.4 -- an honest bounded variant like LIRS D23 / ClockPro D25.2, not the
+    paper's unbounded timestamped HIST(p)); a `put` of a key still in it re-admits the page
+    WARM at `_r1=_r0=++_t`. Gate LRUK strict zero-alloc on `keys:'int'` (0.00000 B/op;
+    Map-backing 0.00032 B/op amortized), `maxPauseMs` 0.000.
+  - `LruK` inherits TTL, zero-GC iteration (resident-only, warm->cold order), opt-in stats,
+    and snapshot/restore (tag `m:'LruK'`; both lists + the `r0`/`r1` columns + the logical
+    clock + the bounded history captured verbatim, fail-closed on restore -- dropping the
+    `_r1` column, the clock, or the history is rejected as a divergence). A snapshot with COLD
+    pages is not plain-JSON round-trippable (the `-Infinity` sentinel degrades to `null` under
+    `JSON.stringify`, and restore then fails closed with a numeric-column error; `structuredClone`
+    round-trips fine, D26.7).
+- `LruK` in the shipped bench (`MEMBERS` 10 -> 11) and the policy-visualization demo (a
+  `LruK` renderer drawing the cold/warm lists strictly from `dump()`); the `LruK` class on
+  `Lru.d.ts`. Two new `test/perf/PerfGate.test.mjs` scenarios (`LruK` get-hit + put-churn,
+  20 -> 22).
+
+### Changed
+
+- Cache-member roster ten -> eleven (`LiteLru`, `Sieve`, `S3Fifo`, `WTinyLfu`, `Slru`,
+  `TwoQ`, `Arc`, `Lirs`, `Lfu`, `ClockPro`, `LruK`); README + `llms.txt` positioning of
+  `LruK` as the original recency-of-recency policy (the ancestor of 2Q/ARC).
+- `test/Snapshot.test.js` `MEMBERS` extended to all eleven members; `validate()` term,
+  torture harness, and an independent LRU-K oracle extended to `LruK`.
+- Test count 1212 -> 1324 node:test cases (the new `LruK` boundary suite incl. two
+  hand-computed victim traces with a pure-LRU control, plus the extended cross-member suites).
+
 ## [1.12.0] - 2026-09-14
 
 ### Added

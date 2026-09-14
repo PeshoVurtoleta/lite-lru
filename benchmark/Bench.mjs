@@ -29,7 +29,7 @@
  * @license MIT
  */
 
-import {LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, VERSION} from '../Lru.js';
+import {LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, VERSION} from '../Lru.js';
 
 /* -------------------------------------------------------------------------- *
  * Seeded PRNG -- xorshift32, the same generator the torture harness uses, so a
@@ -278,6 +278,7 @@ function instrument(cache, counter) {
     if (cache._vis) cache._vis = wrap(cache._vis); // Sieve's visited column
     if (cache._handCold !== undefined) cache._st = wrap(cache._st); // ClockPro reference-bit column (a hit is 1 _st store)
     else if (cache._sNext) { cache._sNext = wrap(cache._sNext); cache._sPrev = wrap(cache._sPrev); } // Lirs stack S
+    if (cache._coldHead !== undefined) { cache._r0 = wrap(cache._r0); cache._r1 = wrap(cache._r1); } // LruK reference-time columns (a hit stamps 2)
     if (cache._fNext) { // Lfu key lists + bucket pool (a hit relinks across frequency buckets)
         cache._fNext = wrap(cache._fNext); cache._fPrev = wrap(cache._fPrev); cache._kB = wrap(cache._kB);
         cache._bFreq = wrap(cache._bFreq); cache._bNext = wrap(cache._bNext); cache._bPrev = wrap(cache._bPrev);
@@ -342,6 +343,7 @@ const MEMBERS = [
     {name: 'Lirs', ctor: Lirs},
     {name: 'Lfu', ctor: Lfu},
     {name: 'ClockPro', ctor: ClockPro},
+    {name: 'LruK', ctor: LruK},
 ];
 
 /* -------------------------------------------------------------------------- *

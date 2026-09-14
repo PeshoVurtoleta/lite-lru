@@ -3,7 +3,7 @@
 //   npm run demo                 (headless per-member summary)
 //   node demo/Visualize.mjs      (same)
 //
-// The headless visualization engine. It constructs ALL SEVEN members once, reuses
+// The headless visualization engine. It constructs ALL ELEVEN members once, reuses
 // them across every step, feeds one shared trace, and reads each member's live
 // state via dump() -- the SINGLE honest source (D22.1). It NEVER re-implements a
 // member's mechanics.
@@ -16,9 +16,9 @@
 //
 // Repo-only dev artifact; NEVER shipped in the npm tarball (D22.3).
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../Lru.js';
 
-/** The ten family members, in the roster order Bench.mjs uses (so a demo run and
+/** The eleven family members, in the roster order Bench.mjs uses (so a demo run and
  *  a bench run line up member-for-member). Each is constructed once per engine. */
 export const MEMBER_DEFS = [
     { name: 'LiteLru', ctor: LiteLru },
@@ -31,6 +31,7 @@ export const MEMBER_DEFS = [
     { name: 'Lirs', ctor: Lirs },
     { name: 'Lfu', ctor: Lfu },
     { name: 'ClockPro', ctor: ClockPro },
+    { name: 'LruK', ctor: LruK },
 ];
 
 export const MEMBER_NAMES = MEMBER_DEFS.map((d) => d.name);
