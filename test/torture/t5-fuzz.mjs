@@ -23,8 +23,9 @@ import {
     lfuPolicy, lfuIntPolicy,
     clockProPolicy, clockProIntPolicy,
     lrukPolicy, lrukIntPolicy,
+    mqPolicy, mqIntPolicy,
     lruTtlPolicy, sieveTtlPolicy, s3fifoTtlPolicy, wtinylfuTtlPolicy,
-    slruTtlPolicy, twoqTtlPolicy, arcTtlPolicy, lirsTtlPolicy, lfuTtlPolicy, clockProTtlPolicy, lrukTtlPolicy,
+    slruTtlPolicy, twoqTtlPolicy, arcTtlPolicy, lirsTtlPolicy, lfuTtlPolicy, clockProTtlPolicy, lrukTtlPolicy, mqTtlPolicy,
     SNAP_MEMBERS, runRoundTrip,
     SEED, die,
 } from './harness.mjs';
@@ -199,6 +200,21 @@ export function run() {
     fuzzPolicy(lrukPolicy, lrukConfigs);
     fuzzPolicy(lrukIntPolicy, lrukConfigs);
 
+    // The Mq MEMBER proof (decisions/0027): the Multi-Queue (m=8) member on BOTH backings against
+    // its own independent 8-band/refcount/logical-clock/bounded-Qout oracle -- same value AND same
+    // next victim AND same live size after every op, including the re-band move-to-band-MRU, the
+    // fixed 7-step aging demotion (band decay), the lowest-queue-tail eviction, and the bounded
+    // Qout refcount-preserving re-admit. The int backing also exercises the strict-zero Qout ring
+    // + its parallel refcount ring + membership table. Caps 1..9 stress the degenerate small caps
+    // (short lifeTime -> frequent demotions); 64 exercises a normal multi-band spread.
+    const mqConfigs = [];
+    for (let cap = 1; cap <= 9; cap++) {
+        mqConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0x3c0 + cap });
+    }
+    mqConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0x3cf });
+    fuzzPolicy(mqPolicy, mqConfigs);
+    fuzzPolicy(mqIntPolicy, mqConfigs);
+
     // The SEAM proof: the SAME runner drives a second policy unchanged.
     fuzzPolicy(fifoPolicy, [
         { cap: 1, keyspace: 4, ops: OPS, salt: 0x61 },
@@ -227,6 +243,7 @@ export function run() {
     fuzzPolicy(lfuTtlPolicy, ttlConfigs);
     fuzzPolicy(clockProTtlPolicy, ttlConfigs);
     fuzzPolicy(lrukTtlPolicy, ttlConfigs);
+    fuzzPolicy(mqTtlPolicy, ttlConfigs);
 
     // The SNAPSHOT proof (decisions/0021): for EVERY member, on BOTH backings, ttl OFF
     // and ttl ON, over the 100k corpus -- dump -> restore -> dump is a fixed point AND a

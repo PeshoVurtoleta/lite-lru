@@ -9,8 +9,8 @@
  *   E single-capacity cache: every put evicts; head===tail always.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK, wrapMq } from './harness.mjs';
 
 export function run() {
     // --- A: re-hit the MRU N times (the head-re-hit fast path) -------------------
@@ -633,12 +633,60 @@ export function run() {
         }
     }
 
+    // --- S: Mq degenerate caps + band decay + lowest-queue eviction + bounded Qout +
+    // conservation (decisions/0027) --------------------------------------------------
+    {
+        // Degenerate caps 1..4: every put churns, conservation holds, Qout stays bounded,
+        // sum(|Q0..Q7|) == size, and every resident's _qn is a valid 0..7 band index.
+        for (const cap of [1, 2, 3, 4]) {
+            const c = new Mq(cap);
+            for (let i = 0; i < 500; i++) {
+                c.put(i, i);
+                if ((i & 1) === 0) c.get(i); // some 2nd references -> band growth + relinks
+                check(c.size === Math.min(cap, i + 1), () => 't2 S: mq cap-' + cap + ' size drift at ' + i);
+                check(c._hist._len <= cap, () => 't2 S: mq cap-' + cap + ' Qout over bound');
+                validate(c);
+            }
+            c.clear();
+            check(c.size === 0, () => 't2 S: mq cap-' + cap + ' not empty after clear');
+            check(c._t === 0, () => 't2 S: mq cap-' + cap + ' logical clock not reset after clear');
+            check(c._freeListLength() === cap, () => 't2 S: mq cap-' + cap + ' free list != capacity after clear');
+            let ends = true;
+            for (let q = 0; q < 8; q++) if (c._qHead[q] !== -1 || c._qTail[q] !== -1) ends = false;
+            check(ends, () => 't2 S: mq cap-' + cap + ' band queue ends not reset after clear');
+            validate(c);
+        }
+
+        // Frequency scan resistance: a hot working set referenced repeatedly climbs into high
+        // bands and survives a distinct one-hit flood far larger than capacity (fresh keys enter
+        // Q0 and are evicted from the lowest-queue tail first), at EXACTLY capacity. This is also
+        // the adversarial band-decay path (idle hot blocks age down over the flood but are kept
+        // hot by the periodic re-reference).
+        {
+            const N = 64;
+            const c = new Mq(N, { keys: 'int' });
+            for (let i = 0; i < N; i++) c.put(i, i);
+            const hot = [0, 1, 2, 3, 4, 5, 6, 7];
+            for (const h of hot) for (let t = 0; t < 10; t++) c.get(h); // climb into high bands
+            for (let i = 0; i < 8000; i++) {
+                for (const h of hot) check(c.get(h) === h, () => 't2 S: mq hot key ' + h + ' lost mid-scan at ' + i);
+                c.put(1000 + i, i);
+                check(c.size === N, () => 't2 S: mq drifted from capacity during the scan');
+                check(c._hist._len <= N, () => 't2 S: mq Qout over bound during the scan');
+                if ((i & 511) === 0) validate(c);
+            }
+            for (const h of hot) check(c.has(h), () => 't2 S: mq hot key ' + h + ' evicted by the scan (no scan resistance)');
+            validate(c);
+            void wrapMq(c);
+        }
+    }
+
     // --- J: the LAZY-SEMANTICS TRIPLE as executable laws (decisions/0017, D17.3) --
     // For EVERY member: an expired entry is a MISS through get/has/peek alike, and each
     // of the three REAPS it in place (fires onEvict once, size drops). A fresh Infinity
     // sibling is untouched by any of them. validate() nets each reap.
     {
-        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu], ['ClockPro', ClockPro], ['LruK', LruK]];
+        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu], ['ClockPro', ClockPro], ['LruK', LruK], ['Mq', Mq]];
         // one probe method per fresh cache (each reap is destructive, so isolate them)
         const probes = [
             ['get', (c, k) => c.get(k), undefined],
@@ -678,7 +726,7 @@ export function run() {
     {
         const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo],
             ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu],
-            ['ClockPro', ClockPro], ['LruK', LruK]];
+            ['ClockPro', ClockPro], ['LruK', LruK], ['Mq', Mq]];
         for (const [name, C] of members) {
             for (const keys of [undefined, 'int']) {
                 const o = keys ? { keys } : undefined;

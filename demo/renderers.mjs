@@ -291,6 +291,28 @@ export const RENDERERS = {
             drawGhost(g, geom.x, y, s.hist, 'non-resident history');
         },
     },
+    Mq: {
+        // Mq dump() shape (decisions/0027): the 8 band queues Q0..Q7 (resident, values), each with
+        // its aligned rc/exq columns, the logical clock `tick`, and the bounded Qout history (keys +
+        // refcounts). Occupancy + the per-band spread are the story -- higher bands (more frequently
+        // referenced) render protected, Q0 (the eviction end) renders the probation/eviction tint;
+        // Qout is keys-only.
+        fields: ['queues', 'rc', 'exq', 'tick', 'hist', 'histRc'],
+        model(s) { return pick(s, this.fields); },
+        draw(g, s, geom) {
+            let y = geom.y + 16;
+            for (let q = 7; q >= 0; q--) {
+                const list = s.queues[q];
+                if (list.slots.length === 0) continue;
+                y = drawList(g, geom.x, y, list, 'Q' + q + (q === 0 ? ' (evict end)' : ''), q === 0 ? COL.prob : COL.prot);
+            }
+            g.fillStyle = COL.dim;
+            g.font = '11px ui-monospace, monospace';
+            g.fillText('logical clock t=' + s.tick, geom.x, y);
+            y += 14;
+            drawGhost(g, geom.x, y, s.hist, 'non-resident Qout (keys)');
+        },
+    },
 };
 
 /** The members this module renders. Demo.test.mjs asserts this covers every engine

@@ -7,8 +7,9 @@ frequency-admission W-TinyLFU member (WTinyLfu), the two scan-resistant
 baselines Segmented-LRU (Slru) and 2Q (TwoQ), the no-tuning adaptive member
 ARC (Arc), the scan/loop-resistant recency-of-recency member LIRS (Lirs), the
 O(1) EXACT least-frequently-used member (Lfu), the CLOCK-approximation-of-LIRS
-member CLOCK-Pro (ClockPro), and the classic recency-of-recency member LRU-K
-(K=2) (LruK)
+member CLOCK-Pro (ClockPro), the classic recency-of-recency member LRU-K
+(K=2) (LruK), and the frequency-band-with-logical-decay member Multi-Queue
+(m=8) (Mq)
 expose the
 SAME get/put/has/peek/delete/clear API, so the eviction policy is a one-line
 constructor swap. Single-file ESM, zero runtime
@@ -16,7 +17,7 @@ dependencies, node:test only. Ships a runnable + importable benchmark tool
 (Bench.mjs) with Belady OPT so a caller measures which policy fits their trace
 instead of guessing.
 
-## Status: 1.13.0 - LruK (LruK), the ELEVENTH member (O'Neil, O'Neil & Weikum, "The LRU-K Page Replacement Algorithm For Database Disk Buffering", SIGMOD'93): the original recency-of-recency policy -- evict by the K-th BACKWARD DISTANCE (the time of a page's K-th-most-recent reference), the freq-aware ancestor of 2Q and ARC. Fixed K=2 (LRU-2), NO knob and NO correlated-reference period (CRP, D26.6). A page is COLD until its 2nd reference, then WARM; two Float64 columns _r0 (most-recent reference time) and _r1 (2nd-most-recent = the K=2 backward distance) are allocated WITH the store, never per-key. The HOT PATH is a pure stamp: a warm hit slides _r1=_r0 then _r0=++_t -- 0 link writes, exactly 2 stamps (the Sieve/S3Fifo 0-link-write headline); a cold->warm promotion unlinks the cold list and pushes the warm list -- AT MOST 5 (2..5) link writes, non-exceedable (up to 2 cold-detach + up to 3 warm-push; 5 is the reachable maximum, verified by static counting AND pinned by CountedLruK) + the same 2 stamps. This is a REAL fixed-size-surgery ceiling, unlike ClockPro's honest O(capacity) eviction. A cold page's _r1 sits at the -Infinity SENTINEL (D26.3: null is not zero -- a cold page is K-distance INFINITE and is evicted first). Two disjoint lists ride the shared _next/_prev columns (COLD, WARM). EVICTION: the cold tail first (O(1)); only when NO cold page exists, a LINEAR min-_r1 scan over the warm list -- honestly O(size) READS, O(1) writes, NOT amortized O(1) and with NO claimed bound (t6 measures the all-warm worst-observed scan length as a per-stream regression TRIPWIRE, never a cap; the true worst case is O(capacity)) -- we do NOT repeat a constant miss+evict overclaim. The non-resident history is a SEPARATE bounded keys-only ring (LruKHistory extends ArcGhost, cap = capacity, drop-oldest, D26.4 -- an honest bounded variant like Lirs D23 / ClockPro D25.2, not the paper's unbounded timestamped HIST(p)); a put of a key still in it re-admits the page WARM at _r1=_r0=++_t. RESIDENT value capacity stays EXACTLY capacity (|cold|+|warm|==size). Distinguishing example: put X,Y,Z; get Y,Z,X -> the next insert evicts X (min-_r1), where classic LRU evicts Y. Gate LRUK strict zero-alloc on keys:'int' (0.00000 B/op; Map-backing 0.00032 B/op amortized), maxPauseMs 0.000. new LiteLru(n) <-> ... <-> new ClockPro(n) <-> new LruK(n), type-checked; TTL / iteration (resident-only, warm->cold order) / stats / snapshot (both lists + the r0/r1 columns + the logical clock + the bounded history captured verbatim, tag m:'LruK', fail-closed restore -- dropping any field is fail-OPEN and caught by the t9 lruk-drop-r1 control) / bench / the demo all extend to the eleventh member. A snapshot with COLD pages is NOT plain-JSON round-trippable (the -Infinity sentinel degrades to null under JSON.stringify, and restore then fails CLOSED with a numeric-column error; structuredClone round-trips fine, D26.7). The lite-perf-gate dev-only zero-alloc node:test gate (`npm run test:perf` in `verify`) extends to 22 int-backed scenarios (all eleven members x get-hit + put-churn). Built atop ClockPro (1.12.0: the CLOCK approximation of LIRS + the lite-perf-gate integration), LFU (1.11.0: the O(1) exact least-frequently-used member), LIRS (1.10.0: recency-of-recency, bounded non-resident history, loop 99.2% of Belady OPT), the S13/S15 policy-visualization demo (a never-shipped demo/ that animates all eleven members on one trace drawn strictly from dump(), served by a zero-dep Node demo/serve.mjs, fails closed off-server), snapshot / restore (1.8.0: a COLD dump() + static restore(snap, opts?), the SoA columns ARE the serial form, no substrate field / no hot-path branch, EXACT future-eviction round-trip, fail-closed restore tag {f,m,cap,keys,ttl,t}, TTL absolute-not-rebased), the no-tuning adaptive member Arc (1.7.0), the scan-resistant baselines Slru/TwoQ (1.6.0), opt-in zero-GC stats (1.5.0), zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool.
+## Status: 1.14.0 - Mq (Mq), the TWELFTH member (Zhou, Philbin & Li, "The Multi-Queue Replacement Algorithm for Second Level Buffer Caches", USENIX ATC'01): frequency BANDS with LOGICAL-time decay, built for SECOND-LEVEL / server buffer caches where a first-level cache has already absorbed the recency and frequency-with-aging is what's left. Each block carries a reference count; its band is band(rc)=min(floor(log2(rc)),7) -- the highest set bit of rc, CLAMPED (D27.3: rc>=128 saturates to Q7, a FAIL-CLOSED guard so Math.clz32 never wraps _qn/_qHead/_qTail out of range). Eight LRU queues Q0..Q7 ride the shared _next/_prev columns (_qHead/_qTail Int32Array(8), _qn Uint8 band per slot). HOT PATH (honest, D27.6): a hit bumps rc, re-bands, and MOVES the block to the MRU of its band -- 0 link writes when already the band MRU, else AT MOST 5 (4..5: <=2 detach + <=3 head push) -- then stamps _exq=_t+lifeTime (lifeTime=capacity, on a LOGICAL clock _t SEPARATE from the wall-clock ttl, D27.2), then runs a FIXED m-1=7-step aging sweep demoting each band's idle tail one level toward Q0 (<=4 links each). This is NOT a 0-write lazy-promotion hit (unlike Sieve/ClockPro/LruK-warm) -- said plainly. The per-access cost is a PROVEN non-exceedable <=33 link writes (5 relink + 7x4 aging) + 3 metadata stamps: reset-on-demote FORBIDS CASCADE (a demoted block lands at the HEAD of an already-visited lower band with a fresh _exq, never re-examined this sweep), so it is a REAL constant like Lfu's proven 14 (NOT a tripwire), pinned + measured by CountedMq (worst-observed 17 links, max 3 demotions/sweep, never >7). EVICTION: the LRU tail of the LOWEST non-empty queue (O(1), D27.4) -- a decayed once-hot block in Q0 goes before a still-hot high-band one. Bounded keys-only + REFCOUNT Qout (MqHistory extends ArcGhost + a parallel Float64 refcount ring, cap=capacity, drop-oldest, D27.5); a put of a key still in Qout re-admits it at rc=savedRc+1 (an evicted rc-5 block re-enters at band(6)=Q2). vs Lfu: Mq FORGETS via logical decay where Lfu never does. Gate MQ strict zero-alloc (keys:'int', 0.00000 B/op), maxPauseMs 0.000. new LiteLru(n) <-> ... <-> new LruK(n) <-> new Mq(n), type-checked; TTL / iteration / stats / snapshot (the 8 queues + the rc/exq columns + the logical clock + the Qout keys+refcounts verbatim, tag m:'Mq', fail-closed restore -- dropping any is fail-OPEN, caught by t9 mq-no-aging / mq-drop-rc) / bench / the demo all extend to the twelfth member. This release ALSO adds a repo-only GUIDE.md -- a "which member do I pick" field guide (a decision table + a mermaid flowchart + a per-member mental model of all twelve + measured seeded-bench numbers), whose GOLDEN RULE is to MEASURE your own trace with runBench + beladyOpt rather than choose by theory; it documents the honest finding that ClockPro scores 0% of Belady OPT on a pure loop (where Lirs hits 99.2% and WTinyLfu 94.4%) despite being the CLOCK approximation of LIRS -- theory is not measurement. The lite-perf-gate dev-only zero-alloc node:test gate (`npm run test:perf` in `verify`) extends to 24 int-backed scenarios (all twelve members x get-hit + put-churn). Built atop LruK (1.13.0: the original LRU-K recency-of-recency member), ClockPro (1.12.0: the CLOCK approximation of LIRS + the lite-perf-gate integration), LFU (1.11.0: the O(1) exact least-frequently-used member), LIRS (1.10.0: recency-of-recency, bounded non-resident history, loop 99.2% of Belady OPT), the S13/S15 policy-visualization demo (a never-shipped demo/ that animates all twelve members on one trace drawn strictly from dump(), served by a zero-dep Node demo/serve.mjs, fails closed off-server), snapshot / restore (1.8.0: a COLD dump() + static restore(snap, opts?), the SoA columns ARE the serial form, no substrate field / no hot-path branch, EXACT future-eviction round-trip, fail-closed restore tag {f,m,cap,keys,ttl,t}, TTL absolute-not-rebased), the no-tuning adaptive member Arc (1.7.0), the scan-resistant baselines Slru/TwoQ (1.6.0), opt-in zero-GC stats (1.5.0), zero-GC iteration (1.4.0), opt-in zero-GC TTL (1.3.0), and the shipped bench + Belady OPT tool.
 
 The family is the identity from v1.0.0: classic LRU is the reference member +
 differential oracle + honest floor, SIEVE is the headline, and the shipped
@@ -33,13 +34,16 @@ that substrate (decisions/0012). S9 (this session) adds the docs, the shipped
 bench + Belady OPT tool, and the OPT torture gate -- with ZERO change to Lru.js /
 Lru.d.ts (the three version sites move together, only at /release).
 
-## Members (decisions/0001, 0012, 0013, 0014, 0015, 0016, 0023, 0024, 0025, 0026)
+## Members (decisions/0001, 0012, 0013, 0014, 0015, 0016, 0023, 0024, 0025, 0026, 0027)
 
-All classes implement LiteCache<K,V>; the recency/lazy-promotion/admission/adaptive
-difference is INTERNAL, so new LiteLru(n) swaps for new Sieve(n), new S3Fifo(n),
+All classes implement LiteCache<K,V>; the recency/lazy-promotion/admission/adaptive/
+frequency difference is INTERNAL, so new LiteLru(n) swaps for new Sieve(n), new S3Fifo(n),
 new WTinyLfu(n), new Slru(n), new TwoQ(n), new Arc(n), new Lirs(n), new Lfu(n),
-new ClockPro(n) or new LruK(n) and stays
-type-checked.
+new ClockPro(n), new LruK(n) or new Mq(n) and stays
+type-checked. For which member to pick per workload (a decision flowchart + measured
+bench numbers + a per-member mental model), see GUIDE.md in the repo (repo-only, not in
+the npm tarball); the golden rule is to MEASURE your own trace with runBench + beladyOpt
+rather than choose by theory.
 
 - LiteLru: classic Least-Recently-Used. get/put promote to most-recently-used;
   at capacity a new key evicts the LRU tail and reuses its slot in place. A hit
@@ -202,6 +206,29 @@ type-checked.
   NOT plain-JSON round-trippable -- the cold _r1 sentinel (-Infinity) degrades to null under
   JSON.stringify, so restore() fails CLOSED with a numeric-column error; structuredClone
   round-trips fine.
+- Mq: Multi-Queue (Zhou, Philbin & Li, USENIX ATC'01), m=8, decisions/0027. Rank by FREQUENCY
+  BAND with LOGICAL-time decay. Each block carries a reference count; its band is
+  band(rc)=min(floor(log2(rc)),7) - the highest set bit of rc, CLAMPED (D27.3: rc>=128 saturates
+  to Q7 so Math.clz32, which coerces mod 2^32, never wraps _qn/_qHead/_qTail out of range - a
+  FAIL-CLOSED guard, not an optimization). 8 LRU queues Q0..Q7 ride the shared _next/_prev columns
+  (_qHead/_qTail Int32Array(8), _qn Uint8 band per slot). HOT PATH (honest, D27.6): a hit bumps rc,
+  re-bands, and MOVES the block to the MRU of its band - 0 link writes when already the band MRU,
+  else AT MOST 5 (4..5: <=2 detach + <=3 head push) - then stamps _exq=_t+lifeTime (lifeTime=capacity, on
+  a LOGICAL clock _t SEPARATE from the wall-clock ttl, D27.2), then runs a FIXED m-1=7-step aging
+  sweep: for each band Q1..Q7 demote its idle tail one level toward Q0 (<=4 links each). This is NOT
+  a 0-write lazy-promotion hit (unlike Sieve/ClockPro/LruK-warm) - said plainly. The per-access cost
+  is a PROVEN non-exceedable <=33 link writes (5 relink + 7x4 aging) + 3 metadata stamps (_rc,_qn,
+  _exq): reset-on-demote FORBIDS CASCADE (a demoted block lands at the HEAD of an already-visited
+  lower band with a fresh _exq, never re-examined this sweep), so it is a REAL constant (like Lfu's
+  proven 14), pinned + measured by CountedMq (worst-observed 17 links, 3 demotions/sweep, never >7).
+  EVICTION: the LRU tail of the LOWEST non-empty queue (O(1), D27.4) - a decayed once-hot block in
+  Q0 goes before a still-hot high-band one. Bounded keys-only + REFCOUNT Qout (MqHistory extends
+  ArcGhost + a parallel Float64 refcount ring, cap=capacity, drop-oldest, D27.5); a put of a key
+  still in Qout re-admits it at rc=savedRc+1 (an evicted rc-5 block re-enters at band(6)=Q2). vs
+  Lfu: Mq FORGETS via logical decay where Lfu never does. Gate MQ strict zero-alloc (keys:'int',
+  0.00000 B/op), maxPauseMs 0.000; snapshot captures the 8 queues + the rc/exq columns + the logical
+  clock + the Qout keys+refcounts verbatim, tag m:'Mq', fail-closed restore (dropping any is
+  fail-OPEN - t9 mq-no-aging / mq-drop-rc catch it).
 
 ## Uniform surface (LiteCache<K,V>)
 
@@ -210,7 +237,7 @@ type-checked.
   new Slru(capacity, options?) / new TwoQ(capacity, options?) /
   new Arc(capacity, options?) / new Lirs(capacity, options?) /
   new Lfu(capacity, options?) / new ClockPro(capacity, options?) /
-  new LruK(capacity, options?)
+  new LruK(capacity, options?) / new Mq(capacity, options?)
   - capacity: integer >= 1, else a [lite-lru]-tagged RangeError at the door.
 - get(key) -> V | undefined. Applies the member's hit policy (LiteLru promotes to
   MRU; Sieve and S3Fifo set the visited bit; WTinyLfu bumps the frequency sketch
@@ -285,7 +312,7 @@ type-checked.
   out-of-band MEASUREMENT (a runtime counter would need a store per hit).
 - Gated: t6 Gate STATS (>= 60000 ops at capacity, { stats: true }) = 0 B/op, holder
   identity stable, holder plain with exactly the four names; Stats.test.js brute-tally
-  parity over the T5 corpus (all eleven members); t9 stats-double-count + stats-counts-
+  parity over the T5 corpus (all twelve members); t9 stats-double-count + stats-counts-
   peek controls (each diverges from the brute tally and fails).
 
 ## TTL (decisions/0017, D17)
@@ -299,7 +326,7 @@ type-checked.
   toward size until touched or purgeStale()'d.
 - Fail-closed: ttlMs on a cache with no ttl configured throws [lite-lru]; ttl/ttlMs
   <= 0 / NaN throw [lite-lru] RangeError; Infinity = never (NEVER 0).
-- All eleven members support it identically over the shared SlotStore _exp column.
+- All twelve members support it identically over the shared SlotStore _exp column.
 - Off-path decision (measured, D17): a single monomorphic this._exp===null guard.
   ttl-OFF writes-per-hit unchanged (LiteLru 0/5/4, Sieve/S3Fifo 0 links + 1 vis,
   WTinyLfu window-MRU 0); ttl-ON strict zero-alloc (maxMajor 0), _exp.byteLength
@@ -316,7 +343,7 @@ type-checked.
   yield). One hand-written iterator reuses a single {value,done} result mutated in
   place; the iterator object is allocated once per keys()/values()/entries() call
   (cold), never per step. Gated: >=10,000 next() steps at capacity = 0 B/op per step
-  on all eleven members. Honest pitch: our iterators allocate nothing per step,
+  on all twelve members. Honest pitch: our iterators allocate nothing per step,
   lru-cache's allocate. Never "lock-free".
 - Per-member ORDER (only LiteLru is true recency): LiteLru MRU->LRU (recency);
   Sieve newest->oldest (FIFO insertion, NOT recency); S3Fifo MAIN newest->oldest
@@ -375,7 +402,7 @@ type-checked.
   backings never grow, writes-per-hit unchanged. dump() is read-only (no _ver bump), so
   a walk in progress is not invalidated.
 - Gated: t6 Gate SNAP (0 B/op restored hot path + dump B/entry + writes-per-hit), t5
-  round-trip differential over the 100k corpus (all eleven members x both backings x ttl
+  round-trip differential over the 100k corpus (all twelve members x both backings x ttl
   off/on), Snapshot.test.js (round-trip identity + 8 rejections + capacity law + interop
   + degenerate caps/keys/values), t7 4096 dump/restore cycles, t9 three drop controls.
 
@@ -422,9 +449,9 @@ runnable tool, not a second implementation.
 
 ## Demo (decisions/0022, D22; dev-only, NEVER shipped)
 
-demo/ animates ONE shared trace through all eleven members, each panel drawn STRICTLY from that member's live dump() snapshot (D22.1, no shadow state), with a running %-of-Belady-optimal line. npm run demo (headless per-member summary via demo/Visualize.mjs) and npm run demo:serve (zero-dep Node server demo/serve.mjs -> http://localhost:8013/, browser page demo/visuals.html imports only ../Lru.js). demo/ is absent from files[]; Lru.js / Lru.d.ts / Bench.mjs are consumed, never edited. Must be run through the Node server (npm run demo:serve -> http://localhost:8013/), NOT as a static file or an IDE static preview: /trace.json is a dynamic route and ES modules need an http origin, so off-server the page fails closed with an actionable message instead of hanging.
+demo/ animates ONE shared trace through all twelve members, each panel drawn STRICTLY from that member's live dump() snapshot (D22.1, no shadow state), with a running %-of-Belady-optimal line. npm run demo (headless per-member summary via demo/Visualize.mjs) and npm run demo:serve (zero-dep Node server demo/serve.mjs -> http://localhost:8013/, browser page demo/visuals.html imports only ../Lru.js). demo/ is absent from files[]; Lru.js / Lru.d.ts / Bench.mjs are consumed, never edited. Must be run through the Node server (npm run demo:serve -> http://localhost:8013/), NOT as a static file or an IDE static preview: /trace.json is a dynamic route and ES modules need an http origin, so off-server the page fails closed with an actionable message instead of hanging.
 
-## API (1.13.0)
+## API (1.14.0)
 
 Named exports from @zakkster/lite-lru:
 
@@ -439,7 +466,8 @@ Named exports from @zakkster/lite-lru:
 - Lfu: the O(1) EXACT Least-Frequently-Used member (frequency buckets; LRU tie-break; the exact counterpart to WTinyLfu's approximate sketch).
 - ClockPro: the CLOCK-Pro member (CLOCK approximation of LIRS; recency-of-recency on a clock with a 0-link-write hit + a self-tuning hot/cold split; bounded non-resident history).
 - LruK: the LRU-K (K=2) member (the original recency-of-recency policy; evicts by the K-th backward distance; warm hit 0 links + 2 stamps, cold->warm promotion at most 5 (2..5) links, non-exceedable; bounded keys-only history).
-- VERSION: '1.13.0'
+- Mq: the Multi-Queue (m=8) member (frequency bands + logical-time decay; a hit is real band-relink surgery (0, or at most 5 (4..5), links) + a fixed 7-step aging sweep, a PROVEN non-exceedable <=33 links + 3 stamps per access, NOT a 0-write hit; evicts the lowest-queue tail; bounded keys-only + refcount Qout).
+- VERSION: '1.14.0'
 
 Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
@@ -448,8 +476,8 @@ Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
 
 ## Testing
 
-- npm test        -- 1322 node:test cases (all eleven members, recency/SIEVE/S3-FIFO/
-  W-TinyLFU/Slru/TwoQ/Arc/LIRS/LFU/ClockPro/LRU-K laws, TTL laws + fail-closed + purgeStale, stats parity,
+- npm test        -- 1427 node:test cases (all twelve members, recency/SIEVE/S3-FIFO/
+  W-TinyLFU/Slru/TwoQ/Arc/LIRS/LFU/ClockPro/LRU-K/Multi-Queue laws, TTL laws + fail-closed + purgeStale, stats parity,
   iteration order, snapshot/restore round-trip + fail-closed, degenerate keys/values
   + degenerate caps 1..4, dts drift, family surface).
 - npm run test:types -- tsc: the LiteCache<K,V> surface + the one-line-swap check.
@@ -457,7 +485,7 @@ Named exports from @zakkster/lite-lru/benchmark/Bench.mjs:
   "ok"; tiers t0/t1/t2/t5/t6/t7/t8/t9 (t8 = the Belady OPT gate).
 - npm run torture:controls -- the deliberately-broken variants; every gate fails.
 - npm run test:perf -- @zakkster/lite-perf-gate (dev-only devDep; ships NOTHING to the
-  tarball), a node:test-native HARD zero-alloc gate that COMPLEMENTS torture t6. 22
+  tarball), a node:test-native HARD zero-alloc gate that COMPLEMENTS torture t6. 24
   scenarios (get-hit + put-churn per member) on the keys:'int' backing, proving 0
   scavenges across N=200000 and k*N=1.6M, with old-gen / arrayBuffers / the int-index
   `grows` counter all pinned to 0, plus a mustFail object-key churn that MUST trip the

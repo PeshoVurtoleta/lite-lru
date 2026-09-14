@@ -15,10 +15,10 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../Lru.js';
 import { validate } from './validate.mjs';
 
-/** Every family member -- each body runs ELEVEN TIMES over the same LiteCache surface. */
+/** Every family member -- each body runs TWELVE TIMES over the same LiteCache surface. */
 const MEMBERS = [
     { name: 'LiteLru', Ctor: LiteLru },
     { name: 'Sieve', Ctor: Sieve },
@@ -31,6 +31,7 @@ const MEMBERS = [
     { name: 'Lfu', Ctor: Lfu },
     { name: 'ClockPro', Ctor: ClockPro },
     { name: 'LruK', Ctor: LruK },
+    { name: 'Mq', Ctor: Mq },
 ];
 
 /** Seeded xorshift32 (same generator the torture harness uses). */

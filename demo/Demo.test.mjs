@@ -14,7 +14,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../Lru.js';
 import { zipfTrace, loopTrace, scanTrace, beladyOpt } from '../benchmark/Bench.mjs';
 import {
     createEngine, step, runToEnd, frameModel, summary,
@@ -26,7 +26,7 @@ import { serveTrace, handle } from './serve.mjs';
 const DEMO_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = dirname(DEMO_DIR);
 
-const CTORS = { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK };
+const CTORS = { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq };
 
 function makeSpec(cap, length, seed) {
     const trace = zipfTrace({ length, keyspace: cap * 16, exponent: 1.0, seed: seed ^ 0x11 });
@@ -49,7 +49,7 @@ function replay(Ctor, trace, cap) {
 
 test('every engine member has a renderer (no member silently unrendered)', () => {
     assert.deepEqual([...MEMBER_NAMES].sort(), [...RENDERED_MEMBERS].sort());
-    assert.equal(MEMBER_DEFS.length, 11);
+    assert.equal(MEMBER_DEFS.length, 12);
 });
 
 test('assertion 1: rendered model deep-equals dump() over >= 2000 ops, all 11 (0 shadow fields)', () => {

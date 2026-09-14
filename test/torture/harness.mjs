@@ -25,12 +25,13 @@
  */
 
 import { measureOps, checkNoGc, measureAllocs, checkAllocs } from '@zakkster/lite-gc-profiler';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../../Lru.js';
 import { makeLruOracle, svz } from './oracles/lru.mjs';
 import { makeLirsOracle } from './oracles/lirs.mjs';
 import { makeLfuOracle } from './oracles/lfu.mjs';
 import { makeClockProOracle } from './oracles/clockpro.mjs';
 import { makeLruKOracle } from './oracles/lruk.mjs';
+import { makeMqOracle } from './oracles/mq.mjs';
 import { makeFifoOracle, makeFifoReal } from './oracles/fifo.mjs';
 import { makeSieveOracle } from './oracles/sieve.mjs';
 import { makeS3FifoOracle } from './oracles/s3fifo.mjs';
@@ -591,6 +592,46 @@ export const lrukTtlPolicy = {
     oracle: (cap, o) => makeLruKOracle(cap, o),
 };
 
+/** Wrap a real Mq as a uniform driver. victim via `_peekVictim` (the LRU tail of the lowest
+ *  non-empty band queue -- test-only introspection, never a hot path). */
+export function wrapMq(cache) {
+    return {
+        get: (k) => cache.get(k),
+        put: (k, v, t) => cache.put(k, v, t),
+        has: (k) => cache.has(k),
+        peek: (k) => cache.peek(k),
+        delete: (k) => cache.delete(k),
+        size: () => cache.size,
+        victim: () => cache._peekVictim(),
+        raw: cache,
+    };
+}
+
+/** The Mq policy (decisions/0027): the Multi-Queue (m=8) member + its own independent
+ *  8-band/refcount/logical-clock/bounded-Qout oracle. Default backing (Map): arbitrary keys. */
+export const mqPolicy = {
+    name: 'mq',
+    real: (cap) => wrapMq(new Mq(cap)),
+    oracle: (cap) => makeMqOracle(cap),
+};
+
+/** The Mq policy on the INTEGER substrate backing (`keys: 'int'`), driven against the SAME mq
+ *  oracle: the strict-zero backing (incl. the int Qout ring + refcount ring) must return
+ *  byte-identical values + victims (decisions/0011 + 0027). */
+export const mqIntPolicy = {
+    name: 'mq-int',
+    real: (cap) => wrapMq(new Mq(cap, { keys: 'int' })),
+    oracle: (cap) => makeMqOracle(cap),
+};
+
+/** Mq with an opt-in TTL default (decisions/0017). The logical clock `_t` is SEPARATE from the
+ *  wall-clock ttl; both are driven in lockstep with the oracle. */
+export const mqTtlPolicy = {
+    name: 'mq-ttl',
+    real: (cap, o) => wrapMq(new Mq(cap, o)),
+    oracle: (cap, o) => makeMqOracle(cap, o),
+};
+
 /* -------------------------------------------------------------------------- *
  * The PARAMETERIZED differential runner (the whole point of S1).
  *
@@ -977,6 +1018,55 @@ export const LRUK_WRITES_HIT_STAMPS = 2;  // both paths slide r1 then stamp r0
  *  scanned; the tripwire sits just above that with headroom. */
 export const LRUK_EVICT_SCAN_TRIPWIRE = 4352;
 
+/**
+ * An Mq subclass whose shared link columns `_next`/`_prev` AND the three metadata columns
+ * `_rc`/`_exq`/`_qn` are wrapped in counting Proxies -- used ONLY in the T6 MQ counter sub-tier,
+ * NEVER on a measured zero-alloc path (a Proxy allocates + traps and would poison the gate). It
+ * pins MQ's write budget (decisions/0027, D27.6): a hit that is already the MRU of its unchanged
+ * band relinks NOTHING (0 `_next`/`_prev` stores); any other hit is EXACTLY 5 link stores (a
+ * <= 2-write detach + a <= 3-write head push). The FIXED 7-step aging sweep adds AT MOST 7
+ * demotions x <= 4 link writes = 28, so the WHOLE per-access link total is <= 33 -- NON-EXCEEDABLE
+ * (reset-on-demote forbids cascade). The accessed slot always receives exactly 3 metadata stamps
+ * (`_rc`, `_qn`, `_exq`); each aging demotion adds 2 more (`_qn`, `_exq` on the demoted slot). The
+ * Proxy writes through to the same underlying buffers the store reads, so alloc/free stay
+ * consistent (as in CountedLru).
+ */
+export class CountedMq extends Mq {
+    constructor(capacity, options) {
+        super(capacity, options);
+        this._writes = 0;  // _next / _prev link stores
+        this._stamps = 0;  // _rc / _exq / _qn metadata stores
+        const self = this;
+        const countStores = (arr, isStamp) => new Proxy(arr, {
+            set(t, prop, value) {
+                if (typeof prop === 'string' && prop !== 'length' && String(+prop) === prop) {
+                    if (isStamp) self._stamps++; else self._writes++;
+                }
+                t[prop] = value;
+                return true;
+            },
+        });
+        this._next = countStores(this._next, false);
+        this._prev = countStores(this._prev, false);
+        this._rc = countStores(this._rc, true);
+        this._exq = countStores(this._exq, true);
+        this._qn = countStores(this._qn, true);
+    }
+    resetWrites() { this._writes = 0; this._stamps = 0; }
+    writes() { return this._writes; }
+    stamps() { return this._stamps; }
+}
+
+/** Mq hit link baselines (measured; a REAL regression pin, decisions/0027 D27.6). A hit that is
+ *  already the MRU of its unchanged band relinks NOTHING; any other hit is exactly 5 link stores.
+ *  The FIXED 7-step aging sweep adds <= 7 x 4 = 28, so the whole per-access link total is <= 33 --
+ *  non-exceedable. The accessed slot always receives exactly 3 metadata stamps. */
+export const MQ_WRITES_HIT_FASTPATH = 0;   // already-MRU-of-band hit relinks nothing
+export const MQ_WRITES_HIT_RELINK = 5;     // any other hit: <= 2 detach + <= 3 head push
+export const MQ_WRITES_AGING_MAX = 28;     // 7 demotions x <= 4 link writes (the fixed sweep)
+export const MQ_WRITES_MAX = 33;           // 5 relink + 28 aging, NON-EXCEEDABLE per access
+export const MQ_STAMPS_ACCESS = 3;         // _rc + _qn + _exq on the accessed slot, every access
+
 /* -------------------------------------------------------------------------- *
  * Snapshot / restore round-trip differential (decisions/0021, D21).
  *
@@ -1005,6 +1095,7 @@ export const SNAP_MEMBERS = [
     { name: 'Lfu', Ctor: Lfu, wrap: wrapLfu },
     { name: 'ClockPro', Ctor: ClockPro, wrap: wrapClockPro },
     { name: 'LruK', Ctor: LruK, wrap: wrapLruK },
+    { name: 'Mq', Ctor: Mq, wrap: wrapMq },
 ];
 
 /** Structural deep-equality for two snapshots, IGNORING the capture-time field `t`

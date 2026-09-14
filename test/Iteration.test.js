@@ -31,7 +31,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, LruK } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, LruK, Mq } from '../Lru.js';
 import { validate } from './validate.mjs';
 
 const NIL = -1;
@@ -52,6 +52,7 @@ const MEMBERS = [
     { name: 'TwoQ', Ctor: TwoQ },
     { name: 'Arc', Ctor: Arc },
     { name: 'LruK', Ctor: LruK },
+    { name: 'Mq', Ctor: Mq },
 ];
 
 /** A hoisted, mutable virtual clock -- zero-alloc per call, fully controlled by the
@@ -73,6 +74,7 @@ function expectedHeads(name, c) {
     if (name === 'TwoQ') return [c._amHead, c._a1Head];      // D15.4: Am then A1in
     if (name === 'Arc') return [c._t2Head, c._t1Head];       // D16.5: T2 (frequent) then T1 (recent)
     if (name === 'LruK') return [c._warmHead, c._coldHead];  // D26: WARM (>= K refs) then COLD
+    if (name === 'Mq') return [c._qHead[7], c._qHead[6], c._qHead[5], c._qHead[4], c._qHead[3], c._qHead[2], c._qHead[1], c._qHead[0]]; // D27: Q7 down to Q0
     return [c._head]; // LiteLru (recency DLL), Sieve (FIFO ring)
 }
 

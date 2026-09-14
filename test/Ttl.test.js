@@ -20,7 +20,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, LruK } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, LruK, Mq } from '../Lru.js';
 import { validate } from './validate.mjs';
 
 /** Every family member, so each test body runs SEVEN TIMES over the exact same
@@ -35,6 +35,7 @@ const MEMBERS = [
     { name: 'TwoQ', Ctor: TwoQ },
     { name: 'Arc', Ctor: Arc },
     { name: 'LruK', Ctor: LruK },
+    { name: 'Mq', Ctor: Mq },
 ];
 
 /** A hoisted, mutable virtual clock -- zero-alloc per call, fully controlled by the

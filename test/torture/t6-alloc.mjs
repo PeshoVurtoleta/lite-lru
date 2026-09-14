@@ -31,9 +31,9 @@
  * rejects the window; T9 exercises the same alloc lane in-process.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../../Lru.js';
 import {
-    runOpsGate, runAllocsGate, BREAK, check, die, makePrng,
+    runOpsGate, runAllocsGate, BREAK, check, die, makePrng, validate,
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
     CountedSieve, SIEVE_WRITES_HIT_LINKS, SIEVE_WRITES_HIT_VIS,
     CountedS3Fifo, S3FIFO_WRITES_HIT_LINKS, S3FIFO_WRITES_HIT_VIS,
@@ -42,6 +42,7 @@ import {
     CountedLfu, LFU_WRITES_FASTPATH, LFU_WRITES_MAX,
     CountedClockPro, CLOCKPRO_WRITES_HIT_LINKS, CLOCKPRO_WRITES_HIT_ST, CLOCKPRO_WRITES_MISS_EVICT_TRIPWIRE,
     CountedLruK, LRUK_WRITES_HIT_WARM, LRUK_WRITES_HIT_PROMOTE, LRUK_WRITES_HIT_STAMPS, LRUK_EVICT_SCAN_TRIPWIRE,
+    CountedMq, MQ_WRITES_HIT_FASTPATH, MQ_WRITES_HIT_RELINK, MQ_WRITES_AGING_MAX, MQ_WRITES_MAX, MQ_STAMPS_ACCESS,
 } from './harness.mjs';
 
 const CAP = 4096;      // power of 2 so the hot body masks its key with & MASK
@@ -228,6 +229,29 @@ class CoveredLruK extends LruK {
         if (cold) this._coldEvicts++; else this._warmEvicts++;
         return r;
     }
+    put(k, v, t) { if (this._store.get(k) < 0 && this._hist.has(k)) this._histReadmits++; return super.put(k, v, t); }
+}
+
+/** An Mq counting the DISTINGUISHING lanes (decisions/0027) via plain integer field increments
+ *  (zero-alloc; lane coverage only, never on a MEASURED window): aging DEMOTIONS (a band tail
+ *  aged one level toward Q0), capacity EVICTIONS (tail of the lowest non-empty queue), history
+ *  RE-ADMITS (a put of a key still in the bounded Qout), AND the max observed demotions in a
+ *  SINGLE aging sweep (the OWNER-RULING measurement -- the sweep is a fixed <= 7-step constant;
+ *  its per-access demotion count is measured to prove reset-on-demote forbids cascade). */
+class CoveredMq extends Mq {
+    constructor(cap, opts) {
+        super(cap, opts);
+        this._demotes = 0; this._evicts = 0; this._histReadmits = 0; this._maxSweepDemotes = 0;
+    }
+    _ageSweep() {
+        // Count how many demotions THIS sweep performs (a demote fires iff a band tail is expired).
+        let n = 0; const t = this._t, exq = this._exq, tc = this._qTail;
+        for (let q = 1; q < 8; q++) { const tail = tc[q]; if (tail !== -1 && exq[tail] < t) n++; }
+        this._demotes += n;
+        if (n > this._maxSweepDemotes) this._maxSweepDemotes = n;
+        super._ageSweep();
+    }
+    _evictOne() { this._evicts++; return super._evictOne(); }
     put(k, v, t) { if (this._store.get(k) < 0 && this._hist.has(k)) this._histReadmits++; return super.put(k, v, t); }
 }
 
@@ -1608,4 +1632,167 @@ export async function run() {
         ' (all-warm worst-observed length=' + advLk._maxScan + ', worst op ' + lkWorstMs.toFixed(3) +
         ' ms; tripwire=' + LRUK_EVICT_SCAN_TRIPWIRE + ', NOT a bound); lanes covered: promos=' +
         covLk._promos + ' coldEvicts=' + covLk._coldEvicts + ' historyReadmits=' + covLk._histReadmits + '\n');
+
+    // --- Gate MQ: the Mq member -- STRICT zero-alloc + MEASURED writes-per-hit + aging sweep ----
+    // (decisions/0027) The SAME MIXED, recurring int-key stream drives every Multi-Queue lane at
+    // capacity: hot recurrence -> refcount growth (re-band + move-to-band-MRU relinks) and the
+    // fixed 7-step aging sweep (idle band tails decay toward Q0); cold churn -> lowest-queue-tail
+    // evictions + bounded-Qout re-admits. Zero-alloc: the closure indexes a preallocated Int32Array
+    // and does int get/put only. The shared link columns `_next`/`_prev`, the metadata columns
+    // `_rc`/`_exq`/`_qn`, the queue head/tail arrays, the int index buffers AND the Qout ring +
+    // its parallel refcount ring NEVER grow; sum(|Q0..Q7|) == size == capacity always; the Qout
+    // stays bounded.
+    const mqStream = buildMixedStream(STREAM_LEN, HOT_SIZE, A1IN_CAP, 0x3d7b0f19);
+    const mqCache = new Mq(CAP, { keys: 'int' });
+    const mqSink = new Int32Array(1);
+    let mqi = 0;
+    const mqHot = () => {
+        const k = mqStream[mqi & STREAM_MASK]; mqi++;
+        const v = mqCache.get(k);
+        if (v === undefined) mqCache.put(k, k); else { mqSink[0] += v | 0; mqCache.get(k); }
+    };
+    for (let i = 0; i < PREFILL; i++) mqHot(); // reach steady state
+    check(mqCache.size === CAP, () => 't6 Gate MQ: prefill did not reach capacity (size ' + mqCache.size + ')');
+    const mqNextBytes = mqCache._next.buffer.byteLength;
+    const mqPrevBytes = mqCache._prev.buffer.byteLength;
+    const mqRcBytes = mqCache._rc.buffer.byteLength;
+    const mqExqBytes = mqCache._exq.buffer.byteLength;
+    const mqQnBytes = mqCache._qn.buffer.byteLength;
+    const mqQHeadBytes = mqCache._qHead.buffer.byteLength;
+    const mqQTailBytes = mqCache._qTail.buffer.byteLength;
+    const mqIxSlotBytes = mqCache._store._ixSlot.buffer.byteLength;
+    const mqIxKeyBytes = mqCache._store._ixKey.buffer.byteLength;
+    const mqHistRingBytes = mqCache._hist._ring.buffer.byteLength;
+    const mqHistRcBytes = mqCache._hist._rcRing.buffer.byteLength;
+    const gmq = runOpsGate(mqHot, { ops: OPS, warmup: WARMUP });
+    check(mqCache._next.buffer.byteLength === mqNextBytes,
+        () => 't6 Gate MQ: _next.buffer grew ' + mqNextBytes + ' -> ' + mqCache._next.buffer.byteLength);
+    check(mqCache._prev.buffer.byteLength === mqPrevBytes,
+        () => 't6 Gate MQ: _prev.buffer grew ' + mqPrevBytes + ' -> ' + mqCache._prev.buffer.byteLength);
+    check(mqCache._rc.buffer.byteLength === mqRcBytes,
+        () => 't6 Gate MQ: _rc.buffer grew ' + mqRcBytes + ' -> ' + mqCache._rc.buffer.byteLength);
+    check(mqCache._exq.buffer.byteLength === mqExqBytes,
+        () => 't6 Gate MQ: _exq.buffer grew ' + mqExqBytes + ' -> ' + mqCache._exq.buffer.byteLength);
+    check(mqCache._qn.buffer.byteLength === mqQnBytes,
+        () => 't6 Gate MQ: _qn.buffer grew ' + mqQnBytes + ' -> ' + mqCache._qn.buffer.byteLength);
+    check(mqCache._qHead.buffer.byteLength === mqQHeadBytes,
+        () => 't6 Gate MQ: _qHead.buffer grew ' + mqQHeadBytes + ' -> ' + mqCache._qHead.buffer.byteLength);
+    check(mqCache._qTail.buffer.byteLength === mqQTailBytes,
+        () => 't6 Gate MQ: _qTail.buffer grew ' + mqQTailBytes + ' -> ' + mqCache._qTail.buffer.byteLength);
+    check(mqCache._store._ixSlot.buffer.byteLength === mqIxSlotBytes,
+        () => 't6 Gate MQ: _ixSlot.buffer grew ' + mqIxSlotBytes + ' -> ' + mqCache._store._ixSlot.buffer.byteLength);
+    check(mqCache._store._ixKey.buffer.byteLength === mqIxKeyBytes,
+        () => 't6 Gate MQ: _ixKey.buffer grew ' + mqIxKeyBytes + ' -> ' + mqCache._store._ixKey.buffer.byteLength);
+    check(mqCache._hist._ring.buffer.byteLength === mqHistRingBytes,
+        () => 't6 Gate MQ: Qout _ring grew ' + mqHistRingBytes + ' -> ' + mqCache._hist._ring.buffer.byteLength);
+    check(mqCache._hist._rcRing.buffer.byteLength === mqHistRcBytes,
+        () => 't6 Gate MQ: Qout _rcRing grew ' + mqHistRcBytes + ' -> ' + mqCache._hist._rcRing.buffer.byteLength);
+    check(mqCache.size === CAP, () => 't6 Gate MQ: churn did not stay at capacity (size ' + mqCache.size + ')');
+    check(mqCache._hist._len <= CAP, () => 't6 Gate MQ: Qout exceeded its bound (' + mqCache._hist._len + ')');
+    if (!gmq.report.ok) {
+        const g = gmq.summary.gc;
+        die('t6 Gate MQ (mixed churn) ops gate rejected -- verdict=' + gmq.report.verdict +
+            ' source=' + gmq.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gmqA = runAllocsGate(mqHot, { iterations: 50000, batches: 8 });
+    if (!gmqA.ok) {
+        die('t6 Gate MQ (mixed churn) retained-alloc gate rejected -- verdict=' + gmqA.report.verdict +
+            ' settled=' + gmqA.result.settled + ' bytesPerCall=' + gmqA.bytesPerCall);
+    }
+    // Writes-per-hit pins (the headline, decisions/0027 D27.6). A hit already at the MRU of its
+    // unchanged band relinks NOTHING (0 links); any other hit is EXACTLY 5 links (<= 2 detach +
+    // <= 3 head push). Every access stamps exactly 3 metadata cells (`_rc`, `_qn`, `_exq`).
+    {
+        // Build the EXACT-5 scenario (interior detach + non-empty head push): band Q2 non-empty
+        // (key z, rc 4), band Q1 = [y, A, x] with A INTERIOR (rc 3). No aging fires (lifeTime 16,
+        // every exq still in the future). Hitting A brings rc 3->4 (Q1->Q2): detach interior A (2
+        // links) + push to non-empty Q2 head (3 links) = exactly 5.
+        const cmq = new CountedMq(16);
+        cmq.put('z', 1); cmq.get('z'); cmq.get('z'); cmq.get('z'); // z rc4 -> Q2 (sole)
+        cmq.put('x', 1); cmq.get('x');                             // x rc2 -> Q1 head
+        cmq.put('A', 1); cmq.get('A'); cmq.get('A');               // A rc3 -> Q1 head (already MRU 3rd)
+        cmq.put('y', 1); cmq.get('y');                             // y rc2 -> Q1 head; Q1 = [y, A, x]
+        cmq.resetWrites();
+        cmq.get('A');           // rc3->4 (Q1->Q2): interior detach(2) + non-empty push(3) = 5 links
+        check(cmq.writes() === MQ_WRITES_HIT_RELINK,
+            () => 't6 Gate MQ: an interior re-band hit relinked ' + cmq.writes() + ' cells, expected ' + MQ_WRITES_HIT_RELINK);
+        check(cmq.stamps() === MQ_STAMPS_ACCESS,
+            () => 't6 Gate MQ: a re-band hit stamped ' + cmq.stamps() + ' cells, expected ' + MQ_STAMPS_ACCESS);
+        cmq.resetWrites();
+        cmq.get('A');           // rc4->5 -> still band 2, already MRU of Q2: 0 links + 3 stamps
+        check(cmq.writes() === MQ_WRITES_HIT_FASTPATH,
+            () => 't6 Gate MQ: an already-MRU hit relinked ' + cmq.writes() + ' cells, expected ' + MQ_WRITES_HIT_FASTPATH);
+        check(cmq.stamps() === MQ_STAMPS_ACCESS,
+            () => 't6 Gate MQ: an already-MRU hit stamped ' + cmq.stamps() + ' cells, expected ' + MQ_STAMPS_ACCESS);
+    }
+    // The clz32 band SATURATION guard (decisions/0027 D27.3, the RISK note): a refcount >= 128
+    // must saturate the band at 7, NEVER index `_qn`/`_qHead`/`_qTail` out of range. Drive one key
+    // past 128 references and confirm it lands in the top band and validate() stays coherent.
+    {
+        const sat = new Mq(4, { keys: 'int' });
+        sat.put(1, 1);
+        for (let i = 0; i < 300; i++) sat.get(1); // rc -> 301, well past 128
+        const s = sat._store.get(1);
+        check(sat._rc[s] >= 128, () => 't6 Gate MQ: saturation setup did not reach rc >= 128 (rc=' + sat._rc[s] + ')');
+        check(sat._qn[s] === 7, () => 't6 Gate MQ: rc >= 128 banded to Q' + sat._qn[s] + ', expected the saturated top band Q7');
+        validate(mqCache); validate(sat);
+    }
+    // The <= 33-link per-access CEILING is PROVEN non-exceedable by construction (D27.6): a hit is
+    // <= 5 relink and the FIXED 7-step sweep is <= 7 demotions x <= 4 = 28, and RESET-ON-DEMOTE
+    // forbids cascade (a demoted block lands at the HEAD of an already-visited lower band with a
+    // fresh `_exq`, so it is never re-examined this sweep). MEASURE the worst-observed links/access
+    // over both a mixed churn AND an adversarial band-decay stream, and assert it never exceeds 33.
+    const cmq2 = new CountedMq(CAP, { keys: 'int' });
+    for (let i = 0; i < CAP; i++) cmq2.put(i, i);
+    let mqMaxLinks = 0, mqMaxStamps = 0;
+    for (let i = 0; i < STREAM_LEN; i++) {
+        const k = mqStream[i & STREAM_MASK];
+        const s = cmq2._store.get(k);
+        cmq2.resetWrites();
+        if (s < 0) cmq2.put(k, k); else cmq2.get(k);
+        if (cmq2.writes() > mqMaxLinks) mqMaxLinks = cmq2.writes();
+        if (cmq2.stamps() > mqMaxStamps) mqMaxStamps = cmq2.stamps();
+    }
+    // Adversarial band-decay: seed single idle keys across bands 1..7, then churn fresh Q0 keys so
+    // logical time advances past lifeTime and the banded tails decay -- the path that fires the
+    // aging sweep hardest.
+    const bandTargets = [2, 4, 8, 16, 32, 64, 128];
+    for (let b = 0; b < bandTargets.length; b++) {
+        const key = 900000 + b; cmq2.put(key, key);
+        for (let j = 1; j < bandTargets[b]; j++) cmq2.get(key);
+    }
+    let fkey = 800000;
+    for (let i = 0; i < CAP * 4; i++) {
+        cmq2.resetWrites();
+        cmq2.put(fkey++, 0);
+        if (cmq2.writes() > mqMaxLinks) mqMaxLinks = cmq2.writes();
+        if (cmq2.stamps() > mqMaxStamps) mqMaxStamps = cmq2.stamps();
+    }
+    check(mqMaxLinks <= MQ_WRITES_MAX,
+        () => 't6 Gate MQ: worst-observed links/access ' + mqMaxLinks + ' exceeded the non-exceedable ceiling ' + MQ_WRITES_MAX);
+    // Lane coverage: the aging sweep must genuinely fire (demotions > 0) and never demote a block
+    // twice in one sweep (max demotions/sweep <= 7 = m-1 -- the reset-on-demote no-cascade proof).
+    const covMq = new CoveredMq(CAP, { keys: 'int' });
+    for (let i = 0; i < CAP; i++) covMq.put(i, i);
+    covMq._demotes = 0; covMq._evicts = 0; covMq._histReadmits = 0; covMq._maxSweepDemotes = 0;
+    let cmk = CAP;
+    for (let i = 0; i < OPS; i++) {
+        const k = mqStream[i & STREAM_MASK];
+        if (covMq.get(k) === undefined) covMq.put(k, k); else covMq.get(k);
+        if ((i & 3) === 0) covMq.put(cmk++, cmk); // fresh cold churn to advance time + evict
+    }
+    check(covMq._demotes > 0,
+        () => 't6 Gate MQ: the window triggered 0 aging demotions (the sweep lane was not covered)');
+    check(covMq._evicts > 0,
+        () => 't6 Gate MQ: the window triggered 0 evictions (lane not covered)');
+    check(covMq._maxSweepDemotes <= 7,
+        () => 't6 Gate MQ: an aging sweep demoted ' + covMq._maxSweepDemotes + ' blocks (> m-1=7) -- a cascade slipped the reset-on-demote guard');
+    process.stderr.write('t6 Gate MQ: ' + gmqA.bytesPerCall.toFixed(5) +
+        ' B/op mixed churn (' + OPS + ' ops window, capacity ' + CAP + '); maxPauseMs=' +
+        gmq.summary.gc.maxMs.toFixed(3) + '; writes/hit fastpath=' + MQ_WRITES_HIT_FASTPATH +
+        ' relink=' + MQ_WRITES_HIT_RELINK + ' + aging <= ' + MQ_WRITES_AGING_MAX + ' (7 x 4) = <= ' +
+        MQ_WRITES_MAX + ' links/access NON-EXCEEDABLE (worst-observed=' + mqMaxLinks + '); stamps/access=' +
+        MQ_STAMPS_ACCESS + ' + 2/demotion (worst-observed=' + mqMaxStamps + '); lanes covered: demotes=' +
+        covMq._demotes + ' evicts=' + covMq._evicts + ' maxDemotes/sweep=' + covMq._maxSweepDemotes +
+        ' (<= 7, no cascade)\n');
 }

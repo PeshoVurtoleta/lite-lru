@@ -133,6 +133,17 @@ export function activeListsOf(cache) {
             { name: 'lruk-cold', head: cache._coldHead, tail: cache._coldTail, doubly: true },
         ];
     }
+    // An Mq member (decisions/0027) threads EIGHT disjoint band LRU queues Q0..Q7 through the
+    // shared _next/_prev columns (detected by its `_qn` band column), each with its own head/tail
+    // in the `_qHead`/`_qTail` Int32Array(8). The keys-only Qout history holds no resident slot.
+    // The SAME checker sums over all eight descriptors, in iteration order (Q7 down to Q0).
+    if (cache._qn !== undefined) {
+        const out = [];
+        for (let q = 7; q >= 0; q--) {
+            out.push({ name: 'mq-q' + q, head: cache._qHead[q], tail: cache._qTail[q], doubly: true });
+        }
+        return out;
+    }
     // A SIEVE member (decisions/0012) exposes _head/_tail on a single doubly-linked
     // FIFO ring (detected by its moving `_hand`). Classic LRU exposes the same shape
     // as a recency DLL. Both are ONE doubly-linked list -> one descriptor.
@@ -595,6 +606,34 @@ export function validate(cache, lists) {
         }
         if (cache._hist._len > cache._histCap) {
             throw new Error('[validate] lruk history(' + cache._hist._len + ') > histCap(' + cache._histCap + ')');
+        }
+    }
+
+    // --- term 16 (Mq members, decisions/0027): the 8 band queues + the metadata columns + the
+    // bounded Qout history. A no-op unless the member exposes `_qn`. The eight disjoint queues'
+    // resident population is already summed against `size` by term 3/4 via the Mq descriptors
+    // above. This term adds the MQ-specifics: every band index is 0..7 (m = 8); every RESIDENT
+    // slot's `_qn` matches the queue it is threaded in (walk each queue and cross-check); the
+    // `_rc`/`_exq`/`_qn` columns are the fixed construction-time size (never grown -- byteLength
+    // checked on real un-proxied instances by t6/t7; here only INDEXED cells are read so it also
+    // holds for a Counted* Proxy-wrapped instance); and the non-resident Qout history never exceeds
+    // its construction bound (hist._len <= capacity), with its parallel refcount ring aligned.
+    if (cache._qn !== undefined) {
+        for (let q = 0; q < 8; q++) {
+            let walked = 0;
+            for (let s = cache._qHead[q]; s !== NIL; s = cache._next[s]) {
+                if (s < 0 || s >= cap) throw new Error('[validate] mq band Q' + q + ' reached out-of-range slot ' + s);
+                if (cache._qn[s] !== q) {
+                    throw new Error('[validate] mq slot ' + s + ' _qn=' + cache._qn[s] + ' != the band Q' + q + ' it is threaded in');
+                }
+                if (++walked > cap) throw new Error('[validate] mq band Q' + q + ' has a cycle (walked > capacity)');
+            }
+        }
+        for (let i = 0; i < cap; i++) {
+            if (cache._qn[i] > 7) throw new Error('[validate] mq _qn[' + i + '] = ' + cache._qn[i] + ' > 7 (out of band range)');
+        }
+        if (cache._hist._len > cache._histCap) {
+            throw new Error('[validate] mq Qout history(' + cache._hist._len + ') > histCap(' + cache._histCap + ')');
         }
     }
 }

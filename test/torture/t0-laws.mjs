@@ -15,8 +15,8 @@
  * corrupt structure still fails the tier.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK, wrapMq } from './harness.mjs';
 
 const NIL = -1;
 
@@ -754,6 +754,99 @@ export function run() {
         void wrapLruK(c);
     }
 
+    // --- Mq laws (decisions/0027) -----------------------------------------------
+
+    // MQ1: the hot path increments the refcount, re-bands the block by its highest set bit
+    // (band(rc) = min(floor(log2(rc)), 7)), and moves it to the MRU of that band. A fresh key is
+    // rc 1 in Q0; a 2nd reference is rc 2 in Q1. has/peek are policy-neutral (no refcount bump).
+    {
+        const c = new Mq(8);
+        for (let i = 0; i < 8; i++) c.put(i, i); // 8 keys, each rc 1 in Q0
+        const s3 = c._store.get(3);
+        check(c._qn[s3] === 0 && c._rc[s3] === 1, () => 't0 MQ1: a fresh key must be rc 1 in band Q0');
+        c.get(3);                                 // 2nd reference -> rc 2 -> band Q1
+        check(c._qn[s3] === 1 && c._rc[s3] === 2, () => 't0 MQ1: 2nd reference did not move rc2 to Q1');
+        const rcBefore = c._rc[s3];
+        c.has(3); c.peek(3);                       // policy-neutral: no bump
+        check(c._rc[s3] === rcBefore, () => 't0 MQ1: has/peek bumped the refcount (must be neutral)');
+        validate(c);
+    }
+
+    // MQ2: eviction takes the LRU (tail) of the LOWEST non-empty queue, so a higher-band (more
+    // frequently referenced) block outranks a Q0 block. Promote b to Q1; the next over-capacity
+    // insert must evict a Q0 block (the oldest, a), NOT the higher-band b.
+    {
+        let evicted;
+        const c = new Mq(3, { onEvict: (k) => { evicted = k; } });
+        c.put('a', 1); c.put('b', 2); c.put('c', 3); // Q0: c(head)..a(tail)
+        c.get('b');                                   // b -> rc2 -> Q1 (outranks Q0)
+        check(c._peekVictim() === 'a', () => 't0 MQ2: victim is ' + String(c._peekVictim()) + ', expected the Q0 tail a');
+        c.put('d', 4);                                // evict the Q0 tail a; b (Q1) survives
+        check(evicted === 'a', () => 't0 MQ2: evicted ' + String(evicted) + ' != the lowest-queue tail a');
+        check(c.has('b') && c.has('c') && c.has('d'), () => 't0 MQ2: a wrong (higher-band) block was evicted');
+        check(c.size === 3, () => 't0 MQ2: size drifted from capacity');
+        validate(c);
+    }
+
+    // MQ3: the FIXED aging sweep demotes an idle band tail ONE level per access toward Q0 (never a
+    // cascade -- reset-on-demote). Pump key 0 to band Q2, then flood foreign Q0 churn; while key 0
+    // stays resident its band drops by 0 or 1 each access (NEVER 2), and it genuinely decays below
+    // its starting band.
+    {
+        const c = new Mq(8, { keys: 'int' });
+        c.put(0, 0); c.get(0); c.get(0); c.get(0); // key 0 -> rc 4 -> band Q2
+        const s0 = c._store.get(0);
+        check(c._qn[s0] === 2, () => 't0 MQ3: setup -- key 0 not in Q2 (qn=' + c._qn[s0] + ')');
+        let prev = c._qn[s0];
+        let decayed = false;
+        let fk = 1000;
+        for (let i = 0; i < 400; i++) {
+            c.put(fk++, i);                     // fresh Q0 churn: advances logical time + ages
+            const s = c._store.get(0);
+            if (s < 0) break;                   // key 0 finally decayed to Q0 and was evicted
+            const now = c._qn[s];
+            check(now <= prev, () => 't0 MQ3: key 0 band went UP without a reference (' + prev + ' -> ' + now + ')');
+            check(prev - now <= 1, () => 't0 MQ3: key 0 dropped ' + (prev - now) + ' bands in one access (cascade)');
+            if (now < prev) decayed = true;
+            prev = now;
+            if ((i & 63) === 0) validate(c);
+        }
+        check(decayed, () => 't0 MQ3: key 0 never decayed a band under the idle flood (aging not exercised)');
+        validate(c);
+    }
+
+    // MQ4: bounded Qout + refcount-preserving re-admit. At cap 1 every put evicts the sole
+    // resident into Qout WITH its refcount; re-putting a remembered key resumes at rc + 1, so an
+    // evicted rc-5 block re-enters at band(6) = Q2 (the multi-queue frequency-memory win).
+    {
+        const c = new Mq(1, { keys: 'int' });
+        c.put(9, 9); c.get(9); c.get(9); c.get(9); c.get(9); // key 9 -> rc 5 -> band Q2
+        c.put(8, 8);                                          // evict 9 (sole resident) -> Qout rc 5
+        check(c._hist.has(9), () => 't0 MQ4: an evicted key was not recorded in Qout');
+        check(c._hist.rcOf(9) === 5, () => 't0 MQ4: Qout did not preserve the evicted refcount (got ' + c._hist.rcOf(9) + ')');
+        check(c._hist._len <= c._histCap, () => 't0 MQ4: Qout exceeded its bound');
+        c.put(9, 90);                                         // re-admit: rc 5 + 1 = 6 -> band Q2
+        const s9 = c._store.get(9);
+        check(c._rc[s9] === 6 && c._qn[s9] === 2, () => 't0 MQ4: re-admit did not resume at rc 6 / Q2 (rc=' + c._rc[s9] + ' qn=' + c._qn[s9] + ')');
+        check(!c._hist.has(9), () => 't0 MQ4: a re-admitted key must be consumed from Qout');
+        check(c.size === 1, () => 't0 MQ4: resident capacity is not exactly capacity');
+        validate(c);
+    }
+
+    // MQ5: the clz32 band SATURATION guard (D27.3). A refcount past 2^7 = 128 saturates the band
+    // at Q7 -- it must NEVER index `_qn`/`_qHead`/`_qTail` out of range. Drive one key well past
+    // 128 references and confirm it lands (and stays) in the top band, coherent under validate().
+    {
+        const c = new Mq(4, { keys: 'int' });
+        c.put(1, 1);
+        for (let i = 0; i < 300; i++) c.get(1); // rc -> 301, well past 128
+        const s = c._store.get(1);
+        check(c._rc[s] >= 128, () => 't0 MQ5: setup did not reach rc >= 128 (rc=' + c._rc[s] + ')');
+        check(c._qn[s] === 7, () => 't0 MQ5: rc >= 128 banded to Q' + c._qn[s] + ', expected the saturated top band Q7');
+        validate(c);
+        void wrapMq(c);
+    }
+
     // --- TTL laws (decisions/0017) ----------------------------------------------
 
     // T1: stale = MISS, and the MISS does NOTHING to policy state. get() on an expired
@@ -950,6 +1043,19 @@ export function run() {
         validate(c);
     }
 
+    // I13 Mq -- the 8 band queues Q7 (highest frequency) DOWN to Q0, each over the shared _next
+    // column, RESIDENT only, the non-resident Qout history EXCLUDED (decisions/0027). The eight
+    // disjoint queues partition the resident set, so the shared CacheIterator + the manual
+    // head-walk agree exactly.
+    {
+        const c = new Mq(16);
+        for (let i = 0; i < 40; i++) c.put(i % 24, i);     // churn past capacity (spread bands)
+        for (let i = 0; i < 40; i++) c.get((i * 5) % 24);  // bump refcounts (re-band, relink)
+        const h = c._qHead;
+        checkIterOrder('mq', c, [h[7], h[6], h[5], h[4], h[3], h[2], h[1], h[0]]);
+        validate(c);
+    }
+
     // I5 TTL-skip WITHOUT reap (D18.5): a walk sees only live entries, but leaves the
     // stale ones resident (size unchanged); purgeStale() is the reclamation path.
     {
@@ -969,7 +1075,7 @@ export function run() {
     // --- Snapshot / restore laws (decisions/0021, D21) --------------------------
     const SNAP = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo],
         ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu],
-        ['ClockPro', ClockPro], ['LruK', LruK]];
+        ['ClockPro', ClockPro], ['LruK', LruK], ['Mq', Mq]];
 
     // SN1: round-trip identity. Build a churned mid-life state, dump, structuredClone,
     // restore, and assert dump==dump (fixed point) AND identical order/values/size via an

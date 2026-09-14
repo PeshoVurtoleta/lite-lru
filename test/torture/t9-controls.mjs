@@ -21,12 +21,13 @@
  *   C-stats-counts-peek   a peek that credits a hit    -> brute-tally parity fails
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, wrapWTinyLfu,
-    wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK, validate, runRoundTrip,
+    wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK, wrapMq, validate, runRoundTrip,
     lruPolicy, check, die, makePrng,
 } from './harness.mjs';
+import { makeMqOracle } from './oracles/mq.mjs';
 import { makeLfuOracle } from './oracles/lfu.mjs';
 import { makeLruOracle } from './oracles/lru.mjs';
 import { makeFifoOracle } from './oracles/fifo.mjs';
@@ -296,6 +297,16 @@ class NoAdaptClockPro extends ClockPro {
  *  agrees (t5). */
 class LruTiebreakLruK extends LruK {
     _scanWarmVictim() { return this._warmTail; } // BUG: LRU tiebreak, not min-r1 (K-distance)
+}
+
+/** C-mq-no-aging (decisions/0027): an Mq whose aging sweep is a NO-OP, so idle high-band blocks
+ *  never decay toward Q0. MQ's whole point is that a once-hot block that goes cold is demoted and
+ *  becomes evictable; freezing the sweep collapses it into a pure frequency policy, so the
+ *  next-eviction victim drifts from the aging Mq oracle. Self-consistent (its own _peekVictim
+ *  reads the same frozen bands), yet WRONG versus the oracle. Non-vacuity: the CORRECT Mq agrees
+ *  (t5). */
+class NoAgingMq extends Mq {
+    _ageSweep() { /* BUG: never demote an idle band tail */ }
 }
 
 /** C-skip-gate (decisions/0017): a get that SKIPS the ttl staleness gate entirely, so a
@@ -700,6 +711,20 @@ export function run() {
         if (r.ok) die('t9 C-lruk-lru-tiebreak: LRU-among-warm did NOT diverge from the lruk oracle (no teeth)');
     }
 
+    // --- C-mq-no-aging (decisions/0027): freezing the aging sweep -> diverges -------------------
+    // MQ's headline is that idle high-band blocks DECAY toward Q0 and become evictable. An Mq whose
+    // aging sweep is a no-op keeps once-hot blocks pinned high forever, so the next-eviction victim
+    // drifts from the aging Mq oracle. Non-vacuity: the CORRECT Mq agrees (t5).
+    {
+        const brokenPolicy = {
+            name: 'mq-no-aging',
+            real: (cap) => wrapMq(new NoAgingMq(cap)),
+            oracle: (cap) => makeMqOracle(cap),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x3c2f, keyspace: 40 });
+        if (r.ok) die('t9 C-mq-no-aging: freezing the aging sweep did NOT diverge from the mq oracle (no teeth)');
+    }
+
     // --- C-skip-gate (decisions/0017): a get that skips the ttl gate -> diverges ---
     // The lazy TTL rule (D17.3): a stale hit is a MISS, reaped in place. A get that never
     // checks staleness returns the expired value and keeps it resident, so it MUST
@@ -947,6 +972,20 @@ export function run() {
                 return inst;
             }
         }
+        // mq-drop-rc: restore keeps the queues + values but ZEROES every resident's refcount `_rc`.
+        // The next reference then re-bands from rc 1 (Q0) instead of its true count, so future band
+        // placement + the lowest-queue victim drift from the twin (whose rc was preserved) -- a
+        // fail-OPEN future-eviction bug the round-trip differential must catch. Post-restore
+        // mutation (the snapshot is valid).
+        class RcDroppedMq extends Mq {
+            static restore(snap, opts) {
+                const inst = Mq.restore(snap, opts);
+                for (let q = 0; q < 8; q++) {
+                    for (let s = inst._qHead[q]; s !== -1; s = inst._next[s]) inst._rc[s] = 0;
+                }
+                return inst;
+            }
+        }
 
         const controls = [
             { name: 'arc-p-dropped', broken: { Ctor: PDroppedArc, wrap: wrapArc }, real: { Ctor: Arc, wrap: wrapArc } },
@@ -957,6 +996,7 @@ export function run() {
             { name: 'clockpro-mhot-dropped', broken: { Ctor: MHotDroppedClockPro, wrap: wrapClockPro }, real: { Ctor: ClockPro, wrap: wrapClockPro } },
             { name: 'clockpro-test-bits-dropped', broken: { Ctor: TestBitsDroppedClockPro, wrap: wrapClockPro }, real: { Ctor: ClockPro, wrap: wrapClockPro } },
             { name: 'lruk-drop-r1', broken: { Ctor: R1DroppedLruK, wrap: wrapLruK }, real: { Ctor: LruK, wrap: wrapLruK } },
+            { name: 'mq-drop-rc', broken: { Ctor: RcDroppedMq, wrap: wrapMq }, real: { Ctor: Mq, wrap: wrapMq } },
         ];
         for (const ctl of controls) {
             // Non-vacuity: the CORRECT round-trip agrees with the twin (also proven in t5).

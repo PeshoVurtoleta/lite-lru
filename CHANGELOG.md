@@ -7,6 +7,61 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.14.0] - 2026-09-14
+
+### Added
+
+- **MQ / Multi-Queue (`Mq`) -- the twelfth cache member** (decisions/0027, D27; Zhou,
+  Philbin & Li, "The Multi-Queue Replacement Algorithm for Second Level Buffer Caches",
+  USENIX ATC'01): frequency bands with logical-time decay, built for second-level / server
+  buffer caches, on the same `LiteCache<K,V>` surface, so `new LiteLru(n)` swaps for
+  `new Mq(n)` type-checked.
+  - m=8 fixed LRU queues Q0..Q7 (D27.1) banded by `band(rc) = min(floor(log2(rc)), 7)` --
+    the highest set bit of the reference count, clamped so `rc >= 128` saturates to Q7
+    (D27.3, a fail-closed guard). Per-slot columns `_rc`/`_exq` (Float64) + `_qn` (Uint8);
+    `_qHead`/`_qTail` `Int32Array(8)`; queues ride the shared `_next`/`_prev` columns.
+  - Hot path (honest, D27.6): a hit bumps `_rc`, re-bands, and moves the block to its band's
+    MRU -- 0 link writes when already the band MRU, else at most 5 (4..5) -- then stamps
+    `_exq = _t + lifeTime` (lifeTime = capacity, on a logical clock `_t` SEPARATE from the
+    wall-clock `ttl`, D27.2), then runs a fixed 7-step aging sweep demoting each band's idle
+    tail one level toward Q0 (<= 4 links each). This is NOT a 0-write lazy-promotion hit.
+    The per-access cost is a PROVEN non-exceedable <= 33 link writes (5 relink + 7x4 aging)
+    + 3 stamps: reset-on-demote forbids cascade (a demoted block lands at the head of an
+    already-visited lower band with a fresh `_exq`, never re-examined that sweep), a real
+    constant like `Lfu`'s proven 14 -- pinned and measured by `CountedMq` (worst-observed 17
+    links, max 3 demotions/sweep). It is the highest writes/hit in the family by design.
+  - Eviction (D27.4): the LRU tail of the lowest non-empty queue, so a decayed once-hot
+    block in Q0 is evicted before a still-hot high-band block. Bounded keys-only + refcount
+    history `MqHistory` (`ArcGhost` + a parallel Float64 refcount ring, cap = capacity,
+    drop-oldest, D27.5); a `put` of a key still in the history re-admits it at
+    `rc = savedRc + 1` (an evicted rc-5 block re-enters at band(6) = Q2). Unlike `Lfu`, `Mq`
+    forgets via logical decay. Gate MQ 0.00000 B/op strict `keys:'int'`, `maxPauseMs` 0.000.
+  - `Mq` inherits TTL, zero-GC iteration, opt-in stats, and snapshot/restore (tag `m:'Mq'`;
+    the 8 queues + the `_rc`/`_exq` columns + the logical clock + the Qout keys+refcounts
+    captured verbatim, fail-closed on restore -- dropping any is a divergence caught by the
+    t9 `mq-no-aging` / `mq-drop-rc` controls). `Mq` in the shipped bench (`MEMBERS` 11 -> 12),
+    the demo (a `Mq` renderer), the `Mq` class on `Lru.d.ts`, and two new
+    `test/perf/PerfGate.test.mjs` scenarios (`Mq` get-hit + put-churn, 22 -> 24).
+- **`GUIDE.md` -- a repo-only "which member do I pick" field guide.** A decision table + a
+  mermaid decision flowchart + a per-member mental model of all twelve members + measured,
+  seeded bench numbers (capacity 256, seed 0x9e3779b9). Its golden rule is to MEASURE your
+  own trace with `runBench` + `beladyOpt` rather than choose by theory, and it documents the
+  honest finding that `ClockPro` scores 0% of Belady optimal on a pure loop (where `Lirs`
+  hits 99.2% and `WTinyLfu` 94.4%) despite being the CLOCK approximation of LIRS -- theory
+  is not measurement. Referenced from `README.md` and `llms.txt`; NOT in the npm tarball
+  (`files[]` unchanged), consistent with `demo/` and `decisions/` being repo-only.
+
+### Changed
+
+- Cache-member roster eleven -> twelve (`LiteLru`, `Sieve`, `S3Fifo`, `WTinyLfu`, `Slru`,
+  `TwoQ`, `Arc`, `Lirs`, `Lfu`, `ClockPro`, `LruK`, `Mq`); README + `llms.txt` positioning
+  of `Mq` as the frequency-bands-with-logical-decay member for second-level buffer caches.
+- `validate()` term 16, the torture harness, and an independent Multi-Queue oracle extended
+  to `Mq`; `test/{Snapshot,Stats,Ttl,Iteration}.test.js` `MEMBERS` extended.
+- Test count 1324 -> 1427 node:test cases (the new `Mq` boundary suite incl. hand-computed
+  decay/victim/re-admit traces, plus the extended cross-member suites); the lite-perf-gate
+  suite 22 -> 24 scenarios.
+
 ## [1.13.0] - 2026-09-14
 
 ### Added

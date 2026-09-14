@@ -28,7 +28,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../../Lru.js';
 import {
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
     CountedSieve, SIEVE_WRITES_HIT_LINKS, SIEVE_WRITES_HIT_VIS,
@@ -38,12 +38,13 @@ import {
     LFU_WRITES_FASTPATH, LFU_WRITES_MAX,
     CLOCKPRO_WRITES_HIT_LINKS, CLOCKPRO_WRITES_HIT_ST,
     CountedLruK, LRUK_WRITES_HIT_WARM, LRUK_WRITES_HIT_PROMOTE, LRUK_WRITES_HIT_STAMPS,
+    CountedMq, MQ_WRITES_HIT_FASTPATH, MQ_WRITES_HIT_RELINK, MQ_WRITES_MAX, MQ_STAMPS_ACCESS,
 } from '../torture/harness.mjs';
 
 const CAP = 4096;       // power of 2 so the hot body masks its key with & MASK
 const MASK = CAP - 1;
 
-/** The 11 shipped members, in canonical order. */
+/** The 12 shipped members, in canonical order. */
 const MEMBERS = [
     { name: 'LiteLru', Ctor: LiteLru },
     { name: 'Sieve', Ctor: Sieve },
@@ -56,6 +57,7 @@ const MEMBERS = [
     { name: 'Lfu', Ctor: Lfu },
     { name: 'ClockPro', Ctor: ClockPro },
     { name: 'LruK', Ctor: LruK },
+    { name: 'Mq', Ctor: Mq },
 ];
 
 /**
@@ -107,7 +109,7 @@ function putChurnScenario(m) {
     };
 }
 
-/** 22 scenarios: get-hit + put-churn for each of the 11 members. */
+/** 24 scenarios: get-hit + put-churn for each of the 12 members. */
 const scenarios = [];
 for (let i = 0; i < MEMBERS.length; i++) {
     scenarios.push(getHitScenario(MEMBERS[i]));
@@ -175,6 +177,10 @@ test('perf-gate writes-pin cross-check: harness constants match the shipped hot 
     assert.equal(LRUK_WRITES_HIT_WARM, 0);
     assert.equal(LRUK_WRITES_HIT_PROMOTE, 5);
     assert.equal(LRUK_WRITES_HIT_STAMPS, 2);
+    assert.equal(MQ_WRITES_HIT_FASTPATH, 0);
+    assert.equal(MQ_WRITES_HIT_RELINK, 5);
+    assert.equal(MQ_WRITES_MAX, 33);
+    assert.equal(MQ_STAMPS_ACCESS, 3);
 
     const N = 8;
 
@@ -221,4 +227,19 @@ test('perf-gate writes-pin cross-check: harness constants match the shipped hot 
     ck.resetWrites(); ck.get(3);                 // now warm -> 0 links, 2 stamps
     assert.equal(ck.writes(), LRUK_WRITES_HIT_WARM, 'LruK warm hit links');
     assert.equal(ck.stamps(), LRUK_WRITES_HIT_STAMPS, 'LruK warm hit stamps');
+
+    // Mq: an interior re-band hit is exactly 5 links (2 detach + 3 head push) + 3 stamps; an
+    // already-MRU-of-band hit relinks NOTHING (0) + the same 3 stamps. Build Q2 non-empty (z) and
+    // Q1 = [y, A, x] with A interior (no aging fires: lifeTime 16).
+    const cmq = new CountedMq(16);
+    cmq.put('z', 1); cmq.get('z'); cmq.get('z'); cmq.get('z'); // z rc4 -> Q2
+    cmq.put('x', 1); cmq.get('x');                             // x rc2 -> Q1 head
+    cmq.put('A', 1); cmq.get('A'); cmq.get('A');               // A rc3 -> Q1 head
+    cmq.put('y', 1); cmq.get('y');                             // y rc2 -> Q1 head; Q1 = [y, A, x]
+    cmq.resetWrites(); cmq.get('A');             // rc3->4 (Q1->Q2): interior detach(2)+push(3)=5
+    assert.equal(cmq.writes(), MQ_WRITES_HIT_RELINK, 'Mq interior re-band hit links');
+    assert.equal(cmq.stamps(), MQ_STAMPS_ACCESS, 'Mq re-band hit stamps');
+    cmq.resetWrites(); cmq.get('A');             // rc4->5 still Q2 head: 0 links, 3 stamps
+    assert.equal(cmq.writes(), MQ_WRITES_HIT_FASTPATH, 'Mq already-MRU hit links');
+    assert.equal(cmq.stamps(), MQ_STAMPS_ACCESS, 'Mq already-MRU hit stamps');
 });

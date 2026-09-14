@@ -863,6 +863,61 @@ export class LruK<K = unknown, V = unknown> implements LiteCache<K, V> {
   get capacity(): number;
 }
 
+/**
+ * Mq -- Multi-Queue (Zhou, Philbin & Li, USENIX ATC'01), m = 8, decisions/0027. The twelfth
+ * family member: rank by FREQUENCY BAND with LOGICAL-time decay. Each block carries a reference
+ * count; its band is `q = min(floor(log2(rc)), 7)` over 8 LRU queues Q0..Q7. A hit bumps the
+ * count, moves the block to the MRU of its band (0 link writes when already the band MRU, else
+ * exactly 5) and stamps a logical expire time; every access then runs a FIXED 7-step aging sweep
+ * that demotes each band's idle tail one level toward Q0 (<= 4 link writes each, reset-on-demote
+ * forbids cascade -> <= 33 link writes + 3 metadata stamps per access, non-exceedable). Eviction
+ * takes the LRU tail of the LOWEST non-empty queue; a bounded keys-only + refcount Qout history
+ * (cap = capacity, drop-oldest) re-admits a returning block at its remembered frequency. Unlike
+ * Sieve/ClockPro, an MQ hit is NOT a 0-write lazy-promotion hit -- moving to the band MRU is real
+ * list surgery. The logical clock is SEPARATE from the wall-clock `ttl` option. Same uniform
+ * `LiteCache<K, V>` surface as every other member -- the one-line policy swap.
+ *
+ * @typeParam K key type (any value; SameValueZero equality via the internal Map)
+ * @typeParam V value type
+ */
+export class Mq<K = unknown, V = unknown> implements LiteCache<K, V> {
+  /**
+   * @param capacity max entries; must be an integer >= 1 (else throws RangeError,
+   *                 fail-closed -- null is not zero).
+   * @param options  optional `onEvict` hook + `keys` backing (see `LiteCacheOptions`).
+   */
+  constructor(capacity: number, options?: LiteCacheOptions<K, V>);
+  /** Reconstruct a FRESH `Mq` from a `dump()` snapshot (decisions/0021 + 0027), incl. the 8 band
+   *  queues, their per-slot refcount + expire-time columns, the logical clock, AND the bounded
+   *  Qout history (keys + refcounts) -- dropping any is a fail-OPEN future-eviction bug. Fail
+   *  closed on any mismatch or bound violation. */
+  static restore<K = unknown, V = unknown>(snap: CacheSnapshot, opts?: LiteCacheOptions<K, V>): Mq<K, V>;
+  get(key: K): V | undefined;
+  put(key: K, value: V, ttlMs?: number): void;
+  has(key: K): boolean;
+  peek(key: K): V | undefined;
+  delete(key: K): boolean;
+  clear(): void;
+  purgeStale(): number;
+  /** Live runtime counters (decisions/0019). BORROWED holder -- copy what you keep;
+   *  throws on an instance built without { stats: true } (fail-closed). */
+  stats(): CacheStats;
+  /** Zero the four counters in place (decisions/0019); throws without { stats: true }. */
+  resetStats(): void;
+  /** Serialize to a plain, structurally-cloneable snapshot (decisions/0021). COLD, may
+   *  allocate (honest <= 96 B/entry; no zero-GC claim). Restore with the static restore(). */
+  dump(): CacheSnapshot;
+  keys(): IterableIterator<K>;
+  values(): IterableIterator<V>;
+  entries(): IterableIterator<[K, V]>;
+  /** Iterable protocol == entries(); the yielded [K, V] tuple is BORROWED/reused
+   *  (decisions/0018) -- copy what you keep. Only a copying map materializes
+   *  (Array.from(c.entries(), ([k,v])=>[k,v])); a bare spread reads all-undefined. */
+  [Symbol.iterator](): IterableIterator<[K, V]>;
+  get size(): number;
+  get capacity(): number;
+}
+
 /** The package version (kept in lock-step with package.json + Lru.js). */
 export const VERSION: string;
 

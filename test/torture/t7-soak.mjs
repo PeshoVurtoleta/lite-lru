@@ -11,7 +11,7 @@
  * the payload refs). The census is the teeth for that.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../../Lru.js';
 import { createLeakTracker } from '@zakkster/lite-leak';
 import { check, validate, censusOk, settleGc } from './harness.mjs';
 
@@ -396,6 +396,52 @@ export async function run() {
             () => 't7 lruk: an evicted value is still live -- the non-resident history is retaining values (leak)');
     }
 
+    // --- Mq soak (decisions/0027): build/clear cycles + the Qout-retains-no-values census + the
+    // metadata-column invariant. The three columns _rc/_exq/_qn are allocated WITH the store and
+    // NEVER grow (byteLength == 8/8/1 * capacity throughout); the bounded Qout fingerprints evicted
+    // keys + refcounts and must retain only KEYS + numbers (hist._len <= capacity), NEVER values.
+    // Push distinct int keys so every eviction churns Qout, re-reference half so bands + the aging
+    // sweep are exercised, sample the evicted VALUE objects, and prove they are collectible after
+    // teardown. Each cycle: conservation + column invariant mid-life, then size 0 + free list
+    // restored + Qout/clock reset after clear.
+    {
+        const mqrefs = [];
+        const mqtracker = createLeakTracker({ name: 'mq-soak' });
+        for (let cyc = 0; cyc < 1024; cyc++) {
+            const cache = new Mq(CAP, { keys: 'int' });
+            const h = mqtracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
+            check(cache._rc.byteLength === 8 * CAP, () => 't7 mq: _rc column byteLength != 8*capacity (cycle ' + cyc + ')');
+            check(cache._exq.byteLength === 8 * CAP, () => 't7 mq: _exq column byteLength != 8*capacity (cycle ' + cyc + ')');
+            check(cache._qn.byteLength === CAP, () => 't7 mq: _qn column byteLength != capacity (cycle ' + cyc + ')');
+            for (let i = 0; i < CAP * 3; i++) {
+                const val = { c: cyc, i };
+                cache.put(cyc * 100000 + i, val); // distinct int keys => real Qout churn
+                if ((i & 1) === 0) cache.get(cyc * 100000 + i); // 2nd reference -> band growth
+                if ((cyc & 63) === 0 && (i & 7) === 0) mqrefs.push(new WeakRef(val));
+            }
+            check(cache.size === CAP, () => 't7 mq: not full mid-life (size ' + cache.size + ')');
+            check(cache._hist._len <= CAP, () => 't7 mq: Qout exceeded bound');
+            check(cache._rc.byteLength === 8 * CAP && cache._exq.byteLength === 8 * CAP && cache._qn.byteLength === CAP,
+                () => 't7 mq: a metadata column grew mid-life (cycle ' + cyc + ')');
+            validate(cache); // conservation mid-life (8 disjoint queues + Qout bound)
+            cache.clear();
+            check(cache.size === 0, () => 't7 mq: size != 0 after clear (cycle ' + cyc + ')');
+            check(cache._freeListLength() === CAP, () => 't7 mq: free list != capacity after clear (cycle ' + cyc + ')');
+            check(cache._hist._len === 0, () => 't7 mq: Qout not empty after clear (cycle ' + cyc + ')');
+            check(cache._t === 0, () => 't7 mq: logical clock not reset after clear (cycle ' + cyc + ')');
+            let ends = true;
+            for (let q = 0; q < 8; q++) if (cache._qHead[q] !== -1 || cache._qTail[q] !== -1) ends = false;
+            check(ends, () => 't7 mq: band queue ends not reset after clear (cycle ' + cyc + ')');
+            validate(cache);
+            mqtracker.untrack(h);
+        }
+        check(mqtracker.size() === 0, () => 't7 mq: leak tracker size ' + mqtracker.size() + ' != 0');
+        await settleGc(6);
+        check(mqrefs.length > 0, () => 't7 mq: census sample was empty (nothing to prove)');
+        check(censusOk(mqrefs),
+            () => 't7 mq: an evicted value is still live -- the Qout history is retaining values (leak)');
+    }
+
     // --- TTL soak (decisions/0017): expiry churn + conservation + purgeStale + census
     // Build each cycle PAST capacity under a virtual clock, half the entries with a
     // finite ttl (they expire mid-build) and half never-expire. Assert conservation
@@ -448,7 +494,7 @@ export async function run() {
     {
         const snaptracker = createLeakTracker({ name: 'snapshot-soak' });
         const srefs = [];
-        const MEM = [LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK];
+        const MEM = [LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq];
         for (let cyc = 0; cyc < 4096; cyc++) {
             const C = MEM[cyc % MEM.length];
             const cache = new C(CAP, { keys: 'int' });

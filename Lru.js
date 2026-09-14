@@ -157,6 +157,19 @@ const CLOCKPRO_TEST = 4; // bit2: a cold page currently in its test period
  *  whole per-access branch is a single `_st[s] & LRUK_WARM` test. */
 const LRUK_WARM = 1; // bit0: 1 = warm (>= K=2 refs), 0 = cold (< K refs)
 
+/** MQ (decisions/0027, D27) fixed queue count m = 8 (D27.1): Q0..Q7 frequency bands, one LRU
+ *  list per band threaded through the shared `_next`/`_prev` columns (a slot is in exactly one).
+ *  The band of a block with reference count `rc` is `min(floor(log2(rc)), 7)` = the highest set
+ *  bit of `rc` clamped to 7. `MQ_MAXBAND` is the top band index (m - 1); `MQ_BAND_SAT` is the rc
+ *  at/above which the band SATURATES to 7 (2^7 = 128): the fail-closed guard the RISK note names,
+ *  so `Math.clz32` (which coerces `rc` mod 2^32 and would otherwise wrap a huge rc to a NEGATIVE
+ *  or > 7 band) is never consulted for rc >= 128 -> `_qn`/`_qHead`/`_qTail` can never index out of
+ *  range. `MQ_DEMOTE_STEPS` = the fixed aging sweep length (Q1..Q7, one demotion each, m - 1). */
+const MQ_M = 8;
+const MQ_MAXBAND = 7;
+const MQ_BAND_SAT = 128;
+const MQ_DEMOTE_STEPS = 7;
+
 /** W-TinyLFU count-min sketch shape (decisions/0014, D14.2): 4 rows of 4-bit
  *  saturating counters packed 8-per-Uint32. One per-row seed spreads a key across the
  *  rows; `Math.imul` keeps each mix an EXACT 32-bit multiply (zero-alloc). Built once. */
@@ -253,7 +266,7 @@ function validateStats(stats) {
         "[lite-lru] unknown stats option " + String(stats) + " (did you mean true?)");
 }
 
-export const VERSION = "1.13.0";
+export const VERSION = "1.14.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -6515,6 +6528,633 @@ export class LruK {
         if (this._size === 0) return undefined;
         if (this._coldTail !== NIL) return this._keys[this._coldTail];
         return this._keys[this._scanWarmVictim()];
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * MqHistory -- the bounded, keys-only + refcount non-resident history for MQ
+ * (decisions/0027, D27.5). A GENERALIZATION of ArcGhost (like LirsHistory /
+ * ClockProHistory / LruKHistory): the SAME drop-oldest FIFO ring of at most
+ * `capacity` recently-evicted keys, strict-zero on keys:'int' -- PLUS a PARALLEL
+ * Float64 refcount ring aligned to the key ring (int: the pow2 `_ring`; Map: the
+ * `_ringArr`). MQ's Qout retains each evicted block's reference COUNT so a returning
+ * block resumes at its remembered frequency band (the multi-queue "frequency memory"
+ * win). The refcount ring is fixed-size at construction and NEVER a per-key array;
+ * dropping the oldest key drops its rc slot with it. `addMRU`/`consume` keep the two
+ * rings in lockstep; `rcOf` is a COLD membership scan (never a hot path).
+ * -------------------------------------------------------------------------- */
+class MqHistory extends ArcGhost {
+    constructor(cap, isInt) {
+        super(cap, isInt);
+        // The parallel refcount ring, aligned to the key ring: int -> the pow2 `_ring`
+        // (indexed by (head+i) & ringMask); Map -> the `_ringArr` (indexed by (head+i) % cap).
+        this._rcRing = cap > 0 ? new Float64Array(isInt ? this._ring.length : cap) : null;
+    }
+
+    /** Add key at the MRU (tail) end WITH its refcount. Caller GUARANTEES room (_len < cap). */
+    addMRU(key, rc) {
+        if (this._cap === 0) return;
+        if (this._int) {
+            const pos = (this._head + this._len) & this._ringMask;
+            this._ring[pos] = key;
+            this._rcRing[pos] = rc;
+            this._memAdd(key);
+        } else {
+            const pos = (this._head + this._len) % this._cap;
+            this._ringArr[pos] = key;
+            this._rcRing[pos] = rc;
+            this._set.add(key);
+        }
+        this._len++;
+    }
+
+    /** The refcount stored for a PRESENT key (COLD membership scan; returns -1 if absent). */
+    rcOf(key) {
+        if (this._cap === 0) return -1;
+        if (this._int) {
+            const mask = this._ringMask;
+            for (let i = 0; i < this._len; i++) {
+                const p = (this._head + i) & mask;
+                if (this._ring[p] === key) return this._rcRing[p];
+            }
+        } else {
+            const cap = this._cap;
+            for (let i = 0; i < this._len; i++) {
+                const p = (this._head + i) % cap;
+                if (sameKey(this._ringArr[p], key)) return this._rcRing[p];
+            }
+        }
+        return -1;
+    }
+
+    /** Remove a SPECIFIC key (re-admission), shifting BOTH rings in lockstep. COLD; never hot. */
+    consume(key) {
+        if (this._cap === 0) return;
+        if (this._int) {
+            const mask = this._ringMask;
+            let idx = -1;
+            for (let i = 0; i < this._len; i++) {
+                if (this._ring[(this._head + i) & mask] === key) { idx = i; break; }
+            }
+            if (idx >= 0) {
+                for (let i = idx; i < this._len - 1; i++) {
+                    const a = (this._head + i) & mask, b = (this._head + i + 1) & mask;
+                    this._ring[a] = this._ring[b];
+                    this._rcRing[a] = this._rcRing[b];
+                }
+                this._len--;
+            }
+            this._memDel(key);
+        } else {
+            const cap = this._cap;
+            let idx = -1;
+            for (let i = 0; i < this._len; i++) {
+                if (sameKey(this._ringArr[(this._head + i) % cap], key)) { idx = i; break; }
+            }
+            if (idx >= 0) {
+                for (let i = idx; i < this._len - 1; i++) {
+                    const a = (this._head + i) % cap, b = (this._head + i + 1) % cap;
+                    this._ringArr[a] = this._ringArr[b];
+                    this._rcRing[a] = this._rcRing[b];
+                }
+                this._ringArr[(this._head + this._len - 1) % cap] = undefined;
+                this._len--;
+            }
+            this._set.delete(key);
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * Mq -- Multi-Queue (Zhou, Philbin & Li, USENIX ATC'01), decisions/0027, D27. The
+ * TWELFTH named export in this file (same single-file ruling as the rest of the
+ * family: single main file + sideEffects:false + named exports = the tree-shake moat).
+ *
+ * MQ ranks blocks by a FREQUENCY BAND and demotes idle blocks over LOGICAL time. Each
+ * block carries a reference count `rc`; its band is `q = min(floor(log2(rc)), m-1)`
+ * (the highest set bit of rc, clamped -- D27.3, the fail-closed clz32 saturation). The
+ * resident set is partitioned into m = 8 LRU queues Q0..Q7 (D27.1) threaded through the
+ * SHARED `_next`/`_prev` columns; a hit moves the block to the MRU (head) of its band
+ * and stamps an EXPIRE time `_exq = _t + lifeTime` on a LOGICAL clock `_t` (D27.2,
+ * lifeTime = capacity). A block that sits untouched past its expire time is DEMOTED one
+ * band toward Q0 by the aging sweep, so a once-hot block that goes cold decays and
+ * becomes evictable. Eviction takes the LRU (tail) of the LOWEST non-empty queue
+ * (D27.4). An evicted block's key + rc enter the bounded Qout history (MqHistory); a put
+ * of a key still in Qout re-admits it at its remembered rc (D27.5).
+ *
+ * HONESTY (D27.6). Unlike Sieve/S3Fifo/ClockPro/LruK-warm, an MQ hit is NOT a
+ * 0-link-write lazy-promotion hit: moving the block to its band's MRU is REAL list
+ * surgery -- 0 link writes when it is already the MRU of its (unchanged) band, else
+ * AT MOST 5 (4..5: a <= 2-write detach + a <= 3-write head push). On top of that EVERY access
+ * runs a FIXED m-1 = 7-step aging sweep: for each of Q1..Q7 it demotes the queue's tail
+ * IF expired, at most 4 link writes each (a <= 1-write tail detach + a <= 3-write head
+ * push into the band below). The sweep is a REAL CONSTANT, not an amortized bound,
+ * because RESET-ON-DEMOTE forbids cascade: a demoted block lands at the HEAD of an
+ * ALREADY-VISITED lower queue with a fresh `_exq`, so it can never be re-examined or
+ * re-demoted within the same access (proven by walking the sweep; PINNED + measured by
+ * `CountedMq` in t6). Worst case per access: 5 + 7*4 = 33 link writes + 3 metadata
+ * stamps (`_rc`, `_qn`, `_exq` on the accessed slot), NON-EXCEEDABLE.
+ *
+ * STRUCTURE (all fixed at construction, zero-alloc on the hot path):
+ *   - `_rc` / `_exq` Float64 columns (allocated WITH the store, never per key): the
+ *     reference count and the logical expire time per slot.
+ *   - `_qn` Uint8 column: which band (0..7) a slot's queue is -- kept <= band(rc)
+ *     because aging can demote a high-rc block below its natural band (the decay).
+ *   - `_qHead` / `_qTail` Int32Array(m): the MRU/LRU endpoint of each of the 8 queues.
+ *   - `_t`: a monotone Float64 logical clock (a plain number field, exact to 2^53),
+ *     bumped `++this._t` on every reference; SEPARATE from the wall-clock TTL option.
+ *   - `_hist` (MqHistory): the bounded keys-only + refcount Qout (D27.5).
+ *
+ * Rides the shared newStore factory (default Map / opt-in keys:'int' strict-zero), the
+ * onEvict fire-after + `_inOnEvict` guard (0002), TTL (0017 -- the WALL-CLOCK ttl,
+ * distinct from the logical `_t`), zero-GC iteration (0018), stats (0019), snapshot
+ * (0021). The hot path is proven zero-alloc + <= 33-link-write + 3-stamp by the t6 gate.
+ * -------------------------------------------------------------------------- */
+
+export class Mq {
+    /**
+     * @param {number} capacity  Max resident entries. Must be an integer >= 1.
+     * @param {{ onEvict?: (key: any, value: any) => void, keys?: 'int' }} [options]
+     */
+    constructor(capacity, options) {
+        if (!Number.isInteger(capacity) || capacity < 1) {
+            throw new RangeError(
+                "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
+            );
+        }
+
+        this._capacity = capacity;
+
+        // TTL (decisions/0017) -- the WALL-CLOCK ttl, validated fail-closed, identical to the
+        // rest of the family. NOTE: this is DISTINCT from the logical clock `_t` below (D27.2).
+        this._clock = validateClock(options && options.clock);
+        this._ttl = validateTtl(options && options.ttl);
+
+        // Same shared substrate + int-key door as every other member.
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+
+        // Cache the store's columns so the relinks stay direct. The 8 queues are DISJOINT over
+        // the shared `_next`/`_prev` columns (a slot is in exactly one), so validate()/iteration/
+        // snapshot reuse the shared machinery unchanged.
+        this._keys = this._store._keys;
+        this._vals = this._store._vals;
+        this._next = this._store._next; // SHARED: threads all 8 queues (disjoint) + the free stack
+        this._prev = this._store._prev;
+        this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+
+        // Member-specific columns, allocated WITH the store, fixed, never grown (like LIRS `_st`).
+        this._rc = new Float64Array(capacity);  // reference count per slot
+        this._exq = new Float64Array(capacity); // logical expire time per slot (_t + lifeTime)
+        this._qn = new Uint8Array(capacity);    // band (0..7) the slot's queue currently is
+
+        // The 8 LRU queues' endpoints: head = MRU, tail = LRU (the eviction end of each band).
+        this._qHead = new Int32Array(MQ_M).fill(NIL);
+        this._qTail = new Int32Array(MQ_M).fill(NIL);
+
+        this._size = 0; // resident = sum(|Q0..Q7|)
+
+        // The monotone logical clock (D27.2): a plain number field (Float64 semantics), bumped on
+        // every reference; lifeTime = capacity. SEPARATE from the wall-clock `_clock`/`_ttl` above.
+        this._t = 0;
+
+        // The bounded Qout history (D27.5): keys + refcount, cap = capacity, drop-oldest.
+        this._histCap = capacity;
+        this._histInt = (options && options.keys) === 'int';
+        this._hist = new MqHistory(capacity, this._histInt);
+
+        this._onEvict = (options && options.onEvict) || NOOP;
+        this._inOnEvict = false;
+
+        // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
+        this._stats = validateStats(options && options.stats);
+    }
+
+    /** The store factory, delegating to the shared `newStore` (decisions/0011). */
+    _makeStore(capacity, keys, hasTtl) {
+        return newStore(capacity, keys, hasTtl);
+    }
+
+    get size() { return this._size; }
+    get capacity() { return this._capacity; }
+
+    // --- the m intrusive band queues (shared `_next`/`_prev`) ------------------
+
+    /** The band of a reference count `rc` (D27.3): min(floor(log2(rc)), 7) = the highest set bit
+     *  of rc, clamped to 7. `rc >= 128` short-circuits to 7 so `Math.clz32` (which coerces rc mod
+     *  2^32 and would wrap a huge rc to a negative or > 7 band) is NEVER consulted out of the
+     *  1..127 domain -> the band is always a valid 0..7 index (fail-closed, the RISK guard). */
+    _band(rc) {
+        return rc >= MQ_BAND_SAT ? MQ_MAXBAND : (31 - Math.clz32(rc));
+    }
+
+    /** Push slot s at the head (MRU) of band q. Up to 3 link writes (non-empty band). */
+    _qPushHead(q, s) {
+        const h = this._qHead[q];
+        this._prev[s] = NIL; this._next[s] = h;
+        if (h !== NIL) this._prev[h] = s;
+        this._qHead[q] = s; if (this._qTail[q] === NIL) this._qTail[q] = s;
+    }
+
+    /** Unlink slot s from band q. Up to 2 link writes for an interior slot; a tail detach is 1. */
+    _qDetach(q, s) {
+        const p = this._prev[s], n = this._next[s];
+        if (p !== NIL) this._next[p] = n; else this._qHead[q] = n;
+        if (n !== NIL) this._prev[n] = p; else this._qTail[q] = p;
+    }
+
+    /** The FIXED m-1 = 7-step aging sweep (D27.6). For each band Q1..Q7 (ASCENDING) demote its
+     *  LRU (tail) IF its logical expire time has passed, resetting the demoted block's `_exq` and
+     *  placing it at the HEAD (MRU) of the band below. Because a demoted block lands in an
+     *  ALREADY-VISITED lower band with a fresh (non-expired) `_exq`, it can NEVER be re-examined
+     *  or re-demoted within this sweep -- reset-on-demote forbids cascade, so this is a REAL
+     *  constant: at most 7 demotions x <= 4 link writes = <= 28. */
+    _ageSweep() {
+        const t = this._t, exq = this._exq, tailC = this._qTail;
+        for (let q = 1; q < MQ_M; q++) {
+            const tail = tailC[q];
+            if (tail === NIL) continue;
+            if (exq[tail] < t) {              // expired -> demote one band toward Q0
+                this._qDetach(q, tail);        // <= 1 link write (tail detach)
+                const nq = q - 1;
+                this._qn[tail] = nq;           // 1 stamp (its band decays)
+                exq[tail] = t + this._capacity; // 1 stamp: reset -> forbids cascade this sweep
+                this._qPushHead(nq, tail);     // <= 3 link writes
+            }
+        }
+    }
+
+    // --- the MQ policy core (allocation-free) ---------------------------------
+
+    /** Add a key + its refcount to the bounded Qout history, dropping the OLDEST at the bound
+     *  (D27.5). COLD (only the eviction path reaches it). */
+    _histAdd(key, rc) {
+        if (this._hist._len >= this._histCap) this._hist.delLRU();
+        this._hist.addMRU(key, rc);
+    }
+
+    /** Free exactly ONE resident slot and return it for in-place reuse (D6-style). The victim is
+     *  the LRU (tail) of the LOWEST non-empty queue (D27.4). The evicted key + its refcount enter
+     *  the bounded Qout history (D27.5). Sets `_evKey`/`_evVal` for the onEvict fire-after. COLD;
+     *  only ever called at capacity (so a non-empty queue always exists). */
+    _evictOne() {
+        let q = 0;
+        while (q < MQ_M && this._qTail[q] === NIL) q++;
+        const s = this._qTail[q];
+        this._evKey = this._keys[s]; this._evVal = this._vals[s];
+        this._qDetach(q, s);
+        this._store.delete(this._evKey);
+        this._histAdd(this._evKey, this._rc[s]);
+        this._rc[s] = 0; this._exq[s] = 0; this._qn[s] = 0; // reset for reuse
+        this._size--;
+        return s;
+    }
+
+    /** The per-access recency + aging step for a RESIDENT slot (get hit / put update). Advances
+     *  the logical clock, increments the refcount, re-bands, moves the block to the MRU of its
+     *  band (0 link writes when already the MRU of its unchanged band, else at most 5 (4..5)), stamps its
+     *  logical expire time, then runs the fixed 7-step aging sweep. Exactly 3 metadata stamps
+     *  (`_rc`, `_qn`, `_exq`) on the accessed slot; <= 33 link writes total (D27.6). */
+    _access(s) {
+        this._t++;
+        const rc = ++this._rc[s];              // stamp 1: refcount++
+        const q = this._band(rc);
+        const oldQ = this._qn[s];
+        this._qn[s] = q;                        // stamp 2: (re)band
+        this._exq[s] = this._t + this._capacity; // stamp 3: logical expire time
+        if (!(oldQ === q && this._qHead[q] === s)) {
+            // NOT already the MRU of its unchanged band -> real list surgery (at most 5 (4..5) links):
+            this._qDetach(oldQ, s);            // <= 2 link writes
+            this._qPushHead(q, s);             // <= 3 link writes
+        }
+        this._ageSweep();
+    }
+
+    // --- public API (all zero-alloc on the hot path) --------------------------
+
+    /** Look up a key AND apply the MQ access policy (refcount++, re-band to MRU, stamp expire,
+     *  age). @returns the value, or undefined if absent (see D7). A get never consults Qout (a
+     *  missing key is a plain miss). */
+    get(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const s = this._store.get(key);
+        if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
+            this._reap(s);
+            return undefined;
+        }
+        this._access(s);
+        if (this._stats !== null) this._stats.hits++; // live hit (0019)
+        return this._vals[s];
+    }
+
+    /**
+     * Insert or update. An update rewrites the value and applies the access policy (like a hit).
+     * A new key still in the bounded Qout history is re-admitted at its remembered refcount + 1
+     * (D27.5); a brand-new key enters at rc = 1 (band Q0). At capacity one resident is evicted
+     * first (its slot reused in place); onEvict fires LAST (0002). The positional `ttlMs` (0017)
+     * overrides the instance ttl default. Every insert is a reference: it advances the logical
+     * clock and runs the aging sweep, exactly like a hit.
+     */
+    put(key, value, ttlMs) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        let expiresAt;
+        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
+        this._store._ver++; // D18.6 -- put mutates; invalidate iterators
+        const store = this._store;
+        const existing = store.get(key);
+        if (existing >= 0) {                  // update-in-place + access policy
+            this._vals[existing] = value;
+            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            this._access(existing);
+            if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
+            return;
+        }
+
+        const inHist = this._hist.has(key);
+        const savedRc = inHist ? this._hist.rcOf(key) : 0; // read BEFORE the evict may drop it
+        let s;
+        let evicted = false;
+        if (this._size === this._capacity) {
+            s = this._evictOne();             // evict one resident -> reuse its slot; sets _evKey/_evVal
+            evicted = true;
+        } else {
+            s = store.allocSlot();
+        }
+
+        if (inHist) this._hist.consume(key);  // it is being re-admitted (resident again)
+        this._keys[s] = key;
+        this._vals[s] = value;
+        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the wall-clock expiry (D17)
+        store.set(key, s);
+
+        this._t++;
+        const rc = savedRc + 1;               // the insert is a reference (brand-new -> rc 1)
+        this._rc[s] = rc;
+        const q = this._band(rc);
+        this._qn[s] = q;
+        this._exq[s] = this._t + this._capacity;
+        this._qPushHead(q, s);
+        this._size++;
+        this._ageSweep();                     // an insert ages like any other reference (D27.6)
+
+        if (this._stats !== null) this._stats.puts++; // successful insert (outcome-based); 0019
+
+        if (evicted) {
+            if (this._stats !== null) this._stats.evictions++; // capacity eviction (0019)
+            const evKey = this._evKey, evVal = this._evVal;
+            this._evKey = undefined; this._evVal = undefined; // retention hygiene
+            this._inOnEvict = true;
+            try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+        }
+    }
+
+    /** True if key is present (RESIDENT). Qout keys are NOT present. Policy-NEUTRAL. A stale entry
+     *  is a MISS and is reaped in place (decisions/0017, D17.3). */
+    has(key) {
+        const s = this._store.get(key);
+        if (s < 0) return false;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return false;
+        }
+        return true;
+    }
+
+    /** Read a value WITHOUT applying the policy. undefined if absent (see D7). A stale entry is a
+     *  MISS and is reaped in place (decisions/0017, D17.3). */
+    peek(key) {
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return undefined;
+        }
+        return this._vals[s];
+    }
+
+    /** Unlink a resident slot from its band, dropping the size. Shared by delete + reap; NOT
+     *  ghosted (a delete/reap keeps no non-resident metadata, like the family). */
+    _unlinkResident(s) {
+        this._qDetach(this._qn[s], s);
+        this._rc[s] = 0; this._exq[s] = 0; this._qn[s] = 0;
+        this._size--;
+    }
+
+    /** Reap an expired slot in place (decisions/0017): unlink, drop from the index, free the
+     *  slot, and fire onEvict LAST via the 0002 guard. Not ghosted (like delete). */
+    _reap(s) {
+        this._store._ver++; // D18.6 -- a reap is a structural mutation; invalidate iterators
+        const evKey = this._keys[s];
+        const evVal = this._vals[s];
+        this._unlinkResident(s);
+        this._store.delete(evKey);
+        this._store.freeSlot(s);
+        if (this._stats !== null) this._stats.evictions++; // reap = eviction (0019, D19.2)
+        this._inOnEvict = true;
+        try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+    }
+
+    /** Evict every expired resident entry now (decisions/0017, D17.5). COLD, O(size). */
+    purgeStale() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG);
+        if (this._exp === null) return 0;
+        const now = this._clock();
+        const exp = this._exp;
+        const victims = [];
+        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
+        return victims.length;
+    }
+
+    /** Remove a key. Returns true if it was present. Frees the slot; NOT ghosted. */
+    delete(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const s = store.get(key);
+        if (s < 0) return false;
+        store._ver++; // D18.6 -- a real delete is a structural mutation; invalidate iterators
+        this._unlinkResident(s);
+        store.delete(key);
+        store.freeSlot(s);
+        return true;
+    }
+
+    /** Empty the cache. Rebuilds the free list, empties every queue + the history, and resets the
+     *  per-slot state + the logical clock. Allocates nothing. O(capacity). */
+    clear() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
+        this._store.reset();
+        this._qHead.fill(NIL); this._qTail.fill(NIL);
+        this._size = 0;
+        this._t = 0;
+        this._rc.fill(0); this._exq.fill(0); this._qn.fill(0);
+        this._hist.clear();
+    }
+
+    // --- opt-in runtime stats (decisions/0019, D19): cold accessors -----------
+
+    /** The live stats holder (decisions/0019, D19.3), returned BY REFERENCE (borrowed). Fail
+     *  closed on an instance built without { stats: true }. */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE (decisions/0019). Fail closed on a non-stats instance. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        const st = this._stats;
+        st.hits = 0; st.misses = 0; st.evictions = 0; st.puts = 0;
+    }
+
+    // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
+
+    /** The per-member iteration ROSTER (decisions/0018 / 0027): the 8 band queues Q7 (highest
+     *  frequency) DOWN to Q0, each threaded through the shared `_next` column -- RESIDENT only,
+     *  the non-resident Qout history EXCLUDED. Recency-neutral, stale-skipping, fail-closed via
+     *  `_ver` -- the shared CacheIterator walks it unchanged. */
+    _iterHeads() {
+        const h = this._qHead;
+        return [h[7], h[6], h[5], h[4], h[3], h[2], h[1], h[0]];
+    }
+
+    keys() { return iterKeys(this); }
+    values() { return iterValues(this); }
+    entries() { return iterEntries(this); }
+    [Symbol.iterator]() { return iterEntries(this); }
+
+    // --- snapshot / restore (decisions/0021, D21 + 0027): COLD, may allocate --
+
+    /** Serialize to a plain snapshot (decisions/0021, D21 + D27.7): the 8 band queues (each with
+     *  values/expiry via the shared snapList), their aligned `_rc`/`_exq` columns, the logical
+     *  clock `_t` (as `tick`), and the bounded Qout history (keys + refcounts, oldest..newest).
+     *  Dropping the refcounts, the expire times, the clock or the history is a fail-OPEN
+     *  future-eviction bug, so all are captured (the t9 controls prove the round-trip catches it). */
+    dump() {
+        const snap = snapBase(this, "Mq");
+        snap.queues = [];
+        snap.rc = [];
+        snap.exq = [];
+        for (let q = 0; q < MQ_M; q++) {
+            const list = snapList(this, this._qHead[q], false);
+            const rc = [], exq = [];
+            for (let i = 0; i < list.slots.length; i++) {
+                const s = list.slots[i];
+                rc.push(this._rc[s]); exq.push(this._exq[s]);
+            }
+            snap.queues.push(list); snap.rc.push(rc); snap.exq.push(exq);
+        }
+        snap.tick = this._t;
+        snap.hist = snapArcGhost(this._hist);
+        snap.histRc = [];
+        if (this._hist._cap > 0 && this._hist._len > 0) {
+            const g = this._hist;
+            if (g._int) {
+                const mask = g._ringMask;
+                for (let i = 0; i < g._len; i++) snap.histRc.push(g._rcRing[(g._head + i) & mask]);
+            } else {
+                for (let i = 0; i < g._len; i++) snap.histRc.push(g._rcRing[(g._head + i) % g._cap]);
+            }
+        }
+        return snap;
+    }
+
+    /** Reconstruct a FRESH Mq from a snapshot (decisions/0021, D21 + D27.7). Fail closed on any
+     *  tag/shape mismatch; a malformed/mis-aligned rc or exq column; a non-finite rc/exq; a `tick`
+     *  that is not a non-negative finite number; a history/histRc length mismatch or over-bound
+     *  history. */
+    static restore(snap, opts) {
+        const cap = snapRead(snap, "Mq", opts);
+        const inst = new Mq(cap, snapOpts(snap, opts));
+
+        if (!Array.isArray(snap.queues) || snap.queues.length !== MQ_M) {
+            throw new Error(SNAP_BAD + "mq queues must be an array of " + MQ_M + " band lists");
+        }
+        if (!Array.isArray(snap.rc) || snap.rc.length !== MQ_M ||
+            !Array.isArray(snap.exq) || snap.exq.length !== MQ_M) {
+            throw new Error(SNAP_BAD + "mq rc/exq must each be an array of " + MQ_M + " aligned columns");
+        }
+        const pairs = [];
+        for (let q = 0; q < MQ_M; q++) pairs.push([snap.queues[q], "q" + q]);
+        const occ = snapCheckOccupy(cap, snap.ttl, pairs);
+
+        // Shape the MQ-specific aux columns (fail closed -- "null is not zero").
+        const ckCol = (arr, n, label) => {
+            if (!Array.isArray(arr) || arr.length !== n) {
+                throw new Error(SNAP_BAD + "mq " + label + " must be an array aligned to its queue");
+            }
+            for (let i = 0; i < n; i++) {
+                const x = arr[i];
+                if (typeof x !== "number" || !Number.isFinite(x)) {
+                    throw new Error(SNAP_BAD + "mq " + label + "[" + i + "] = " + String(x) + " (must be a finite number)");
+                }
+            }
+        };
+        for (let q = 0; q < MQ_M; q++) {
+            const n = snap.queues[q].slots.length;
+            ckCol(snap.rc[q], n, "rc[" + q + "]");
+            ckCol(snap.exq[q], n, "exq[" + q + "]");
+        }
+        if (typeof snap.tick !== "number" || !Number.isFinite(snap.tick) || snap.tick < 0) {
+            throw new Error(SNAP_BAD + "mq tick must be a non-negative finite number, got " + String(snap.tick));
+        }
+        if (!Array.isArray(snap.hist)) throw new Error(SNAP_BAD + "mq history (hist) must be an array");
+        if (!Array.isArray(snap.histRc)) throw new Error(SNAP_BAD + "mq history refcounts (histRc) must be an array");
+        if (snap.hist.length !== snap.histRc.length) {
+            throw new Error(SNAP_BAD + "mq history (" + snap.hist.length + ") and histRc (" + snap.histRc.length + ") length mismatch");
+        }
+        if (snap.hist.length > cap) {
+            throw new Error(SNAP_BAD + "mq history (" + snap.hist.length + ") exceeds capacity (" + cap + ")");
+        }
+
+        let total = 0;
+        for (let q = 0; q < MQ_M; q++) {
+            const list = snap.queues[q];
+            const ends = snapRestoreList(inst, list, null, 0);
+            for (let i = 0; i < list.slots.length; i++) {
+                const s = list.slots[i];
+                inst._qn[s] = q;
+                inst._rc[s] = snap.rc[q][i];
+                inst._exq[s] = snap.exq[q][i];
+            }
+            inst._qHead[q] = ends.head; inst._qTail[q] = ends.tail;
+            total += ends.size;
+        }
+        inst._size = total;
+        inst._t = snap.tick;
+
+        const gInt = typeof inst._store._ck === "function";
+        for (let i = 0; i < snap.hist.length; i++) {
+            const rc = snap.histRc[i];
+            if (typeof rc !== "number" || !Number.isFinite(rc)) {
+                throw new Error(SNAP_BAD + "mq histRc[" + i + "] = " + String(rc) + " (must be a finite number)");
+            }
+            if (gInt) inst._store._ck(snap.hist[i]); // fail closed on a non-int history key
+            inst._histAdd(snap.hist[i], rc);
+        }
+
+        inst._store.rebuildFreeList(occ);
+        return inst;
+    }
+
+    // --- test/debug only (never call on a hot path) ---------------------------
+
+    /** Free-stack length, delegated to the store (conservation invariant). */
+    _freeListLength() {
+        return this._store.freeListLength();
+    }
+
+    /** The key the NEXT over-capacity insert would evict, WITHOUT mutating (D27.4): the LRU (tail)
+     *  of the lowest non-empty queue. TEST-ONLY (drives the torture differential); never a hot
+     *  path. */
+    _peekVictim() {
+        if (this._size === 0) return undefined;
+        let q = 0;
+        while (q < MQ_M && this._qTail[q] === NIL) q++;
+        return this._keys[this._qTail[q]];
     }
 }
 
