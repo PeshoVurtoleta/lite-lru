@@ -25,7 +25,7 @@
  */
 
 import { measureOps, checkNoGc, measureAllocs, checkAllocs } from '@zakkster/lite-gc-profiler';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car } from '../../Lru.js';
 import { makeLruOracle, svz } from './oracles/lru.mjs';
 import { makeLirsOracle } from './oracles/lirs.mjs';
 import { makeLfuOracle } from './oracles/lfu.mjs';
@@ -39,6 +39,7 @@ import { makeWTinyLfuOracle } from './oracles/wtinylfu.mjs';
 import { makeSlruOracle } from './oracles/slru.mjs';
 import { makeTwoQOracle } from './oracles/twoq.mjs';
 import { makeArcOracle } from './oracles/arc.mjs';
+import { makeCarOracle } from './oracles/car.mjs';
 
 export { validate } from '../validate.mjs';
 
@@ -436,6 +437,45 @@ export const arcTtlPolicy = {
     name: 'arc-ttl',
     real: (cap, o) => wrapArc(new Arc(cap, o)),
     oracle: (cap, o) => makeArcOracle(cap, o),
+};
+
+/** Wrap a real Car as a uniform driver. victim via `_peekVictim` (the non-destructive twin of
+ *  the REPLACE clock sweep, test-only introspection, never a hot path). */
+export function wrapCar(cache) {
+    return {
+        get: (k) => cache.get(k),
+        put: (k, v, t) => cache.put(k, v, t),
+        has: (k) => cache.has(k),
+        peek: (k) => cache.peek(k),
+        delete: (k) => cache.delete(k),
+        size: () => cache.size,
+        victim: () => cache._peekVictim(),
+        raw: cache,
+    };
+}
+
+/** The Car policy (decisions/0028): the CLOCK-reformulation-of-ARC member + its own independent
+ *  two-clock/two-ghost/`p` oracle. Default backing (Map): arbitrary keys. */
+export const carPolicy = {
+    name: 'car',
+    real: (cap) => wrapCar(new Car(cap)),
+    oracle: (cap) => makeCarOracle(cap),
+};
+
+/** The Car policy on the INTEGER substrate backing (`keys: 'int'`), driven against the SAME car
+ *  oracle: the strict-zero backing (incl. the int B1/B2 ghost rings + membership tables) must
+ *  return byte-identical values + victims (decisions/0011 + 0028). */
+export const carIntPolicy = {
+    name: 'car-int',
+    real: (cap) => wrapCar(new Car(cap, { keys: 'int' })),
+    oracle: (cap) => makeCarOracle(cap),
+};
+
+/** Car with an opt-in TTL default (decisions/0017). */
+export const carTtlPolicy = {
+    name: 'car-ttl',
+    real: (cap, o) => wrapCar(new Car(cap, o)),
+    oracle: (cap, o) => makeCarOracle(cap, o),
 };
 
 /** Wrap a real Lirs as a uniform driver. victim via `_peekVictim` (Q front, test-only). */
@@ -1082,6 +1122,59 @@ export const MQ_STAMPS_ACCESS = 3;         // _rc + _qn + _exq on the accessed s
  * restore() targets a FRESH instance. Both are then driven in lockstep.
  * -------------------------------------------------------------------------- */
 
+/**
+ * A Car subclass whose clock columns `_next`/`_prev` AND the per-page state column `_st` are
+ * wrapped in counting Proxies -- used ONLY in the T6 CAR counter sub-tier, NEVER on a measured
+ * zero-alloc path (a Proxy allocates + traps and would poison the gate). It pins CAR's headline:
+ * a HIT relinks NOTHING (0 `_next`/`_prev` stores) and sets exactly ONE `_st` byte (the reference
+ * bit) -- the Sieve/S3Fifo/ClockPro lazy-promotion discipline.
+ *
+ * ATTRIBUTION (decisions/0028, the RISK the planner flagged): the writes are counted PER CALL
+ * SITE. The HIT path (get / put-update) touches ONLY `_st[s] |= CAR_REF` -- 0 links + exactly 1
+ * `_st` store -- and it never calls `_replace`. The reference-bit CLEARS and clock relinks happen
+ * inside `_replace`, which is reached ONLY on a capacity miss (put of an absent key at size==cap),
+ * so those writes are attributed to the miss/evict path, never the hit budget. The counters are a
+ * single running tally; the t6 gate RESETS them immediately before a lone hit to isolate the hit
+ * cost, and measures miss+evict writes on a separate put(miss) with a fresh reset -- so the two
+ * budgets never contaminate each other.
+ */
+export class CountedCar extends Car {
+    constructor(capacity, options) {
+        super(capacity, options);
+        this._writes = 0;   // _next / _prev link stores
+        this._stWrites = 0; // _st state stores
+        const self = this;
+        const countStores = (arr, isSt) => new Proxy(arr, {
+            set(t, prop, value) {
+                if (typeof prop === 'string' && prop !== 'length' && String(+prop) === prop) {
+                    if (isSt) self._stWrites++; else self._writes++;
+                }
+                t[prop] = value;
+                return true;
+            },
+        });
+        this._next = countStores(this._next, false);
+        this._prev = countStores(this._prev, false);
+        this._st = countStores(this._st, true);
+    }
+    resetWrites() { this._writes = 0; this._stWrites = 0; }
+    writes() { return this._writes; }
+    stWrites() { return this._stWrites; }
+}
+
+/** CAR hit baselines (measured; a REAL regression pin, decisions/0028 D28.5). The headline: a hit
+ *  relinks NOTHING (0 link stores) and sets exactly ONE state byte (the reference bit). */
+export const CAR_WRITES_HIT_LINKS = 0;
+export const CAR_WRITES_HIT_ST = 1;
+
+/** NOT a bound -- a per-STREAM regression TRIPWIRE only (decisions/0028, D28.6). A CAR miss+evict
+ *  is amortized O(1) (classic CLOCK) but WORST-CASE O(capacity) `_st` writes on a full-scan-then-
+ *  insert (fill to capacity, reference every resident page, then insert -- REPLACE must sweep the
+ *  whole clock clearing reference bits before it finds an unreferenced victim). This constant only
+ *  tripwires the t6 `carStream` corpus (a mixed stream that never does scan-then-insert); it makes
+ *  NO claim about the true worst case (which is O(capacity)). Do not call it a bound. */
+export const CAR_WRITES_MISS_EVICT_TRIPWIRE = 288;
+
 /** Every member paired with its Ctor + uniform driver wrapper (victim()). */
 export const SNAP_MEMBERS = [
     { name: 'LiteLru', Ctor: LiteLru, wrap: wrapLru },
@@ -1096,6 +1189,7 @@ export const SNAP_MEMBERS = [
     { name: 'ClockPro', Ctor: ClockPro, wrap: wrapClockPro },
     { name: 'LruK', Ctor: LruK, wrap: wrapLruK },
     { name: 'Mq', Ctor: Mq, wrap: wrapMq },
+    { name: 'Car', Ctor: Car, wrap: wrapCar },
 ];
 
 /** Structural deep-equality for two snapshots, IGNORING the capture-time field `t`

@@ -24,8 +24,9 @@ import {
     clockProPolicy, clockProIntPolicy,
     lrukPolicy, lrukIntPolicy,
     mqPolicy, mqIntPolicy,
+    carPolicy, carIntPolicy,
     lruTtlPolicy, sieveTtlPolicy, s3fifoTtlPolicy, wtinylfuTtlPolicy,
-    slruTtlPolicy, twoqTtlPolicy, arcTtlPolicy, lirsTtlPolicy, lfuTtlPolicy, clockProTtlPolicy, lrukTtlPolicy, mqTtlPolicy,
+    slruTtlPolicy, twoqTtlPolicy, arcTtlPolicy, lirsTtlPolicy, lfuTtlPolicy, clockProTtlPolicy, lrukTtlPolicy, mqTtlPolicy, carTtlPolicy,
     SNAP_MEMBERS, runRoundTrip,
     SEED, die,
 } from './harness.mjs';
@@ -215,6 +216,23 @@ export function run() {
     fuzzPolicy(mqPolicy, mqConfigs);
     fuzzPolicy(mqIntPolicy, mqConfigs);
 
+    // The Car MEMBER proof (decisions/0028): the CLOCK-reformulation-of-ARC member on BOTH
+    // backings against its own independent two-clock/two-ghost/`p` oracle -- same value AND same
+    // next victim AND same live size after every op, including the reference-bit second chance,
+    // the T1-survivor migration to T2, the T2 rotation, the `p` adaptation on B1/B2 ghost hits,
+    // the directory trim, and the eviction victim from the non-destructive sweep twin. The int
+    // backing also exercises the strict-zero B1/B2 ghost rings + membership tables. Caps 1..9
+    // stress the degenerate small caps (ghost sizing, the empty-clock REPLACE fallback); 64/256
+    // exercise a normal split where both clocks + both ghosts + p adaptation all fire.
+    const carConfigs = [];
+    for (let cap = 1; cap <= 9; cap++) {
+        carConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0x4d0 + cap });
+    }
+    carConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0x4df });
+    carConfigs.push({ cap: 256, keyspace: 300, ops: OPS, salt: 0x4d1f });
+    fuzzPolicy(carPolicy, carConfigs);
+    fuzzPolicy(carIntPolicy, carConfigs);
+
     // The SEAM proof: the SAME runner drives a second policy unchanged.
     fuzzPolicy(fifoPolicy, [
         { cap: 1, keyspace: 4, ops: OPS, salt: 0x61 },
@@ -244,6 +262,7 @@ export function run() {
     fuzzPolicy(clockProTtlPolicy, ttlConfigs);
     fuzzPolicy(lrukTtlPolicy, ttlConfigs);
     fuzzPolicy(mqTtlPolicy, ttlConfigs);
+    fuzzPolicy(carTtlPolicy, ttlConfigs);
 
     // The SNAPSHOT proof (decisions/0021): for EVERY member, on BOTH backings, ttl OFF
     // and ttl ON, over the 100k corpus -- dump -> restore -> dump is a fixed point AND a

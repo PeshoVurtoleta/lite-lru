@@ -7,6 +7,51 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.15.0] - 2026-09-14
+
+### Added
+
+- **CAR / Clock with Adaptive Replacement (`Car`) -- the thirteenth cache member**
+  (decisions/0028, D28; Bansal & Modha, "CAR: Clock with Adaptive Replacement", USENIX
+  FAST'04): the CLOCK reformulation of ARC, on the same `LiteCache<K,V>` surface, so
+  `new LiteLru(n)` swaps for `new Car(n)` type-checked. Completes the CLOCK-approximation
+  trio: `ClockPro` is to `Lirs` what `Car` is to `Arc`.
+  - Patent cleared before implementation (research spike): the direct CAR/CART filing
+    US 2006/0069876 A1 (Bansal & Modha / IBM) was abandoned and never granted; the adjacent
+    temporal-filtering patents US 7,058,766 and US 7,096,321 expired 2024; ARC's US 6,996,676
+    expired 2024-02-22. Due-diligence, not legal advice; US filings only.
+  - Two reference-bit CLOCK lists `T1` (recency) and `T2` (frequency) ride the shared
+    `_next`/`_prev` columns, each walked by a hand (`_hT1`/`_hT2`); a per-slot `_st` byte
+    carries bit0 reference + bit1 inT2. Two keys-only bounded ghosts `B1` (cap = capacity) and
+    `B2` (cap = 2*capacity) via `CarHistory extends ArcGhost`, and an adaptive integer target
+    `p` for `|T1|` that a B1 hit raises and a B2 hit lowers (ARC's self-tuning split, no knobs).
+  - Hot path: a hit sets one reference bit (`_st |= CAR_REF`) -- 0 link writes, exactly 1 `_st`
+    store, and never calls `_replace` (the Sieve/ClockPro 0-link-write hit; CAR never promotes
+    on hit). Eviction: `_replace` rotates the T1/T2 hands, migrating a referenced page to T2 and
+    clearing its bit, and evicts the first page with reference bit 0.
+  - Honest bound (no ClockPro-S18-style overclaim): eviction is amortized O(1) per miss but
+    worst-case O(capacity) reference-bit clears + link writes on a full-scan-then-insert. NO
+    pinned constant miss+evict bound -- the t6 `carStream` worst-observed (109; tripwire 288) is
+    a per-stream regression tripwire, not a cap, unlike `Lfu`'s proven <= 14 or `Mq`'s proven
+    <= 33. Stated identically in code, decisions/0028, `llms.txt`, `GUIDE.md`, and `README.md`.
+  - Directory invariants (validate.mjs term 17): `|T1|+|T2| == size <= capacity`,
+    `|T1|+|B1| <= capacity`, total `<= 2*capacity`, a key in exactly one of T1/T2/B1/B2;
+    resident value capacity stays exactly capacity. Gate CAR 0.00000 B/op strict `keys:'int'`
+    (writes/hit links=0 state=1), `maxPauseMs` 0.000.
+  - `Car` inherits TTL, zero-GC iteration (T2 MRU..LRU then T1, ghost-excluded, recency-neutral,
+    fail-closed mid-walk), opt-in stats, and snapshot/restore (tag `m:'Car'`; both clocks +
+    per-slot ref bits + T1/T2 membership + B1/B2 ghosts + adaptive `p` + both hand positions
+    captured verbatim; fail-closed restore). CART deferred: its T1-vs-T2 entry rule is a tuning
+    delta, not a distinct mental model -- the family is declared complete at thirteen members.
+
+### Changed
+
+- Roster twelve -> thirteen members. `validate.mjs` adds term 17 (CAR directory invariants).
+  Test count 1427 -> 1449 (node:test). The dev-only `lite-perf-gate` gate extends 24 -> 26
+  int-backed scenarios (all thirteen members x get-hit + put-churn). The repo-only `GUIDE.md`
+  gains a `Car` decision-table row, a per-member mental model, and a synced mermaid branch;
+  `README.md`, `llms.txt`, the bench (`benchmark/Bench.mjs`), and the demo extend to `Car`.
+
 ## [1.14.0] - 2026-09-14
 
 ### Added

@@ -15,8 +15,8 @@
  * corrupt structure still fails the tier.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK, wrapMq } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapS3Fifo, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK, wrapMq, wrapCar } from './harness.mjs';
 
 const NIL = -1;
 
@@ -847,6 +847,60 @@ export function run() {
         void wrapMq(c);
     }
 
+    // --- Car laws (decisions/0028) ----------------------------------------------
+    const CAR_REF = 1, CAR_T2 = 2; // matches Lru.js _st bits
+
+    // CAR1: the hot path sets the reference bit ONLY. A get on a resident page sets bit0 and
+    // moves NOTHING; a true miss enters T1 (recent, ref 0); has/peek are reference-neutral.
+    // Fixed capacity: |T1| + |T2| == size.
+    {
+        const c = new Car(8);
+        for (let i = 0; i < 8; i++) c.put(i, i);
+        const s3 = c._store.get(3);
+        check((c._st[s3] & CAR_T2) === 0, () => 't0 CAR1: a true-miss newcomer must enter T1 (recent)');
+        check((c._st[s3] & CAR_REF) === 0, () => 't0 CAR1: a fresh page must start unreferenced');
+        c.get(3);
+        check((c._st[s3] & CAR_REF) !== 0, () => 't0 CAR1: get did not set the reference bit');
+        const s5 = c._store.get(5);
+        c.has(5); c.peek(5);
+        check((c._st[s5] & CAR_REF) === 0, () => 't0 CAR1: has/peek set a reference bit (must be neutral)');
+        check(c._t1Size + c._t2Size === c.size, () => 't0 CAR1: t1+t2 != size');
+        validate(c);
+    }
+
+    // CAR2: the reference-bit second chance -- a referenced page survives an eviction sweep that
+    // reclaims an unreferenced one. Fill; reference every page but one; the next insert evicts the
+    // single unreferenced page (its neighbours earn a second chance -- migration/rotation).
+    {
+        let evicted;
+        const c = new Car(4, { onEvict: (k) => { evicted = k; } });
+        c.put(0, 0); c.put(1, 1); c.put(2, 2); c.put(3, 3);
+        c.get(0); c.get(2); c.get(3); // 1 is the only unreferenced page
+        c.put(4, 4);                  // a sweep must reclaim the unreferenced page (1)
+        check(evicted === 1, () => 't0 CAR2: evicted ' + String(evicted) + ' != the unreferenced page 1');
+        check(c.has(0) && c.has(2) && c.has(3) && c.has(4),
+            () => 't0 CAR2: a referenced page was evicted instead of the unreferenced one');
+        check(c.size === 4, () => 't0 CAR2: size drifted from capacity');
+        validate(c);
+    }
+
+    // CAR3: scan/loop resistance -- a referenced hot set survives a distinct one-hit flood larger
+    // than capacity, at EXACTLY capacity throughout (the CLOCK-of-ARC scan resistance).
+    {
+        const N = 32;
+        const c = new Car(N, { keys: 'int' });
+        for (let i = 0; i < N; i++) c.put(i, i);
+        const hot = [0, 1, 2, 3];
+        for (const h of hot) for (let t = 0; t < 8; t++) c.get(h);
+        for (let i = 0; i < 4000; i++) { for (const h of hot) c.get(h); c.put(1000 + i, i); }
+        for (const h of hot) check(c.has(h), () => 't0 CAR3: hot key ' + h + ' evicted by the flood (no scan resistance)');
+        check(c.size === N, () => 't0 CAR3: size drifted from capacity under the flood');
+        check(c._t1Size + c._b1._len <= N, () => 't0 CAR3: |T1|+|B1| exceeded capacity');
+        check(c._t1Size + c._t2Size + c._b1._len + c._b2._len <= 2 * N, () => 't0 CAR3: directory total exceeded 2c');
+        validate(c);
+        void wrapCar(c);
+    }
+
     // --- TTL laws (decisions/0017) ----------------------------------------------
 
     // T1: stale = MISS, and the MISS does NOTHING to policy state. get() on an expired
@@ -1056,6 +1110,19 @@ export function run() {
         validate(c);
     }
 
+    // I14 Car -- T2 (_headT2..) THEN T1 (_headT1..), each MRU..LRU over the shared _next column,
+    // RESIDENT only, the keys-only B1/B2 ghosts EXCLUDED (decisions/0028, mirrors Arc D16.5).
+    {
+        const c = new Car(20);
+        for (let i = 0; i < 20; i++) c.put(i, i);      // all newcomers -> T1
+        for (let i = 0; i < 12; i++) c.get(i);         // reference some (bit only, no move)
+        for (let i = 100; i < 110; i++) c.put(i, i);   // churn: _replace migrates ref'd T1 -> T2
+        check(c._headT2 !== NIL, () => 't0 ITER car: T2 empty (setup invalid)');
+        check(c._headT1 !== NIL, () => 't0 ITER car: T1 empty (setup invalid)');
+        checkIterOrder('car', c, [c._headT2, c._headT1]);
+        validate(c);
+    }
+
     // I5 TTL-skip WITHOUT reap (D18.5): a walk sees only live entries, but leaves the
     // stale ones resident (size unchanged); purgeStale() is the reclamation path.
     {
@@ -1075,7 +1142,7 @@ export function run() {
     // --- Snapshot / restore laws (decisions/0021, D21) --------------------------
     const SNAP = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo],
         ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu],
-        ['ClockPro', ClockPro], ['LruK', LruK], ['Mq', Mq]];
+        ['ClockPro', ClockPro], ['LruK', LruK], ['Mq', Mq], ['Car', Car]];
 
     // SN1: round-trip identity. Build a churned mid-life state, dump, structuredClone,
     // restore, and assert dump==dump (fixed point) AND identical order/values/size via an

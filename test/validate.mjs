@@ -98,6 +98,16 @@ export function activeListsOf(cache) {
             { name: 'arc-t1', head: cache._t1Head, tail: cache._t1Tail, doubly: true },
         ];
     }
+    // A Car member (decisions/0028) threads TWO circular clocks through the shared _next/_prev
+    // columns (detected by its `_hT1` recent-clock hand): T2 (frequent) and T1 (recent). The
+    // keys-only B1/B2 ghosts hold no resident slot. The SAME checker sums over both, in
+    // iteration order (T2 then T1 -- mirrors Arc D16.5).
+    if (cache._hT1 !== undefined) {
+        return [
+            { name: 'car-t2', head: cache._headT2, tail: cache._tailT2, doubly: true },
+            { name: 'car-t1', head: cache._headT1, tail: cache._tailT1, doubly: true },
+        ];
+    }
     // A Lirs member (decisions/0023) threads a DISJOINT resident partition through the shared
     // _next/_prev columns (detected by its `_lirHead` LIR-list endpoint): the LIR list and the
     // resident-HIR queue Q. The interleaved stack S rides its OWN member columns and is checked
@@ -398,6 +408,58 @@ export function validate(cache, lists) {
         }
         if (b1 + b2 > cap) {
             throw new Error('[validate] arc b1(' + b1 + ') + b2(' + b2 + ') > capacity(' + cap + ')');
+        }
+    }
+
+    // --- term 17 (Car members, decisions/0028): the split + the two hands + the two ghost
+    // bounds. A no-op unless the member exposes `_hT1`. The two clocks' resident population is
+    // already summed against `size` by term 3/4 via the CAR descriptor above. This term adds the
+    // CAR-specifics: |T1| + |T2| == size; every `_st` byte is a valid 2-bit tag (0..3); the inT2
+    // bit AGREES with the clock a slot is threaded in (a T1 slot never carries CAR_T2, a T2 slot
+    // always does); the adaptive `p` is in [0, capacity]; BOTH hands are NIL iff their clock is
+    // empty and reference a RESIDENT slot of that clock otherwise (a hand can never dangle); and
+    // the two ghost bounds hold -- |T1|+|B1| <= c and the directory total |T1|+|T2|+|B1|+|B2| <= 2c.
+    if (cache._hT1 !== undefined) {
+        const REFB = 1, T2B = 2;
+        if (cache._t1Size + cache._t2Size !== size) {
+            throw new Error('[validate] car t1Size(' + cache._t1Size + ') + t2Size(' + cache._t2Size +
+                ') != size(' + size + ')');
+        }
+        // Walk each clock: mark residency per clock + validate per-page state + the inT2 bit.
+        const inT1 = new Uint8Array(cap), inT2 = new Uint8Array(cap);
+        for (let s = cache._headT1; s !== NIL; s = cache._next[s]) {
+            const st = cache._st[s];
+            if (st > 3) throw new Error('[validate] car _st[' + s + '] = ' + st + ' > 3');
+            if (st & T2B) throw new Error('[validate] car T1 slot ' + s + ' carries the inT2 bit');
+            inT1[s] = 1;
+        }
+        for (let s = cache._headT2; s !== NIL; s = cache._next[s]) {
+            const st = cache._st[s];
+            if (st > 3) throw new Error('[validate] car _st[' + s + '] = ' + st + ' > 3');
+            if ((st & T2B) === 0) throw new Error('[validate] car T2 slot ' + s + ' is missing the inT2 bit');
+            inT2[s] = 1;
+        }
+        void REFB; // the reference bit is unconstrained (0 or 1) per resident slot
+        if (cache._p < 0 || cache._p > cap) {
+            throw new Error('[validate] car p(' + cache._p + ') out of [0,' + cap + ']');
+        }
+        if (cache._t1Size === 0) {
+            if (cache._hT1 !== NIL) throw new Error('[validate] car hT1 ' + cache._hT1 + ' set on an empty T1 clock');
+        } else if (cache._hT1 < 0 || cache._hT1 >= cap || inT1[cache._hT1] === 0) {
+            throw new Error('[validate] car hT1 ' + cache._hT1 + ' does not reference a resident T1 slot (dangling)');
+        }
+        if (cache._t2Size === 0) {
+            if (cache._hT2 !== NIL) throw new Error('[validate] car hT2 ' + cache._hT2 + ' set on an empty T2 clock');
+        } else if (cache._hT2 < 0 || cache._hT2 >= cap || inT2[cache._hT2] === 0) {
+            throw new Error('[validate] car hT2 ' + cache._hT2 + ' does not reference a resident T2 slot (dangling)');
+        }
+        const b1 = cache._b1._len, b2 = cache._b2._len;
+        if (cache._t1Size + b1 > cap) {
+            throw new Error('[validate] car t1Size(' + cache._t1Size + ') + b1(' + b1 + ') > capacity(' + cap + ')');
+        }
+        if (cache._t1Size + cache._t2Size + b1 + b2 > 2 * cap) {
+            throw new Error('[validate] car directory total(' + (cache._t1Size + cache._t2Size + b1 + b2) +
+                ') > 2*capacity(' + (2 * cap) + ')');
         }
     }
 

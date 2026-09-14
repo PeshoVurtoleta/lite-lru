@@ -31,7 +31,7 @@
  * rejects the window; T9 exercises the same alloc lane in-process.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, BREAK, check, die, makePrng, validate,
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
@@ -43,6 +43,7 @@ import {
     CountedClockPro, CLOCKPRO_WRITES_HIT_LINKS, CLOCKPRO_WRITES_HIT_ST, CLOCKPRO_WRITES_MISS_EVICT_TRIPWIRE,
     CountedLruK, LRUK_WRITES_HIT_WARM, LRUK_WRITES_HIT_PROMOTE, LRUK_WRITES_HIT_STAMPS, LRUK_EVICT_SCAN_TRIPWIRE,
     CountedMq, MQ_WRITES_HIT_FASTPATH, MQ_WRITES_HIT_RELINK, MQ_WRITES_AGING_MAX, MQ_WRITES_MAX, MQ_STAMPS_ACCESS,
+    CountedCar, CAR_WRITES_HIT_LINKS, CAR_WRITES_HIT_ST, CAR_WRITES_MISS_EVICT_TRIPWIRE,
 } from './harness.mjs';
 
 const CAP = 4096;      // power of 2 so the hot body masks its key with & MASK
@@ -253,6 +254,36 @@ class CoveredMq extends Mq {
     }
     _evictOne() { this._evicts++; return super._evictOne(); }
     put(k, v, t) { if (this._store.get(k) < 0 && this._hist.has(k)) this._histReadmits++; return super.put(k, v, t); }
+}
+
+/** A Car counting the DISTINGUISHING lanes (decisions/0028) via plain integer field increments
+ *  (zero-alloc; lane coverage only, never on a MEASURED window): `p`-adaptations (B1 or B2 ghost
+ *  hits), B1 hits, B2 hits, capacity evictions (REPLACE), AND T1->T2 migrations of a referenced
+ *  page. The ghost membership is read BEFORE `super.put` runs (it consumes the key), so the
+ *  classification is accurate; migrations are counted by the T2 growth REPLACE performs before it
+ *  removes the victim. */
+class CoveredCar extends Car {
+    constructor(cap, opts) {
+        super(cap, opts);
+        this._pAdapts = 0; this._b1Hits = 0; this._b2Hits = 0; this._evicts = 0; this._migrations = 0;
+    }
+    _replace() {
+        this._evicts++;
+        const t2Before = this._t2Size;
+        const r = super._replace();
+        // REPLACE grows T2 by (migrations) and may remove one T2 page (the victim). The migration
+        // count is the net T2 growth PLUS 1 if the victim came from T2 (net could be one short).
+        const grew = this._t2Size - t2Before;
+        if (grew > 0) this._migrations += grew;
+        return r;
+    }
+    put(key, value, ttlMs) {
+        if (this._store.get(key) < 0) {
+            if (this._b1.has(key)) { this._b1Hits++; this._pAdapts++; }
+            else if (this._b2.has(key)) { this._b2Hits++; this._pAdapts++; }
+        }
+        return super.put(key, value, ttlMs);
+    }
 }
 
 /** Retained sink for the BREAK control -- survives GC so arrayBuffers grows. */
@@ -1795,4 +1826,121 @@ export async function run() {
         MQ_STAMPS_ACCESS + ' + 2/demotion (worst-observed=' + mqMaxStamps + '); lanes covered: demotes=' +
         covMq._demotes + ' evicts=' + covMq._evicts + ' maxDemotes/sweep=' + covMq._maxSweepDemotes +
         ' (<= 7, no cascade)\n');
+
+    // --- Gate CAR: the Car member -- STRICT zero-alloc + MEASURED writes-per-hit --------------
+    // (decisions/0028) The SAME MIXED, recurring int-key stream drives every CAR lane at capacity:
+    // hot recurrence -> reference bits set (0 relinks) + T1->T2 migrations of referenced pages on
+    // REPLACE; cold churn -> REPLACE evictions to B1/B2 + `p` adaptation on B1/B2 ghost hits + the
+    // directory trim. Zero-alloc: the closure indexes a preallocated Int32Array and does int
+    // get/put only. The clock columns `_next`/`_prev`, the state column `_st`, the int index
+    // buffers AND both ghost rings + membership tables never grow; |T1|+|T2| == size == capacity
+    // always; |T1|+|B1| <= c and the directory total <= 2c always.
+    const carStream = buildMixedStream(STREAM_LEN, HOT_SIZE, A1IN_CAP, 0xCA55EED0);
+    const carCache = new Car(CAP, { keys: 'int' });
+    const carSink = new Int32Array(1);
+    let cari = 0;
+    const carHot = () => {
+        const k = carStream[cari & STREAM_MASK]; cari++;
+        const v = carCache.get(k);
+        if (v === undefined) carCache.put(k, k); else { carSink[0] += v | 0; carCache.get(k); }
+    };
+    for (let i = 0; i < PREFILL; i++) carHot(); // reach steady state (both ghosts populated)
+    check(carCache.size === CAP, () => 't6 Gate CAR: prefill did not reach capacity (size ' + carCache.size + ')');
+    const carNextBytes = carCache._next.buffer.byteLength;
+    const carPrevBytes = carCache._prev.buffer.byteLength;
+    const carStBytes = carCache._st.buffer.byteLength;
+    const carIxSlotBytes = carCache._store._ixSlot.buffer.byteLength;
+    const carIxKeyBytes = carCache._store._ixKey.buffer.byteLength;
+    const carB1RingBytes = carCache._b1._ring.buffer.byteLength;
+    const carB2RingBytes = carCache._b2._ring.buffer.byteLength;
+    const gcar = runOpsGate(carHot, { ops: OPS, warmup: WARMUP });
+    check(carCache._next.buffer.byteLength === carNextBytes,
+        () => 't6 Gate CAR: _next.buffer grew ' + carNextBytes + ' -> ' + carCache._next.buffer.byteLength);
+    check(carCache._prev.buffer.byteLength === carPrevBytes,
+        () => 't6 Gate CAR: _prev.buffer grew ' + carPrevBytes + ' -> ' + carCache._prev.buffer.byteLength);
+    check(carCache._st.buffer.byteLength === carStBytes,
+        () => 't6 Gate CAR: _st.buffer grew ' + carStBytes + ' -> ' + carCache._st.buffer.byteLength);
+    check(carCache._store._ixSlot.buffer.byteLength === carIxSlotBytes,
+        () => 't6 Gate CAR: _ixSlot.buffer grew ' + carIxSlotBytes + ' -> ' + carCache._store._ixSlot.buffer.byteLength);
+    check(carCache._store._ixKey.buffer.byteLength === carIxKeyBytes,
+        () => 't6 Gate CAR: _ixKey.buffer grew ' + carIxKeyBytes + ' -> ' + carCache._store._ixKey.buffer.byteLength);
+    check(carCache._b1._ring.buffer.byteLength === carB1RingBytes,
+        () => 't6 Gate CAR: B1 _ring grew ' + carB1RingBytes + ' -> ' + carCache._b1._ring.buffer.byteLength);
+    check(carCache._b2._ring.buffer.byteLength === carB2RingBytes,
+        () => 't6 Gate CAR: B2 _ring grew ' + carB2RingBytes + ' -> ' + carCache._b2._ring.buffer.byteLength);
+    check(carCache.size === CAP, () => 't6 Gate CAR: churn did not stay at capacity (size ' + carCache.size + ')');
+    check(carCache._t1Size + carCache._b1._len <= CAP, () => 't6 Gate CAR: |T1|+|B1| exceeded capacity (' + (carCache._t1Size + carCache._b1._len) + ')');
+    check(carCache._t1Size + carCache._t2Size + carCache._b1._len + carCache._b2._len <= 2 * CAP,
+        () => 't6 Gate CAR: directory total exceeded 2c (' + (carCache._t1Size + carCache._t2Size + carCache._b1._len + carCache._b2._len) + ')');
+    if (!gcar.report.ok) {
+        const g = gcar.summary.gc;
+        die('t6 Gate CAR (mixed churn) ops gate rejected -- verdict=' + gcar.report.verdict +
+            ' source=' + gcar.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gcarA = runAllocsGate(carHot, { iterations: 50000, batches: 8 });
+    if (!gcarA.ok) {
+        die('t6 Gate CAR (mixed churn) retained-alloc gate rejected -- verdict=' + gcarA.report.verdict +
+            ' settled=' + gcarA.result.settled + ' bytesPerCall=' + gcarA.bytesPerCall);
+    }
+    // Writes-per-hit pin (the headline, D28.5): a HIT relinks NOTHING (0 _next/_prev stores) and
+    // sets exactly ONE _st byte (the reference bit) -- the Sieve/S3Fifo/ClockPro discipline. This
+    // is the 0-link-write / 1-`_st`-store hit gate; the ref-bit CLEARS live on the miss path below.
+    const ccar = new CountedCar(16);
+    for (let i = 0; i < 16; i++) ccar.put(i, i);
+    ccar.get(5);                    // set the reference bit once (idempotent)
+    ccar.resetWrites();
+    ccar.get(5);                    // a hit -> 0 links, 1 state store
+    check(ccar.writes() === CAR_WRITES_HIT_LINKS,
+        () => 't6 Gate CAR: a hit relinked ' + ccar.writes() + ' cells, expected ' + CAR_WRITES_HIT_LINKS);
+    check(ccar.stWrites() === CAR_WRITES_HIT_ST,
+        () => 't6 Gate CAR: a hit wrote ' + ccar.stWrites() + ' state bytes, expected ' + CAR_WRITES_HIT_ST);
+    // Miss+evict is NOT a constant: it is amortized O(1) (classic CLOCK) but WORST-CASE O(capacity)
+    // `_st` + link writes on a full-scan-then-insert (REPLACE migrates/clears the whole clock before
+    // it finds an unreferenced victim). We do NOT pin a bound. The number below is a per-STREAM
+    // regression TRIPWIRE on `carStream` only (a mixed stream that never does scan-then-insert): if
+    // it is ever exceeded the change is investigated -- it is not a proven cap. The ATTRIBUTION is
+    // exact: these writes are measured on a put(miss) that reaches REPLACE, NEVER on the hit above.
+    const ccar2 = new CountedCar(CAP, { keys: 'int' });
+    let ccar2i = 0, carMaxWrites = 0;
+    for (let i = 0; i < STREAM_LEN; i++) {
+        const k = carStream[i & STREAM_MASK];
+        const s = ccar2._store.get(k);
+        if (s >= 0) { ccar2.get(k); continue; }
+        ccar2.resetWrites();
+        ccar2.put(k, k);
+        const w = ccar2.writes() + ccar2.stWrites();
+        if (w > carMaxWrites) carMaxWrites = w;
+    }
+    check(carMaxWrites <= CAR_WRITES_MISS_EVICT_TRIPWIRE,
+        () => 't6 Gate CAR: carStream miss+evict worst-observed ' + carMaxWrites +
+            ' exceeded the carStream tripwire ' + CAR_WRITES_MISS_EVICT_TRIPWIRE +
+            ' (a per-stream regression tripwire, NOT a bound; the true worst case is O(capacity))');
+    // Lane coverage: the mixed stream must exercise evictions, B1 hits, B2 hits, p-adaptations.
+    const covCar = new CoveredCar(CAP, { keys: 'int' });
+    let covCari = 0;
+    const covCarHot = () => {
+        const k = carStream[covCari & STREAM_MASK]; covCari++;
+        if (covCar.get(k) === undefined) covCar.put(k, k); else covCar.get(k);
+    };
+    for (let i = 0; i < PREFILL; i++) covCarHot();
+    covCar._pAdapts = 0; covCar._b1Hits = 0; covCar._b2Hits = 0; covCar._evicts = 0; covCar._migrations = 0;
+    for (let i = 0; i < OPS; i++) covCarHot();
+    check(covCar._evicts >= 100,
+        () => 't6 Gate CAR: the window triggered ' + covCar._evicts + ' evictions (< 100 -- lane not covered)');
+    check(covCar._b1Hits >= 50,
+        () => 't6 Gate CAR: the window triggered ' + covCar._b1Hits + ' B1 ghost hits (< 50 -- lane not covered)');
+    check(covCar._b2Hits >= 50,
+        () => 't6 Gate CAR: the window triggered ' + covCar._b2Hits + ' B2 ghost hits (< 50 -- lane not covered)');
+    check(covCar._pAdapts >= 100,
+        () => 't6 Gate CAR: the window triggered ' + covCar._pAdapts + ' p-adaptations (< 100 -- lane not covered)');
+    check(covCar._migrations > 0,
+        () => 't6 Gate CAR: the window triggered 0 T1->T2 migrations (the clock second-chance lane was not covered)');
+    process.stderr.write('t6 Gate CAR: ' + gcarA.bytesPerCall.toFixed(5) +
+        ' B/op mixed churn (' + OPS + ' ops window, capacity ' + CAP + '); maxPauseMs=' +
+        gcar.summary.gc.maxMs.toFixed(3) + '; writes/hit links=' + CAR_WRITES_HIT_LINKS +
+        ' state=' + CAR_WRITES_HIT_ST + '; miss+evict worst-on-carStream=' + carMaxWrites +
+        ' (amortized O(1); worst-case O(capacity) on scan-then-insert; carStream tripwire=' +
+        CAR_WRITES_MISS_EVICT_TRIPWIRE + '); lanes covered: pAdapt=' + covCar._pAdapts +
+        ' b1Hit=' + covCar._b1Hits + ' b2Hit=' + covCar._b2Hits + ' evicts=' + covCar._evicts +
+        ' migrations=' + covCar._migrations + '\n');
 }

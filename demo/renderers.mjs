@@ -313,6 +313,47 @@ export const RENDERERS = {
             drawGhost(g, geom.x, y, s.hist, 'non-resident Qout (keys)');
         },
     },
+    Car: {
+        // Car dump() shape (decisions/0028): the two clocks T2 (frequent) + T1 (recent) (resident,
+        // values), each page's per-slot `st` byte (bit0 reference / bit1 inT2), the two clock hand
+        // slot positions, the adaptive `p`, and the two keys-only ghosts B1/B2. Occupancy + the
+        // split + the reference bits are the story -- each page is tinted frequent (T2) vs recent
+        // (T1) and outlined when its reference bit is set (the CLOCK second-chance flag).
+        fields: ['t2', 't1', 'st2', 'st1', 'hT1', 'hT2', 'p', 'b1', 'b2'],
+        model(s) { return pick(s, this.fields); },
+        draw(g, s, geom) {
+            let y = geom.y + 16;
+            y = drawPBar(g, geom.x, y + 8, s.p, s.cap);
+            // Draw one clock as reference-outlined cells: hot/cold tint by `col`, outline when ref.
+            const clock = (list, st, label, col) => {
+                g.fillStyle = COL.label;
+                g.font = '11px ui-monospace, monospace';
+                g.fillText(label + ' (referenced = outline)', geom.x, y - 4);
+                let cx = geom.x;
+                for (let i = 0; i < list.k.length; i++) {
+                    const b = st[i];
+                    g.fillStyle = col;
+                    g.fillRect(cx, y, CELL_W, CELL_H);
+                    if (b & 1) { g.strokeStyle = COL.visited; g.lineWidth = 2; } // reference bit set
+                    else { g.strokeStyle = COL.slotEdge; g.lineWidth = 1; }
+                    g.strokeRect(cx, y, CELL_W, CELL_H);
+                    g.fillStyle = COL.text;
+                    g.fillText(String(list.k[i]), cx + 4, y + 16);
+                    cx += CELL_W + GAP;
+                    if (cx > geom.x + 12 * (CELL_W + GAP)) { cx = geom.x; y += CELL_H + GAP + 12; }
+                }
+                y += CELL_H + 18;
+            };
+            clock(s.t2, s.st2, 'T2 frequent (MRU..LRU)', COL.prot);
+            clock(s.t1, s.st1, 'T1 recent (MRU..LRU)', COL.prob);
+            g.fillStyle = COL.hand;
+            g.font = '11px ui-monospace, monospace';
+            g.fillText('hands -> T1 ' + s.hT1 + '  T2 ' + s.hT2, geom.x, y);
+            y += 14;
+            y = drawGhost(g, geom.x, y, s.b1, 'B1 ghost (recent)');
+            drawGhost(g, geom.x, y, s.b2, 'B2 ghost (frequent)');
+        },
+    },
 };
 
 /** The members this module renders. Demo.test.mjs asserts this covers every engine

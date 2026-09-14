@@ -11,7 +11,7 @@
  * the payload refs). The census is the teeth for that.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car } from '../../Lru.js';
 import { createLeakTracker } from '@zakkster/lite-leak';
 import { check, validate, censusOk, settleGc } from './harness.mjs';
 
@@ -442,6 +442,49 @@ export async function run() {
             () => 't7 mq: an evicted value is still live -- the Qout history is retaining values (leak)');
     }
 
+    // --- Car soak (decisions/0028): build/clear cycles + the GHOST-retains-no-values census +
+    // the reference-bit-column invariant. The two ghosts B1/B2 fingerprint evicted keys; they must
+    // retain only KEYS (bounded so |T1|+|B1| <= c and the directory total <= 2c), NEVER values. The
+    // per-page `_st` column is allocated WITH the store and NEVER grows (byteLength == capacity
+    // throughout). Push distinct int keys so every eviction churns a ghost, re-reference half so the
+    // reference-bit second chance + the T1->T2 migration are exercised, sample the evicted VALUE
+    // objects, and prove they are collectible after teardown even though their keys may still sit in
+    // a ghost. Each cycle: conservation mid-life (both clocks + both ghost bounds), then size 0 +
+    // free list restored + ghosts empty + hands/p reset after clear.
+    {
+        const carrefs = [];
+        const cartracker = createLeakTracker({ name: 'car-soak' });
+        for (let cyc = 0; cyc < 1024; cyc++) {
+            const cache = new Car(CAP, { keys: 'int' });
+            const h = cartracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
+            check(cache._st.byteLength === CAP, () => 't7 car: _st column byteLength != capacity (cycle ' + cyc + ')');
+            for (let i = 0; i < CAP * 3; i++) {
+                const val = { c: cyc, i };
+                cache.put(cyc * 100000 + i, val); // distinct int keys => real ghost churn
+                if ((i & 1) === 0) cache.get(cyc * 100000 + i); // set reference bits (drives migration)
+                if ((cyc & 63) === 0 && (i & 7) === 0) carrefs.push(new WeakRef(val));
+            }
+            check(cache.size === CAP, () => 't7 car: not full mid-life (size ' + cache.size + ')');
+            check(cache._t1Size + cache._b1._len <= CAP, () => 't7 car: |T1|+|B1| exceeded bound');
+            check(cache._t1Size + cache._t2Size + cache._b1._len + cache._b2._len <= 2 * CAP, () => 't7 car: directory total exceeded 2c');
+            check(cache._st.byteLength === CAP, () => 't7 car: _st column grew mid-life (cycle ' + cyc + ')');
+            validate(cache); // conservation mid-life (both clocks + both ghost bounds + hands)
+            cache.clear();
+            check(cache.size === 0, () => 't7 car: size != 0 after clear (cycle ' + cyc + ')');
+            check(cache._freeListLength() === CAP, () => 't7 car: free list != capacity after clear (cycle ' + cyc + ')');
+            check(cache._b1._len === 0 && cache._b2._len === 0, () => 't7 car: ghosts not empty after clear (cycle ' + cyc + ')');
+            check(cache._p === 0, () => 't7 car: p not reset after clear (cycle ' + cyc + ')');
+            check(cache._hT1 === -1 && cache._hT2 === -1, () => 't7 car: hands not reset after clear (cycle ' + cyc + ')');
+            validate(cache);
+            cartracker.untrack(h);
+        }
+        check(cartracker.size() === 0, () => 't7 car: leak tracker size ' + cartracker.size() + ' != 0');
+        await settleGc(6);
+        check(carrefs.length > 0, () => 't7 car: census sample was empty (nothing to prove)');
+        check(censusOk(carrefs),
+            () => 't7 car: an evicted value is still live -- a B1/B2 ghost is retaining values (leak)');
+    }
+
     // --- TTL soak (decisions/0017): expiry churn + conservation + purgeStale + census
     // Build each cycle PAST capacity under a virtual clock, half the entries with a
     // finite ttl (they expire mid-build) and half never-expire. Assert conservation
@@ -494,7 +537,7 @@ export async function run() {
     {
         const snaptracker = createLeakTracker({ name: 'snapshot-soak' });
         const srefs = [];
-        const MEM = [LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq];
+        const MEM = [LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car];
         for (let cyc = 0; cyc < 4096; cyc++) {
             const C = MEM[cyc % MEM.length];
             const cache = new C(CAP, { keys: 'int' });

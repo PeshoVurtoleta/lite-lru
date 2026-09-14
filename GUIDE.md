@@ -1,6 +1,6 @@
 # Choosing a cache member -- a field guide
 
-`@zakkster/lite-lru` ships **twelve** eviction policies behind one identical
+`@zakkster/lite-lru` ships **thirteen** eviction policies behind one identical
 `LiteCache<K,V>` surface. This guide is the opinionated, measurement-driven
 companion to the API docs: it tells you where to *start*, why the classic
 choices lose, and -- the part that actually matters -- how to stop guessing and
@@ -22,7 +22,7 @@ per-member "good for / not for". This guide is the long form.
 
 ## 1. TL;DR decision table
 
-Twelve members, one constructor swap. Start here, then measure (section 4).
+Thirteen members, one constructor swap. Start here, then measure (section 4).
 
 | Your workload / need | Start with | Strong alternative | Avoid | Measured signal (see section 4) |
 | --- | --- | --- | --- | --- |
@@ -31,7 +31,8 @@ Twelve members, one constructor swap. Start here, then measure (section 4).
 | Repeated one-pass **scans** (working set > cache) | `Sieve` or `S3Fifo` | `Slru`, `TwoQ`, `LruK`, `Arc` | `LiteLru`, `ClockPro` | scan ~100% OPT for most; LiteLru 72%, ClockPro 84.5% |
 | **Loops** / cyclic reuse LARGER than capacity | `Lirs` | `WTinyLfu` | everything else | loop %OPT: **Lirs 99.2, WTinyLfu 94.4, all others 0.0** |
 | Second-level / behind-another-cache buffer | `Mq` | `Arc`, `Lirs` | `LiteLru` | MQ is built for this (frequency bands + decay) |
-| Phase-changing traffic, no time to tune | `Arc` | `WTinyLfu` | -- | self-tuning, no knobs; 88.1% zipf |
+| Phase-changing traffic, no time to tune | `Arc` | `WTinyLfu`, `Car` | -- | self-tuning, no knobs; 88.1% zipf |
+| Self-tuning like ARC but with the CHEAPEST hit (0-link-write) | `Car` | `Arc`, `ClockPro` | -- | ARC's adaptation on clocks; hit sets 1 bit, moves nothing (like ClockPro) |
 | **Exact** frequency eviction (quota fairness, audits, deterministic replay) | `Lfu` | -- | approximations | provable LFU victim; 88.4% zipf |
 | Cheapest hit / highest throughput + scan resistance | `Sieve` | `S3Fifo` | `Mq`, `Lirs`, `Arc` | 1.0 writes/hit, ~42 ns/op; Mq ~9.4 writes/hit |
 | Pure recency, maximum simplicity, chronically full | `LiteLru` | -- | -- | the honest floor -- but **0% on loops** |
@@ -51,10 +52,13 @@ Measured on the same trace (cap 256):
 
 | Cheapest hit (~1.0 writes/hit) | Middle (~2--5) | Most expensive |
 | --- | --- | --- |
-| `Sieve`, `S3Fifo`, `ClockPro` | `LruK` (~2.0), `Lfu` (~2.9), `LiteLru`/`Arc`/`Lirs`/`WTinyLfu` (~4.8) | `Mq` (~9.4) |
+| `Sieve`, `S3Fifo`, `ClockPro`, `Car` | `LruK` (~2.0), `Lfu` (~2.9), `LiteLru`/`Arc`/`Lirs`/`WTinyLfu` (~4.8) | `Mq` (~9.4) |
 
 `Mq` and the frequency members do real per-hit list surgery by design; the
-lazy-promotion members (`Sieve`, `S3Fifo`, `ClockPro`) set one bit and move on.
+lazy-promotion members (`Sieve`, `S3Fifo`, `ClockPro`, `Car`) set one bit and
+move on. `Car` is the write-cheap counterpart to `Arc`: the SAME adaptive
+recency/frequency policy, but a 0-link-write reference-bit hit instead of ARC's
+move-to-T2-MRU relink.
 
 ---
 
@@ -75,13 +79,16 @@ flowchart TD
     SKEW -- no --> L2{Behind another cache /<br/>second-level buffer?}
     L2 -- yes --> MQ[Mq or Arc<br/>frequency bands + decay]
     L2 -- no --> KNOBS{Mixed / unknown /<br/>phase-changing?}
-    KNOBS -- yes --> ARC[Arc<br/>self-tuning, no knobs]
+    KNOBS -- yes --> CHEAP{Want the CHEAPEST hit<br/>0-link-write?}
+    CHEAP -- yes --> CAR[Car<br/>ARC on clocks, 0-link-write hit]
+    CHEAP -- no --> ARC[Arc<br/>self-tuning, no knobs]
     KNOBS -- no --> SIMPLE[LiteLru<br/>pure recency, the floor]
     LIRS --> MEASURE
     SIEVE --> MEASURE
     LFU --> MEASURE
     WTLFU --> MEASURE
     MQ --> MEASURE
+    CAR --> MEASURE
     ARC --> MEASURE
     SIMPLE --> MEASURE
     MEASURE([Now MEASURE: runBench + beladyOpt on YOUR trace.<br/>Pick the best % of optimal at an acceptable writes/hit.])
@@ -106,7 +113,7 @@ common shapes. This is *why* the family exists.
   the pathological case: by the time a key comes back around, LRU has just
   evicted it. Measured on this trace, **every recency- and frequency-ordered
   member hits 0.0% of optimal** -- `LiteLru`, `Sieve`, `S3Fifo`, `Slru`, `TwoQ`,
-  `Arc`, `Lfu`, `LruK`, and even `Mq`. Only two survive: **`Lirs` at 99.2%** and
+  `Arc`, `Car`, `Lfu`, `LruK`, and even `Mq`. Only two survive: **`Lirs` at 99.2%** and
   **`WTinyLfu` at 94.4%**. `Lirs` keeps a stable "hot" set by recency-of-recency
   and refuses to let a loop churn it; `WTinyLfu`'s frequency admission does the
   same job differently.
@@ -263,6 +270,22 @@ One paragraph each -- what it does, its hot-path cost, and its honest caveat.
   non-exceedable), NOT a 0-write hit; the most writes/hit in the family (~9.4).
   Reach for it over `Lfu` when recency should be allowed to reclaim decayed
   frequency (D27).
+
+- **`Car`** -- CAR, Clock with Adaptive Replacement (Bansal & Modha, FAST'04):
+  the **CLOCK reformulation of ARC**. ARC's exact semantics -- T1 recent / T2
+  frequent, ghosts B1/B2, one self-tuning integer `p`, **no knobs** -- but on
+  reference-bit CLOCKS instead of LRU lists, so a hit sets ONE bit and moves
+  NOTHING (a 0-link-write hit like `ClockPro`/`Sieve`) where `Arc` relinks to the
+  T2 MRU. It completes the CLOCK-approximation trio: `ClockPro` approximates LIRS,
+  `Car` reformulates ARC. Reach for it over `Arc` when the hit-path write cost
+  matters, and over `ClockPro` when you want ARC's recency/frequency adaptation
+  rather than LIRS's recency-of-recency. *Caveat:* like `ClockPro`, eviction is
+  **amortized O(1) but worst-case O(capacity)** reference-bit clears on a
+  full-scan-then-insert -- **NO constant bound is claimed** (unlike `Lfu`'s proven
+  14 or `Mq`'s proven 33); the torture `carStream` worst-observed is a per-stream
+  regression tripwire, not a cap (D28). CART is DEFERRED and the family is final
+  at thirteen: CART's T1-vs-T2 entry rule is a tuning delta on CAR's placement,
+  not a distinct mental model.
 
 ---
 

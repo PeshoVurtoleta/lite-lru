@@ -116,6 +116,16 @@ const TWOQ_AM = 1;
 const ARC_T1 = 0;
 const ARC_T2 = 1;
 
+/** CAR (decisions/0028, D28) per-slot state bits, packed in a member-specific `_st` Uint8
+ *  column (mirrors LIRS/ClockPro `_st`, NOT a field on the shared SlotStore -- the other
+ *  members' hot paths stay byte-identical). bit0 = reference (the ONLY bit a get/put-update
+ *  touches -- CAR's CLOCK reformulation of ARC: a hit sets a reference bit and moves NOTHING,
+ *  the 0-link-write headline); bit1 = inT2 (the slot rides the FREQUENT clock T2, else the
+ *  RECENT clock T1). The two clocks T1/T2 ride the shared `_next`/`_prev` columns; the inT2
+ *  bit tells `_detach`/`_removeResident`/`_reap` which clock a slot is in. */
+const CAR_REF = 1; // bit0: referenced since the last hand pass (the hot-path store)
+const CAR_T2 = 2;  // bit1: 1 = in the frequent clock T2, 0 = in the recent clock T1
+
 /** LIRS (decisions/0023, D23) per-slot state bits, packed in a member-specific `_st`
  *  Uint8 column (like W-TinyLFU's sketch -- NOT a field on the shared SlotStore, so the
  *  other members' hot paths stay byte-identical). bit0 = LIR (low IRR, hot/resident);
@@ -266,7 +276,7 @@ function validateStats(stats) {
         "[lite-lru] unknown stats option " + String(stats) + " (did you mean true?)");
 }
 
-export const VERSION = "1.14.0";
+export const VERSION = "1.15.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -7155,6 +7165,614 @@ export class Mq {
         let q = 0;
         while (q < MQ_M && this._qTail[q] === NIL) q++;
         return this._keys[this._qTail[q]];
+    }
+}
+
+/* -------------------------------------------------------------------------- *
+ * CarHistory -- the bounded, keys-only ghost list for CAR's B1/B2 (decisions/0028,
+ * D28.2). A GENERALIZATION of ArcGhost (exactly like LirsHistory / ClockProHistory /
+ * LruKHistory / MqHistory): the SAME open-addressed int ring (strict zero-alloc on
+ * keys:'int') / Set + FIFO array (amortized on the Map backing), bounded at construction,
+ * drop-oldest / consume-specific. B1 is sized to `capacity` (|T1|+|B1| <= c) and B2 to
+ * `2*capacity` (|T2|+|B2| <= 2c). INTERNAL, never exported.
+ * -------------------------------------------------------------------------- */
+
+class CarHistory extends ArcGhost {}
+
+/* -------------------------------------------------------------------------- *
+ * Car -- CAR, Clock with Adaptive Replacement (Bansal & Modha, USENIX FAST'04),
+ * decisions/0028, D28. The THIRTEENTH named export in this file (same single-file ruling
+ * as the rest of the family: single main file + sideEffects:false + named exports = the
+ * tree-shake moat). CAR completes the CLOCK-approximation trio: SIEVE (CLOCK-ish FIFO),
+ * ClockPro (the CLOCK approximation of LIRS), and CAR (the CLOCK reformulation of ARC).
+ * It is ARC's exact semantics -- two lists T1 (recent) / T2 (frequent), keys-only ghosts
+ * B1/B2, one adaptive integer `p`, no knobs -- realized on ClockPro-style reference-bit
+ * clocks instead of ARC's LRU lists, so a HIT sets ONE reference bit and MOVES NOTHING
+ * (the Sieve/S3Fifo/ClockPro 0-link-write headline, D28.5) where ARC relinks to T2 MRU.
+ *
+ * STRUCTURE (all fixed at construction, zero-alloc on the hot path):
+ *   - TWO circular clocks T1 (recent) and T2 (frequent) threaded through the shared
+ *     `_next`/`_prev` columns (D28.1). Each is realized as a NIL-terminated DLL (`_headTx`
+ *     = newest .. `_tailTx` = oldest) whose hand WRAPS (`_advance(_tail) -> _head`) -- the
+ *     TRAVERSAL is circular (a clock has no ends), while the NIL terminus lets the member
+ *     reuse the family's shared iteration (CacheIterator), conservation (validate's CAR
+ *     term) and snapshot (snapList/snapLink) machinery. A slot is in EXACTLY one clock,
+ *     tagged by `_st` bit1 (CAR_T2).
+ *   - `_st` Uint8: bit0 reference, bit1 inT2 (D28.1). A hit is a single `_st[s] |= CAR_REF`
+ *     -- 0 link writes, exactly 1 state store (D28.5, pinned in t6).
+ *   - TWO hands `_hT1`/`_hT2` as Int32 slot pointers (D28.1), NIL only when that clock is
+ *     empty: the eviction/rotation position in each clock. `_replace()` rotates them.
+ *   - `_p` (0..capacity): the ADAPTIVE integer target size for T1 (D28.3). A B1 (recent)
+ *     ghost hit RAISES it, a B2 (frequent) ghost hit LOWERS it. O(1) updates, no knobs.
+ *   - `_b1`/`_b2` (CarHistory): the two bounded keys-only ghosts (D28.2), B1 sized to c,
+ *     B2 to 2c, drop-oldest / consume-on-readmit.
+ *
+ * `_replace()` (D28.4) is the whole cold cost: from the T1 hand (when |T1| >= max(1,p))
+ * or the T2 hand, a REFERENCED page has its reference bit CLEARED and MIGRATES to the T2
+ * clock (a T1 survivor) or rotates within T2 (a T2 survivor); the FIRST UNREFERENCED page
+ * found is the victim, demoted to B1 (from T1) or B2 (from T2). This is amortized O(1) per
+ * miss (classic CLOCK) but WORST-CASE O(capacity) `_st` writes on a full-scan-then-insert
+ * (every resident referenced -> the whole clock's reference bits are cleared before a
+ * victim is found) -- EXACTLY ClockPro's honest characterization (D28.6). There is NO
+ * pinned constant miss+evict bound; the t6 carStream worst-observed scan length is a
+ * per-stream regression TRIPWIRE, not a cap. The ref-bit CLEARS live entirely on this
+ * miss/evict path, NEVER the hit path (the 0-link-write / 1-`_st`-store hit is real).
+ *
+ * Fixed-capacity honesty (D28.4, restating Arc D16.2 / ClockPro D25.4): the RESIDENT
+ * value capacity is EXACTLY `capacity`; only the T1/T2 split adapts, |T1|+|T2| == size.
+ *
+ * Rides the shared newStore factory (default Map / opt-in keys:'int' strict-zero), the
+ * onEvict fire-after + `_inOnEvict` guard (0002), TTL (0017), zero-GC iteration (0018,
+ * order T2 then T1 -- mirrors Arc D16.5), stats (0019), snapshot (0021). A hit is proven
+ * zero-alloc + 0-link-write by the t6 gate.
+ * -------------------------------------------------------------------------- */
+
+export class Car {
+    /**
+     * @param {number} capacity  Max resident entries. Must be an integer >= 1.
+     * @param {{ onEvict?: (key: any, value: any) => void, keys?: 'int' }} [options]
+     */
+    constructor(capacity, options) {
+        if (!Number.isInteger(capacity) || capacity < 1) {
+            throw new RangeError(
+                "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
+            );
+        }
+
+        this._capacity = capacity;
+
+        // TTL (decisions/0017), validated fail-closed -- identical to the rest of the family.
+        this._clock = validateClock(options && options.clock);
+        this._ttl = validateTtl(options && options.ttl);
+
+        // Same shared substrate + int-key door as every other member.
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+
+        // Cache the store's columns so the clock relinks stay direct. `_next` toward the
+        // tail (older), `_prev` toward the head (newer); the hands WRAP `_next[tail] -> head`.
+        this._keys = this._store._keys;
+        this._vals = this._store._vals;
+        this._next = this._store._next;
+        this._prev = this._store._prev;
+        this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+
+        // Per-slot state (bit0 reference, bit1 inT2). Member-specific, fixed, never grown.
+        this._st = new Uint8Array(capacity);
+
+        // The two clocks, each a NIL-terminated DLL (head = newest .. tail = oldest).
+        this._headT1 = NIL; this._tailT1 = NIL; this._t1Size = 0; // T1 (recent) clock
+        this._headT2 = NIL; this._tailT2 = NIL; this._t2Size = 0; // T2 (frequent) clock
+        this._size = 0;                                           // _t1Size + _t2Size
+
+        // The two clock hands (D28.1), Int32 slot pointers; NIL only when that clock is empty.
+        this._hT1 = NIL; // the recent-clock hand
+        this._hT2 = NIL; // the frequent-clock hand
+
+        // The adaptive integer target size for T1 (D28.3), 0..capacity. Starts at 0.
+        this._p = 0;
+
+        // The two bounded keys-only ghosts (D28.2): B1 sized to c (|T1|+|B1| <= c), B2 to 2c
+        // (|T2|+|B2| <= 2c). keys:'int' -> strict zero-alloc; default Map -> amortized.
+        this._ghostInt = (options && options.keys) === 'int';
+        this._b1 = new CarHistory(capacity, this._ghostInt);
+        this._b2 = new CarHistory(2 * capacity, this._ghostInt);
+
+        this._onEvict = (options && options.onEvict) || NOOP;
+        this._inOnEvict = false;
+
+        // Retention hygiene for the onEvict fire-after (mirrors ClockPro).
+        this._evKey = undefined;
+        this._evVal = undefined;
+
+        // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
+        this._stats = validateStats(options && options.stats);
+    }
+
+    /** The store factory, delegating to the shared `newStore` (decisions/0011). */
+    _makeStore(capacity, keys, hasTtl) {
+        return newStore(capacity, keys, hasTtl);
+    }
+
+    get size() { return this._size; }
+    get capacity() { return this._capacity; }
+
+    // --- the two circular clocks (NIL-terminated DLL + wrap-around hand advance) ---
+
+    /** Advance one step around clock T1: toward the tail, wrapping tail -> head. */
+    _advanceT1(s) { const n = this._next[s]; return n !== NIL ? n : this._headT1; }
+    /** Advance one step around clock T2. */
+    _advanceT2(s) { const n = this._next[s]; return n !== NIL ? n : this._headT2; }
+
+    /** The ring successor of `s` in T1 used when `s` is removed: its `_next`, else the head
+     *  (wrap), else NIL when `s` is the sole T1 resident. Computed BEFORE the detach. */
+    _ringSuccT1(s) { const n = this._next[s]; if (n !== NIL) return n; return this._headT1 === s ? NIL : this._headT1; }
+    /** The ring successor of `s` in T2 (as above). */
+    _ringSuccT2(s) { const n = this._next[s]; if (n !== NIL) return n; return this._headT2 === s ? NIL : this._headT2; }
+
+    /** Unlink slot s from T1, fixing neighbours + head/tail sentinels + size. */
+    _detachT1(s) {
+        const p = this._prev[s], n = this._next[s];
+        if (p !== NIL) this._next[p] = n; else this._headT1 = n;
+        if (n !== NIL) this._prev[n] = p; else this._tailT1 = p;
+        this._t1Size--;
+    }
+    /** Unlink slot s from T2. */
+    _detachT2(s) {
+        const p = this._prev[s], n = this._next[s];
+        if (p !== NIL) this._next[p] = n; else this._headT2 = n;
+        if (n !== NIL) this._prev[n] = p; else this._tailT2 = p;
+        this._t2Size--;
+    }
+
+    /** Insert slot s at the head (newest / MRU) of T1. Sets the hand when the clock was empty. */
+    _pushT1(s) {
+        this._prev[s] = NIL; this._next[s] = this._headT1;
+        if (this._headT1 !== NIL) this._prev[this._headT1] = s;
+        this._headT1 = s;
+        if (this._tailT1 === NIL) { this._tailT1 = s; this._hT1 = s; }
+        this._t1Size++;
+    }
+    /** Insert slot s at the head (newest / MRU) of T2. Sets the hand when the clock was empty. */
+    _pushT2(s) {
+        this._prev[s] = NIL; this._next[s] = this._headT2;
+        if (this._headT2 !== NIL) this._prev[this._headT2] = s;
+        this._headT2 = s;
+        if (this._tailT2 === NIL) { this._tailT2 = s; this._hT2 = s; }
+        this._t2Size++;
+    }
+
+    /** Remove a resident slot from WHICHEVER clock it is in (per `_st` bit1), repairing the
+     *  hand parked on it. Does NOT touch `_st` / the index / the free stack / `_size` (the
+     *  caller finishes those). Used by _reap and delete (NOT _replace, which drives its own
+     *  hand rotation). */
+    _removeResident(s) {
+        if (this._st[s] & CAR_T2) {
+            const succ = this._ringSuccT2(s);
+            if (this._hT2 === s) this._hT2 = succ;
+            this._detachT2(s);
+        } else {
+            const succ = this._ringSuccT1(s);
+            if (this._hT1 === s) this._hT1 = succ;
+            this._detachT1(s);
+        }
+    }
+
+    /**
+     * REPLACE (decisions/0028, D28.4): evict exactly ONE resident to a ghost and return its
+     * (reused-in-place) slot, leaving `_keys[slot]`/`_vals[slot]` intact for the onEvict
+     * fire-after. From the T1 hand (when |T1| >= max(1,p)) or the T2 hand: a REFERENCED page
+     * has its ref bit CLEARED and MIGRATES to T2 (a T1 survivor) or rotates within T2 (a T2
+     * survivor); the first UNREFERENCED page is the victim -> B1 (from T1) or B2 (from T2).
+     * Amortized O(1); worst-case O(capacity) ref-bit clears (D28.6). Only called at capacity.
+     */
+    _replace() {
+        const pTarget = this._p > 1 ? this._p : 1; // max(1, p)
+        for (;;) {
+            // Branch to a clock, defensively total: prefer T1 when |T1| >= max(1,p), but a
+            // referenced-only sweep can drain a clock -- always fall back to the non-empty one.
+            let takeT1 = this._t1Size >= pTarget;
+            if (this._t1Size === 0) takeT1 = false;
+            else if (this._t2Size === 0) takeT1 = true;
+            if (takeT1) {
+                const h = this._hT1;
+                if ((this._st[h] & CAR_REF) === 0) {
+                    // unreferenced T1 head -> the victim, demoted to B1.
+                    const key = this._keys[h];
+                    this._hT1 = this._ringSuccT1(h);
+                    this._detachT1(h);
+                    this._store.delete(key);
+                    this._b1.addMRU(key);
+                    this._st[h] = 0;
+                    return h;
+                }
+                // referenced T1 head -> clear ref, migrate to T2 MRU, advance the hand.
+                const succ = this._ringSuccT1(h);
+                this._detachT1(h);
+                this._hT1 = succ;
+                this._st[h] = CAR_T2; // ref cleared, now in the frequent clock
+                this._pushT2(h);
+                continue;
+            }
+            const h = this._hT2;
+            if ((this._st[h] & CAR_REF) === 0) {
+                // unreferenced T2 head -> the victim, demoted to B2.
+                const key = this._keys[h];
+                this._hT2 = this._ringSuccT2(h);
+                this._detachT2(h);
+                this._store.delete(key);
+                this._b2.addMRU(key);
+                this._st[h] = 0;
+                return h;
+            }
+            // referenced T2 head -> clear ref, rotate within T2 (advance the hand).
+            this._st[h] &= ~CAR_REF;
+            this._hT2 = this._advanceT2(h);
+        }
+    }
+
+    // --- public API (all zero-alloc on the hot path) --------------------------
+
+    /** Look up a key AND set its reference bit (CAR's second-chance flag). The whole hot
+     *  path is a single `_st` store -- 0 link writes (D28.5). @returns the value, or
+     *  undefined if absent (see D7). A get never consults the ghosts. */
+    get(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const s = this._store.get(key);
+        if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
+            this._reap(s);
+            return undefined;
+        }
+        this._st[s] |= CAR_REF; // the whole hot path: one state store, no relink
+        if (this._stats !== null) this._stats.hits++; // live hit (0019)
+        return this._vals[s];
+    }
+
+    /**
+     * Insert or update. An update rewrites the value and sets the reference bit (like a hit,
+     * D28.5). A true miss enters T1 (recent, ref 0). A miss whose key is in B1 raises `p` and
+     * re-admits into T2; in B2 lowers `p` and re-admits into T2 (D28.3). At capacity one
+     * resident is evicted first via REPLACE (its slot reused in place) and the ghost directory
+     * is trimmed (D28.4). onEvict fires LAST (0002). The positional `ttlMs` (0017) overrides
+     * the ttl default.
+     */
+    put(key, value, ttlMs) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        let expiresAt;
+        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
+        this._store._ver++; // D18.6 -- put mutates; invalidate iterators
+        const store = this._store;
+        const existing = store.get(key);
+        if (existing >= 0) {                  // update-in-place + set the reference bit
+            this._vals[existing] = value;
+            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            this._st[existing] |= CAR_REF;
+            if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
+            return;
+        }
+
+        const c = this._capacity;
+        const inB1 = this._b1.has(key);
+        const inB2 = inB1 ? false : this._b2.has(key);
+        const inGhost = inB1 || inB2;
+        let s, evKey, evVal;
+        let evicted = false;
+
+        if (this._size === c) {
+            s = this._replace();                 // evict one resident -> reuse its slot
+            evKey = this._keys[s]; evVal = this._vals[s];
+            evicted = true;
+            // directory replacement (D28.4): trim a ghost when a new (non-ghost) directory
+            // entry is about to be added and the bounds are tight.
+            if (!inGhost) {
+                if (this._t1Size + this._b1._len === c && this._b1._len > 0) this._b1.delLRU();
+                else if (this._t1Size + this._t2Size + this._b1._len + this._b2._len === 2 * c && this._b2._len > 0) this._b2.delLRU();
+            }
+        } else {
+            // below capacity (delete-induced): preserve the SAME directory bounds before a new
+            // (non-ghost) T1 entry grows the directory.
+            if (!inGhost) {
+                if (this._t1Size + this._b1._len === c && this._b1._len > 0) this._b1.delLRU();
+                else if (this._t1Size + this._t2Size + this._b1._len + this._b2._len === 2 * c && this._b2._len > 0) this._b2.delLRU();
+            }
+            s = store.allocSlot();
+        }
+
+        this._keys[s] = key; this._vals[s] = value;
+        if (this._exp !== null) this._exp[s] = expiresAt;
+        store.set(key, s);
+
+        if (inB1) {
+            const b1 = this._b1._len, b2 = this._b2._len; // b1 >= 1 (key still in B1)
+            let d = Math.floor(b2 / b1); if (d < 1) d = 1;
+            this._p += d; if (this._p > c) this._p = c;   // recency ghost hit -> raise p (D28.3)
+            this._b1.consume(key);
+            this._st[s] = CAR_T2; this._pushT2(s);        // re-admit into T2, ref 0
+        } else if (inB2) {
+            const b1 = this._b1._len, b2 = this._b2._len; // b2 >= 1 (key still in B2)
+            let d = Math.floor(b1 / b2); if (d < 1) d = 1;
+            this._p -= d; if (this._p < 0) this._p = 0;    // frequency ghost hit -> lower p (D28.3)
+            this._b2.consume(key);
+            this._st[s] = CAR_T2; this._pushT2(s);        // re-admit into T2, ref 0
+        } else {
+            this._st[s] = 0; this._pushT1(s);             // true miss -> T1 (recent), ref 0
+        }
+
+        this._size = this._t1Size + this._t2Size;
+        if (this._stats !== null) this._stats.puts++; // successful insert (outcome-based); 0019
+
+        if (evicted) {
+            if (this._stats !== null) this._stats.evictions++; // capacity eviction (0019)
+            this._inOnEvict = true;
+            try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+        }
+    }
+
+    /** True if key is present (RESIDENT). Ghost keys are NOT present. Reference-NEUTRAL. A
+     *  stale entry is a MISS and is reaped in place (decisions/0017, D17.3). */
+    has(key) {
+        const s = this._store.get(key);
+        if (s < 0) return false;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return false;
+        }
+        return true;
+    }
+
+    /** Read a value WITHOUT setting the reference bit. undefined if absent (see D7). A stale
+     *  entry is a MISS and is reaped in place (decisions/0017, D17.3). */
+    peek(key) {
+        const s = this._store.get(key);
+        if (s < 0) return undefined;
+        if (this._exp !== null && this._exp[s] <= this._clock()) {
+            if (!this._inOnEvict) this._reap(s);
+            return undefined;
+        }
+        return this._vals[s];
+    }
+
+    /** Reap an expired slot in place (decisions/0017): repair the hand, unlink from its clock,
+     *  drop from the index, free the slot, and fire onEvict LAST via the 0002 guard. A reap is
+     *  NOT a capacity victim, so it is never recorded in a ghost and never moves `p` (like
+     *  delete). */
+    _reap(s) {
+        this._store._ver++; // D18.6 -- a reap is a structural mutation; invalidate iterators
+        const evKey = this._keys[s];
+        const evVal = this._vals[s];
+        this._removeResident(s);
+        this._store.delete(evKey);
+        this._st[s] = 0;
+        this._store.freeSlot(s);
+        this._size = this._t1Size + this._t2Size;
+        if (this._stats !== null) this._stats.evictions++; // reap = eviction (0019, D19.2)
+        this._inOnEvict = true;
+        try { this._onEvict(evKey, evVal); } finally { this._inOnEvict = false; }
+    }
+
+    /** Evict every expired resident entry now (decisions/0017, D17.5). COLD, O(size). */
+    purgeStale() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG);
+        if (this._exp === null) return 0;
+        const now = this._clock();
+        const exp = this._exp;
+        const victims = [];
+        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
+        return victims.length;
+    }
+
+    /** Remove a key. Returns true if it was present. Frees the slot; NOT recorded in a ghost
+     *  and never moves `p`. */
+    delete(key) {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        const store = this._store;
+        const s = store.get(key);
+        if (s < 0) return false;
+        store._ver++; // D18.6 -- a real delete is a structural mutation; invalidate iterators
+        this._removeResident(s);
+        store.delete(key);
+        this._st[s] = 0;
+        store.freeSlot(s);
+        this._size = this._t1Size + this._t2Size;
+        return true;
+    }
+
+    /** Empty the cache. Rebuilds the free list, empties both clocks + both ghosts, resets the
+     *  hands, the counts and `p`. Allocates nothing. O(capacity). */
+    clear() {
+        if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
+        this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
+        this._store.reset();
+        this._headT1 = NIL; this._tailT1 = NIL; this._t1Size = 0;
+        this._headT2 = NIL; this._tailT2 = NIL; this._t2Size = 0;
+        this._hT1 = NIL; this._hT2 = NIL;
+        this._size = 0;
+        this._p = 0;
+        this._st.fill(0);
+        this._b1.clear();
+        this._b2.clear();
+    }
+
+    // --- opt-in runtime stats (decisions/0019, D19): cold accessors -----------
+
+    /** The live stats holder (decisions/0019, D19.3), returned BY REFERENCE (borrowed).
+     *  Fail closed on an instance built without { stats: true }. */
+    stats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        return this._stats;
+    }
+
+    /** Zero the four counters IN PLACE (decisions/0019). Fail closed on a non-stats instance. */
+    resetStats() {
+        if (this._stats === null) throw new Error(STATS_OFF_MSG);
+        const st = this._stats;
+        st.hits = 0; st.misses = 0; st.evictions = 0; st.puts = 0;
+    }
+
+    // --- iteration (decisions/0018, D18): zero-GC keys/values/entries ----------
+
+    /** The per-member iteration ROSTER (decisions/0018 / 0028): T2 (frequent, MRU->LRU) THEN
+     *  T1 (recent, MRU->LRU) -- mirrors Arc's D16.5. Two clocks concatenated, RESIDENT only;
+     *  the keys-only B1/B2 ghosts are EXCLUDED. NOT global recency order. */
+    _iterHeads() { return [this._headT2, this._headT1]; }
+
+    keys() { return iterKeys(this); }
+    values() { return iterValues(this); }
+    entries() { return iterEntries(this); }
+    [Symbol.iterator]() { return iterEntries(this); }
+
+    // --- snapshot / restore (decisions/0021, D21 + 0028): COLD, may allocate --
+
+    /** Serialize to a plain snapshot (decisions/0021, D21 + D28.6): the T2 + T1 clocks (each
+     *  newest..oldest, values/expiry) + each page's per-slot `_st` byte, the TWO hand
+     *  positions, the adaptive `p`, AND BOTH keys-only ghosts B1/B2 (each oldest..newest).
+     *  Dropping the hands, `p`, the reference bits or a ghost is a fail-OPEN future-eviction
+     *  bug, so ALL are captured (the t9 controls prove the round-trip catches it). */
+    dump() {
+        const snap = snapBase(this, "Car");
+        snap.t2 = snapList(this, this._headT2, false);
+        snap.t1 = snapList(this, this._headT1, false);
+        const st2 = []; for (let i = 0; i < snap.t2.slots.length; i++) st2.push(this._st[snap.t2.slots[i]]);
+        const st1 = []; for (let i = 0; i < snap.t1.slots.length; i++) st1.push(this._st[snap.t1.slots[i]]);
+        snap.st2 = st2;
+        snap.st1 = st1;
+        snap.hT1 = this._hT1;
+        snap.hT2 = this._hT2;
+        snap.p = this._p;
+        snap.b1 = snapArcGhost(this._b1);
+        snap.b2 = snapArcGhost(this._b2);
+        return snap;
+    }
+
+    /** Reconstruct a FRESH Car from a snapshot (decisions/0021, D21 + D28.6). Fail closed on
+     *  any tag/shape mismatch, a malformed/short `st1`/`st2` column, a `_st` byte that is not a
+     *  valid 2-bit tag (0..3) or whose inT2 bit disagrees with the list it was captured in, a
+     *  `p` out of [0,cap], a hand that does not reference a resident slot of its clock (or is
+     *  set on an empty clock), or a ghost that would break a conservation bound. */
+    static restore(snap, opts) {
+        const cap = snapRead(snap, "Car", opts);
+        const inst = new Car(cap, snapOpts(snap, opts));
+        const occ = snapCheckOccupy(cap, snap.ttl, [[snap.t2, "t2"], [snap.t1, "t1"]]);
+        // Shape the CAR-specific aux (fail closed -- "null is not zero").
+        if (!Array.isArray(snap.st2) || snap.st2.length !== snap.t2.slots.length) {
+            throw new Error(SNAP_BAD + "car st2 must be an array aligned to the T2 list");
+        }
+        if (!Array.isArray(snap.st1) || snap.st1.length !== snap.t1.slots.length) {
+            throw new Error(SNAP_BAD + "car st1 must be an array aligned to the T1 list");
+        }
+        for (let i = 0; i < snap.st2.length; i++) {
+            const b = snap.st2[i];
+            if (!Number.isInteger(b) || b < 0 || b > 3) {
+                throw new Error(SNAP_BAD + "car st2[" + i + "] = " + String(b) + " (must be an integer 0..3)");
+            }
+            if ((b & CAR_T2) === 0) throw new Error(SNAP_BAD + "car st2[" + i + "] is missing the inT2 bit");
+        }
+        for (let i = 0; i < snap.st1.length; i++) {
+            const b = snap.st1[i];
+            if (!Number.isInteger(b) || b < 0 || b > 3) {
+                throw new Error(SNAP_BAD + "car st1[" + i + "] = " + String(b) + " (must be an integer 0..3)");
+            }
+            if (b & CAR_T2) throw new Error(SNAP_BAD + "car st1[" + i + "] carries the inT2 bit");
+        }
+        if (!Number.isInteger(snap.p) || snap.p < 0 || snap.p > cap) {
+            throw new Error(SNAP_BAD + "car p out of [0," + cap + "]: " + String(snap.p));
+        }
+        if (!Array.isArray(snap.b1) || !Array.isArray(snap.b2)) {
+            throw new Error(SNAP_BAD + "car snapshot missing a ghost array (b1/b2)");
+        }
+        if (snap.t1.slots.length + snap.b1.length > cap) {
+            throw new Error(SNAP_BAD + "car |T1|+|B1| (" + (snap.t1.slots.length + snap.b1.length) + ") exceeds capacity (" + cap + ")");
+        }
+        if (snap.t1.slots.length + snap.t2.slots.length + snap.b1.length + snap.b2.length > 2 * cap) {
+            throw new Error(SNAP_BAD + "car directory total exceeds 2*capacity (" + (2 * cap) + ")");
+        }
+
+        const T2 = snapRestoreList(inst, snap.t2, null, 0);
+        inst._headT2 = T2.head; inst._tailT2 = T2.tail; inst._t2Size = T2.size;
+        for (let i = 0; i < snap.t2.slots.length; i++) inst._st[snap.t2.slots[i]] = snap.st2[i];
+        const T1 = snapRestoreList(inst, snap.t1, null, 0);
+        inst._headT1 = T1.head; inst._tailT1 = T1.tail; inst._t1Size = T1.size;
+        for (let i = 0; i < snap.t1.slots.length; i++) inst._st[snap.t1.slots[i]] = snap.st1[i];
+        inst._size = inst._t1Size + inst._t2Size;
+        inst._p = snap.p;
+
+        // The two hands: NIL iff that clock is empty, else a resident slot of that clock.
+        if (inst._t1Size === 0) {
+            if (snap.hT1 !== NIL) throw new Error(SNAP_BAD + "car hT1 set on an empty T1 clock");
+        } else if (!Number.isInteger(snap.hT1) || snap.hT1 < 0 || snap.hT1 >= cap || occ[snap.hT1] === 0 || (inst._st[snap.hT1] & CAR_T2)) {
+            throw new Error(SNAP_BAD + "car hT1 " + String(snap.hT1) + " does not reference a resident T1 slot");
+        }
+        if (inst._t2Size === 0) {
+            if (snap.hT2 !== NIL) throw new Error(SNAP_BAD + "car hT2 set on an empty T2 clock");
+        } else if (!Number.isInteger(snap.hT2) || snap.hT2 < 0 || snap.hT2 >= cap || occ[snap.hT2] === 0 || (inst._st[snap.hT2] & CAR_T2) === 0) {
+            throw new Error(SNAP_BAD + "car hT2 " + String(snap.hT2) + " does not reference a resident T2 slot");
+        }
+        inst._hT1 = snap.hT1;
+        inst._hT2 = snap.hT2;
+
+        const gInt = typeof inst._store._ck === "function";
+        for (let i = 0; i < snap.b1.length; i++) {
+            if (gInt) inst._store._ck(snap.b1[i]); // fail closed on a non-int ghost key
+            inst._b1.addMRU(snap.b1[i]);
+        }
+        for (let i = 0; i < snap.b2.length; i++) {
+            if (gInt) inst._store._ck(snap.b2[i]);
+            inst._b2.addMRU(snap.b2[i]);
+        }
+        inst._store.rebuildFreeList(occ);
+        return inst;
+    }
+
+    // --- test/debug only (never call on a hot path) ---------------------------
+
+    /** Free-stack length, delegated to the store (conservation invariant). */
+    _freeListLength() {
+        return this._store.freeListLength();
+    }
+
+    /**
+     * The key the NEXT over-capacity insert would evict, computed WITHOUT mutating any link,
+     * bit, hand, count or `p` (the non-destructive twin of `_replace`). It builds local slot
+     * arrays for the two clocks (T2/T1 head..tail), clones the reference bits, records the
+     * hand indices, then replays the EXACT `_replace` sweep (referenced T1 pages migrate to
+     * T2, referenced T2 pages rotate, the first unreferenced page found is the victim).
+     * TEST-ONLY (drives the torture differential); it MAY allocate precisely because it is
+     * never a hot or measured path.
+     */
+    _peekVictim() {
+        if (this._size === 0) return undefined;
+        // Build arrays: index 0 = head (MRU) .. last = tail (LRU); ref bit per element.
+        const l1 = [], r1 = [], l2 = [], r2 = [];
+        let h1 = -1, h2 = -1;
+        for (let s = this._headT1; s !== NIL; s = this._next[s]) { if (s === this._hT1) h1 = l1.length; l1.push(s); r1.push(this._st[s] & CAR_REF); }
+        for (let s = this._headT2; s !== NIL; s = this._next[s]) { if (s === this._hT2) h2 = l2.length; l2.push(s); r2.push(this._st[s] & CAR_REF); }
+        const keys = this._keys;
+        const pTarget = this._p > 1 ? this._p : 1;
+        // succ index after removing element `h` from an array of length `len` when the hand was AT h.
+        const succAfter = (len, h) => (len === 1 ? -1 : (h === len - 1 ? 0 : h));
+        for (;;) {
+            let takeT1 = l1.length >= pTarget;
+            if (l1.length === 0) takeT1 = false;
+            else if (l2.length === 0) takeT1 = true;
+            if (takeT1) {
+                if (r1[h1] === 0) return keys[l1[h1]];
+                // migrate l1[h1] to l2 MRU (front); advance the hand.
+                const succ = succAfter(l1.length, h1);
+                const slot = l1.splice(h1, 1)[0];
+                r1.splice(h1, 1);
+                h1 = succ;
+                l2.unshift(slot); r2.unshift(0);
+                if (h2 >= 0) h2++;
+                if (l2.length === 1) h2 = 0;
+                continue;
+            }
+            if (r2[h2] === 0) return keys[l2[h2]];
+            r2[h2] = 0;
+            h2 = (h2 + 1) % l2.length;
+        }
     }
 }
 

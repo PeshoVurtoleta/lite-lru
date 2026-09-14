@@ -28,7 +28,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car } from '../../Lru.js';
 import {
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
     CountedSieve, SIEVE_WRITES_HIT_LINKS, SIEVE_WRITES_HIT_VIS,
@@ -39,12 +39,13 @@ import {
     CLOCKPRO_WRITES_HIT_LINKS, CLOCKPRO_WRITES_HIT_ST,
     CountedLruK, LRUK_WRITES_HIT_WARM, LRUK_WRITES_HIT_PROMOTE, LRUK_WRITES_HIT_STAMPS,
     CountedMq, MQ_WRITES_HIT_FASTPATH, MQ_WRITES_HIT_RELINK, MQ_WRITES_MAX, MQ_STAMPS_ACCESS,
+    CountedCar, CAR_WRITES_HIT_LINKS, CAR_WRITES_HIT_ST,
 } from '../torture/harness.mjs';
 
 const CAP = 4096;       // power of 2 so the hot body masks its key with & MASK
 const MASK = CAP - 1;
 
-/** The 12 shipped members, in canonical order. */
+/** The 13 shipped members, in canonical order. */
 const MEMBERS = [
     { name: 'LiteLru', Ctor: LiteLru },
     { name: 'Sieve', Ctor: Sieve },
@@ -58,6 +59,7 @@ const MEMBERS = [
     { name: 'ClockPro', Ctor: ClockPro },
     { name: 'LruK', Ctor: LruK },
     { name: 'Mq', Ctor: Mq },
+    { name: 'Car', Ctor: Car },
 ];
 
 /**
@@ -109,7 +111,7 @@ function putChurnScenario(m) {
     };
 }
 
-/** 24 scenarios: get-hit + put-churn for each of the 12 members. */
+/** 26 scenarios: get-hit + put-churn for each of the 13 members. */
 const scenarios = [];
 for (let i = 0; i < MEMBERS.length; i++) {
     scenarios.push(getHitScenario(MEMBERS[i]));
@@ -181,6 +183,8 @@ test('perf-gate writes-pin cross-check: harness constants match the shipped hot 
     assert.equal(MQ_WRITES_HIT_RELINK, 5);
     assert.equal(MQ_WRITES_MAX, 33);
     assert.equal(MQ_STAMPS_ACCESS, 3);
+    assert.equal(CAR_WRITES_HIT_LINKS, 0);
+    assert.equal(CAR_WRITES_HIT_ST, 1);
 
     const N = 8;
 
@@ -242,4 +246,14 @@ test('perf-gate writes-pin cross-check: harness constants match the shipped hot 
     cmq.resetWrites(); cmq.get('A');             // rc4->5 still Q2 head: 0 links, 3 stamps
     assert.equal(cmq.writes(), MQ_WRITES_HIT_FASTPATH, 'Mq already-MRU hit links');
     assert.equal(cmq.stamps(), MQ_STAMPS_ACCESS, 'Mq already-MRU hit stamps');
+
+    // Car: a hit relinks NOTHING (0 _next/_prev stores) and sets exactly one _st byte (the
+    // reference bit) -- the CLOCK-of-ARC headline (D28.5). The ref-bit CLEARS live on the miss/
+    // evict path (REPLACE), never the hit budget.
+    const ccar = new CountedCar(N);
+    for (let i = 0; i < N; i++) ccar.put(i, i);
+    ccar.get(5);
+    ccar.resetWrites(); ccar.get(5);
+    assert.equal(ccar.writes(), CAR_WRITES_HIT_LINKS, 'Car hit links');
+    assert.equal(ccar.stWrites(), CAR_WRITES_HIT_ST, 'Car hit _st stores');
 });

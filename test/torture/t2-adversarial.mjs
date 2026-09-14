@@ -9,8 +9,8 @@
  *   E single-capacity cache: every put evicts; head===tail always.
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../../Lru.js';
-import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK, wrapMq } from './harness.mjs';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car } from '../../Lru.js';
+import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK, wrapMq, wrapCar } from './harness.mjs';
 
 export function run() {
     // --- A: re-hit the MRU N times (the head-re-hit fast path) -------------------
@@ -681,12 +681,98 @@ export function run() {
         }
     }
 
+    // --- T: Car degenerate caps + reference-bit second chance + scan resistance + the
+    // PHASE-CHANGE p law + the two ghost bounds + conservation (decisions/0028) -----
+    {
+        const CAR_T2 = 2;
+        // Degenerate caps 1..4: every put churns, conservation holds, both ghost bounds respected,
+        // and hot/cold clock state stays coherent.
+        for (const cap of [1, 2, 3, 4]) {
+            const c = new Car(cap);
+            for (let i = 0; i < 500; i++) {
+                c.put(i, i);
+                check(c.size === Math.min(cap, i + 1), () => 't2 T: car cap-' + cap + ' size drift at ' + i);
+                check(c.get(i) === i, () => 't2 T: car cap-' + cap + ' just-inserted key missing');
+                check(c._t1Size + c._b1._len <= cap, () => 't2 T: car cap-' + cap + ' |T1|+|B1| exceeded bound');
+                check(c._t1Size + c._t2Size + c._b1._len + c._b2._len <= 2 * cap, () => 't2 T: car cap-' + cap + ' directory total exceeded 2c');
+                validate(c);
+            }
+            c.clear();
+            check(c.size === 0, () => 't2 T: car cap-' + cap + ' not empty after clear');
+            check(c._b1._len === 0 && c._b2._len === 0, () => 't2 T: car cap-' + cap + ' ghosts not empty after clear');
+            check(c._p === 0, () => 't2 T: car cap-' + cap + ' p not reset after clear');
+            check(c._hT1 === -1 && c._hT2 === -1, () => 't2 T: car cap-' + cap + ' hands not reset after clear');
+            validate(c);
+        }
+
+        // A referenced hot SET survives an unbounded distinct one-hit flood -- a cap-sized scan
+        // evicts 0 of the referenced working set.
+        const N = 64; const HOT = 8;
+        const c = new Car(N);
+        for (let h = 0; h < HOT; h++) { const k = 'hot' + h; c.put(k, h); }
+        while (c.size < N) c.put('warm' + c.size, c.size);
+        check(c.size === N, () => 't2 T: car not full before the scan');
+        for (let i = 0; i < 8000; i++) {
+            for (let h = 0; h < HOT; h++) check(c.get('hot' + h) === h, () => 't2 T: hot key ' + h + ' lost mid-scan at ' + i);
+            c.put('scan' + i, i);
+            check(c.size === N, () => 't2 T: car drifted from capacity during the scan');
+            check(c._t1Size + c._b1._len <= N, () => 't2 T: car |T1|+|B1| exceeded bound in scan');
+            check(c._t1Size + c._t2Size + c._b1._len + c._b2._len <= 2 * N, () => 't2 T: car directory total exceeded 2c in scan');
+            if ((i & 511) === 0) validate(c);
+        }
+        for (let h = 0; h < HOT; h++) check(c.has('hot' + h), () => 't2 T: hot key ' + h + ' evicted by the scan (no scan resistance)');
+        let survivors = 0;
+        for (let i = 0; i < 8000; i++) if (c.has('scan' + i)) survivors++;
+        check(survivors < N, () => 't2 T: too many scan keys survived (' + survivors + ') -- eviction not exercised');
+        validate(c);
+
+        // PHASE-CHANGE law (decisions/0028, D28.3, mirrors Arc's t2 M): a RECENCY phase (re-
+        // references of keys just evicted from T1 -> B1 hits) drives p UP; a following FREQUENCY
+        // phase (re-references of keys evicted from T2 -> B2 hits) drives p DOWN. The DIRECTION is
+        // the point -- exactly what the t9 car-no-adapt control must break.
+        {
+            const CAP = 32;
+            // Recency phase: seed referenced T1 (so REPLACE migrates them to T2, freeing room for
+            // B1), then capture the T1 LRU sent to B1 and re-reference it -> a B1 hit each round.
+            let lastEvicted = null;
+            const a = new Car(CAP, { onEvict: (k) => { lastEvicted = k; } });
+            for (let i = 0; i < 8; i++) { a.put('f' + i, i); a.get('f' + i); } // referenced T1 seed
+            let b1Hits = 0, next = 0;
+            for (let round = 0; round < 800; round++) {
+                lastEvicted = null;
+                a.put('n' + next, next); next++;                 // true miss -> a resident -> ghost
+                if (lastEvicted !== null && a._b1.has(lastEvicted)) { a.put(lastEvicted, 0); b1Hits++; } // B1 hit -> p++
+            }
+            check(b1Hits > 0, () => 't2 T: recency phase produced 0 B1 hits (setup invalid)');
+            check(a._p > 0, () => 't2 T: recency phase did not raise p above 0 (got ' + a._p + ')');
+            validate(a);
+
+            // Frequency phase: from a recency-biased peak (p == CAP), drive B2 hits -> p FALLS.
+            const b = new Car(CAP);
+            for (let i = 0; i < CAP; i++) { b.put(i, i); b.get(i); } // referenced T1
+            b._p = CAP; // peak, so a B2 hit's DECREASE is observable (floored at 0 otherwise)
+            const pStart = b._p;
+            let b2Hits = 0;
+            for (let round = 0; round < 8; round++) {
+                const base = 1000 + round * CAP;
+                for (let i = 0; i < CAP; i++) b.put(base + i, i);            // flush -> referenced migrate to T2, evict to B2
+                for (let i = 0; i < CAP; i++) if (b._b2.has(i)) { b.put(i, i); b2Hits++; } // B2 hits (lower p)
+            }
+            check(b2Hits > 0, () => 't2 T: frequency phase produced 0 B2 hits (setup invalid)');
+            check(b._p < pStart, () => 't2 T: frequency phase did not lower p from ' + pStart + ' (got ' + b._p + ')');
+            // Re-admits route to T2 (the frequent clock).
+            for (let i = 0; i < CAP; i++) { const s = b._store.get(i); if (s >= 0) check((b._st[s] & CAR_T2) !== 0, () => 't2 T: a ghost re-admit did not route to T2'); }
+            validate(b);
+        }
+        void wrapCar(c);
+    }
+
     // --- J: the LAZY-SEMANTICS TRIPLE as executable laws (decisions/0017, D17.3) --
     // For EVERY member: an expired entry is a MISS through get/has/peek alike, and each
     // of the three REAPS it in place (fires onEvict once, size drops). A fresh Infinity
     // sibling is untouched by any of them. validate() nets each reap.
     {
-        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu], ['ClockPro', ClockPro], ['LruK', LruK], ['Mq', Mq]];
+        const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo], ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu], ['ClockPro', ClockPro], ['LruK', LruK], ['Mq', Mq], ['Car', Car]];
         // one probe method per fresh cache (each reap is destructive, so isolate them)
         const probes = [
             ['get', (c, k) => c.get(k), undefined],
@@ -726,7 +812,7 @@ export function run() {
     {
         const members = [['LiteLru', LiteLru], ['Sieve', Sieve], ['S3Fifo', S3Fifo],
             ['WTinyLfu', WTinyLfu], ['Slru', Slru], ['TwoQ', TwoQ], ['Arc', Arc], ['Lirs', Lirs], ['Lfu', Lfu],
-            ['ClockPro', ClockPro], ['LruK', LruK], ['Mq', Mq]];
+            ['ClockPro', ClockPro], ['LruK', LruK], ['Mq', Mq], ['Car', Car]];
         for (const [name, C] of members) {
             for (const keys of [undefined, 'int']) {
                 const o = keys ? { keys } : undefined;

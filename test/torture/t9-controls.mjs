@@ -21,12 +21,13 @@
  *   C-stats-counts-peek   a peek that credits a hit    -> brute-tally parity fails
  */
 
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, wrapWTinyLfu,
-    wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK, wrapMq, validate, runRoundTrip,
+    wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK, wrapMq, wrapCar, validate, runRoundTrip,
     lruPolicy, check, die, makePrng,
 } from './harness.mjs';
+import { makeCarOracle } from './oracles/car.mjs';
 import { makeMqOracle } from './oracles/mq.mjs';
 import { makeLfuOracle } from './oracles/lfu.mjs';
 import { makeLruOracle } from './oracles/lru.mjs';
@@ -307,6 +308,20 @@ class LruTiebreakLruK extends LruK {
  *  (t5). */
 class NoAgingMq extends Mq {
     _ageSweep() { /* BUG: never demote an idle band tail */ }
+}
+
+/** C-car-no-adapt (decisions/0028): a Car whose adaptive `p` is PINNED at 0 (it never moves on a
+ *  B1/B2 ghost hit). CAR's headline is the SELF-TUNING split: a B1 (recent) ghost hit RAISES p, a
+ *  B2 (frequent) ghost hit LOWERS it. Freezing p means REPLACE always sees max(1,p)==1 at op
+ *  boundaries, so its clock-branch choice (T1 vs T2) is pinned -- the next-eviction victim MUST
+ *  drift from the pure (adaptive) Car oracle. Self-consistent (its own _peekVictim reads the frozen
+ *  p), yet WRONG versus the oracle. Non-vacuity: the CORRECT Car agrees (t5). */
+class NoAdaptCar extends Car {
+    put(key, value, ttlMs) {
+        this._p = 0;
+        super.put(key, value, ttlMs);
+        this._p = 0; // BUG: never let the ghost-hit adaptation persist
+    }
 }
 
 /** C-skip-gate (decisions/0017): a get that SKIPS the ttl staleness gate entirely, so a
@@ -725,6 +740,33 @@ export function run() {
         if (r.ok) die('t9 C-mq-no-aging: freezing the aging sweep did NOT diverge from the mq oracle (no teeth)');
     }
 
+    // --- C-car-no-adapt (decisions/0028): a pinned `p` -> diverges from the car oracle ----------
+    // CAR's headline is the SELF-TUNING split (the CLOCK reformulation of ARC): a B1 hit raises p,
+    // a B2 hit lowers it. Freezing p pins REPLACE's clock-branch choice, so it drifts from the
+    // adaptive oracle. Non-vacuity: the CORRECT Car agrees (t5).
+    {
+        const brokenPolicy = {
+            name: 'car-no-adapt',
+            real: (cap) => wrapCar(new NoAdaptCar(cap)),
+            oracle: (cap) => makeCarOracle(cap),
+        };
+        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x4d0a, keyspace: 40 });
+        if (r.ok) die('t9 C-car-no-adapt: a pinned `p` did NOT diverge from the car oracle (no teeth)');
+        // Teeth on the phase-change law directly: across a RECENCY phase (B1 hits) an adaptive Car
+        // raises p, but a no-adapt Car does not. Seed referenced T1 (so REPLACE migrates to T2,
+        // freeing room for B1), then capture the T1 LRU sent to B1 and re-reference it each round.
+        let evA = null, evF = null;
+        const adaptive = new Car(16, { onEvict: (k) => { evA = k; } });
+        const frozen = new NoAdaptCar(16, { onEvict: (k) => { evF = k; } });
+        for (let i = 0; i < 8; i++) { adaptive.put('f' + i, i); adaptive.get('f' + i); frozen.put('f' + i, i); frozen.get('f' + i); }
+        for (let k = 0; k < 400; k++) {
+            evA = null; adaptive.put('n' + k, k); if (evA !== null && adaptive._b1.has(evA)) adaptive.put(evA, 0);
+            evF = null; frozen.put('n' + k, k); if (evF !== null && frozen._b1.has(evF)) frozen.put(evF, 0);
+        }
+        check(frozen._p === 0, () => 't9 C-car-no-adapt: the frozen p moved (control invalid)');
+        check(adaptive._p > 0, () => 't9 C-car-no-adapt: the adaptive p did NOT rise in a recency phase (the phase-change law is toothless)');
+    }
+
     // --- C-skip-gate (decisions/0017): a get that skips the ttl gate -> diverges ---
     // The lazy TTL rule (D17.3): a stale hit is a MISS, reaped in place. A get that never
     // checks staleness returns the expired value and keeps it resident, so it MUST
@@ -986,6 +1028,22 @@ export function run() {
                 return inst;
             }
         }
+        // car-p-dropped: restore forgets the adaptive integer `p` (pins it to 0). REPLACE's
+        // clock-branch choice then drifts from the twin (whose p was preserved).
+        class PDroppedCar extends Car {
+            static restore(snap, opts) { const inst = Car.restore(snap, opts); inst._p = 0; return inst; }
+        }
+        // car-ref-bits-dropped: restore CLEARS every per-page reference bit. The next REPLACE then
+        // finds an unreferenced victim SOONER (no second chances / migrations), so the victim drifts
+        // from the twin (whose reference bits were preserved). Post-restore mutation (the snapshot
+        // itself is valid) -- exactly the fail-OPEN bug D28.6 requires t9 to catch.
+        class RefBitsDroppedCar extends Car {
+            static restore(snap, opts) {
+                const inst = Car.restore(snap, opts);
+                for (let i = 0; i < inst._st.length; i++) inst._st[i] &= ~1; // clear CAR_REF
+                return inst;
+            }
+        }
 
         const controls = [
             { name: 'arc-p-dropped', broken: { Ctor: PDroppedArc, wrap: wrapArc }, real: { Ctor: Arc, wrap: wrapArc } },
@@ -997,6 +1055,8 @@ export function run() {
             { name: 'clockpro-test-bits-dropped', broken: { Ctor: TestBitsDroppedClockPro, wrap: wrapClockPro }, real: { Ctor: ClockPro, wrap: wrapClockPro } },
             { name: 'lruk-drop-r1', broken: { Ctor: R1DroppedLruK, wrap: wrapLruK }, real: { Ctor: LruK, wrap: wrapLruK } },
             { name: 'mq-drop-rc', broken: { Ctor: RcDroppedMq, wrap: wrapMq }, real: { Ctor: Mq, wrap: wrapMq } },
+            { name: 'car-p-dropped', broken: { Ctor: PDroppedCar, wrap: wrapCar }, real: { Ctor: Car, wrap: wrapCar } },
+            { name: 'car-ref-bits-dropped', broken: { Ctor: RefBitsDroppedCar, wrap: wrapCar }, real: { Ctor: Car, wrap: wrapCar } },
         ];
         for (const ctl of controls) {
             // Non-vacuity: the CORRECT round-trip agrees with the twin (also proven in t5).

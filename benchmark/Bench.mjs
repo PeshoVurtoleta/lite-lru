@@ -29,7 +29,7 @@
  * @license MIT
  */
 
-import {LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, VERSION} from '../Lru.js';
+import {LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car, VERSION} from '../Lru.js';
 
 /* -------------------------------------------------------------------------- *
  * Seeded PRNG -- xorshift32, the same generator the torture harness uses, so a
@@ -277,6 +277,7 @@ function instrument(cache, counter) {
     cache._prev = wrap(cache._prev);
     if (cache._vis) cache._vis = wrap(cache._vis); // Sieve's visited column
     if (cache._handCold !== undefined) cache._st = wrap(cache._st); // ClockPro reference-bit column (a hit is 1 _st store)
+    else if (cache._hT1 !== undefined) cache._st = wrap(cache._st); // Car reference-bit column (a hit is 1 _st store)
     else if (cache._sNext) { cache._sNext = wrap(cache._sNext); cache._sPrev = wrap(cache._sPrev); } // Lirs stack S
     if (cache._coldHead !== undefined) { cache._r0 = wrap(cache._r0); cache._r1 = wrap(cache._r1); } // LruK reference-time columns (a hit stamps 2)
     if (cache._qn !== undefined) { cache._rc = wrap(cache._rc); cache._exq = wrap(cache._exq); cache._qn = wrap(cache._qn); } // Mq metadata columns (a hit stamps 3 + relinks + ages)
@@ -346,6 +347,7 @@ const MEMBERS = [
     {name: 'ClockPro', ctor: ClockPro},
     {name: 'LruK', ctor: LruK},
     {name: 'Mq', ctor: Mq},
+    {name: 'Car', ctor: Car},
 ];
 
 /* -------------------------------------------------------------------------- *
