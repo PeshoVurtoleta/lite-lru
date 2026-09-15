@@ -80,6 +80,7 @@ function randomCache(prng, cap, keyspace) {
 
 export function run() {
     const prng = makePrng(SEED ^ 0x0a);
+    let units = 0; // work units: random cache states validated across the recency laws
 
     for (let s = 0; s < STATES; s++) {
         const c = randomCache(prng, CAP, KEYSPACE);
@@ -137,6 +138,7 @@ export function run() {
             check(c._keys[c._head] === headBefore,
                 () => 't0 L3: has/peek changed the MRU head');
         }
+        units++; // one random state fully validated across L1..L3
     }
 
     // L4: at capacity, insert evicts EXACTLY the LRU tail, onEvict fires once with
@@ -1210,4 +1212,6 @@ export function run() {
             () => 't0 SN4: restored stats are not fresh-zeroed');
         validate(r);
     }
+
+    return units;
 }

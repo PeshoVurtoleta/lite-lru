@@ -37,7 +37,7 @@ const SEG_PROBATION = 1;
 const SEG_PROTECTED = 2;
 
 test('exports: VERSION and the named WTinyLfu export are present', async () => {
-    assert.equal(VERSION, '1.15.0');
+    assert.equal(VERSION, '1.16.0');
     const mod = await import('../Lru.js');
     assert.equal(mod.WTinyLfu, WTinyLfu);
 });
@@ -594,7 +594,7 @@ test('aging matches the oracle deterministically across many aging passes (a dif
     const c = new WTinyLfu(cap);
     const o = makeWTinyLfuOracle(cap);
     let x = 0xC0FFEE ^ cap;
-    const rnd = () => { x ^= x << 13; x >>>= 0; x ^= x >> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
+    const rnd = () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
     const keyspace = cap * 3 + 2;
     for (let i = 0; i < 5000; i++) { // >> 80*several = many aging passes
         const kind = rnd() % 5;
@@ -890,7 +890,7 @@ test('both backings match an independent W-TinyLFU oracle over a fuzz stream (ca
             const c = new WTinyLfu(cap, useInt ? { keys: 'int' } : undefined);
             const o = makeWTinyLfuOracle(cap);
             let x = (0x1234567 ^ cap) >>> 0;
-            const rnd = () => { x ^= x << 13; x >>>= 0; x ^= x >> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
+            const rnd = () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
             for (let i = 0; i < 8000; i++) {
                 const kind = rnd() % 5;
                 const key = rnd() % keyspace;

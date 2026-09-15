@@ -12,7 +12,7 @@ multi-policy cache family in JavaScript/TypeScript.
 - Zero garbage collection on the steady-state hot path
 - Structure-of-Arrays (SoA) + `Map` substrate for O(1) lookup and excellent locality
 - Tree-shakeable individual policies
-- “Measure & Trust” as the primary product differentiator
+- "Measure & Trust" as the primary product differentiator
 
 The library intentionally avoids competing with `lru-cache` on feature breadth or with `quick-lru` on minimalism. It
 wins on a different axis: a curated family of modern policies, strict performance discipline, and an authoritative
@@ -20,11 +20,11 @@ measurement harness.
 
 ---
 
-## 2. The Analytical Anchor: Bélády’s OPT
+## 2. The Analytical Anchor: Belady's OPT
 
 ### Why it belongs in the project
 
-If the library ships a benchmark harness as a core feature, it needs an absolute reference point. Bélády’s Optimal
+If the library ships a benchmark harness as a core feature, it needs an absolute reference point. Belady's Optimal
 Algorithm (OPT / MIN) is the mathematically perfect offline eviction policy: it always evicts the item whose next use
 lies furthest in the future.
 
@@ -33,8 +33,8 @@ policy.
 
 **Why it is a killer feature**:
 
-- “SIEVE achieved 82 %” is ambiguous.
-- “SIEVE achieved 82 % while OPT achieved 84 % → 97.6 % of optimal” is immediately actionable.
+- "SIEVE achieved 82 %" is ambiguous.
+- "SIEVE achieved 82 % while OPT achieved 84 % -> 97.6 % of optimal" is immediately actionable.
 - Neither `lru-cache` nor `quick-lru` (nor most other JavaScript caches) can tell a user how close to theoretical
   perfection they are.
 
@@ -51,7 +51,7 @@ policy.
 
 ```js
 /**
- * Calculates the mathematically optimal hit rate for a given trace (Bélády's OPT).
+ * Calculates the mathematically optimal hit rate for a given trace (Belady's OPT).
  * Uses a zero-GC Lazy-Deletion Max-Heap with Amortized Rebuilding to prevent pollution.
  *
  * WARNING: This is an offline Oracle (clairvoyant) algorithm. It requires peering
@@ -224,9 +224,9 @@ v2 self-measuring meta-policy: detect that recency is not paying and drop the re
 | **SIEVE**       | Headline policy                           | Simplest modern high-performer, 1-bit flag |
 | S3-FIFO         | Strong general / CDN performer            | Queue-based, excellent one-hit filtering   |
 | W-TinyLFU       | Skewed / Zipfian workloads                | Frequency sketch + window                  |
-| 2Q / SLRU       | Simple scan-resistant baseline            | —                                          |
+| 2Q / SLRU       | Simple scan-resistant baseline            | --                                          |
 | ARC             | Deferred                                  | Ghost lists stress the fixed-capacity model|
-| LIRS, CLOCK-Pro, LRU-K, pure CLOCK | Out of v1 family               | —                                          |
+| LIRS, CLOCK-Pro, LRU-K, pure CLOCK | Out of v1 family               | --                                          |
 
 **Design principle**: FIFO-reinsertion / lazy promotion is treated as a principle already embodied by SIEVE and S3-FIFO,
 not as a separate roster member.
@@ -260,8 +260,8 @@ It must remain a policy-local dependency so that other algorithms stay ultra-lig
 ### Self-Measuring Meta-Policy
 
 A zero-GC controller that tracks live efficacy of the active policy and can optionally auto-switch between simple
-modes (e.g. recency-biased SIEVE ↔ frequency-biased mode). This is the only adaptive idea still considered genuinely
-differentiated. It directly strengthens the “Measure & Trust” moat.
+modes (e.g. recency-biased SIEVE <-> frequency-biased mode). This is the only adaptive idea still considered genuinely
+differentiated. It directly strengthens the "Measure & Trust" moat.
 
 ### Adaptive Light Hybrid / Shadow-OPT
 
@@ -273,7 +273,7 @@ branching and metadata. Kept strictly as research.
 ## 6. Experimental Direction: LiteMGLRU
 
 Linux Multi-Gen LRU (MGLRU, merged in kernel 6.1) is the current production page-reclaim policy on a large fraction of
-the world’s Linux systems. A clean, userspace, zero-GC, fixed-capacity approximation has clear attention potential.
+the world's Linux systems. A clean, userspace, zero-GC, fixed-capacity approximation has clear attention potential.
 
 ### Design goals of LiteMGLRU
 
@@ -281,14 +281,14 @@ the world’s Linux systems. A clean, userspace, zero-GC, fixed-capacity approxi
 - SoA layout
 - 4 generations (0 = oldest, 3 = youngest)
 - 1-byte metadata per slot (bit 0 = visited, bits 1-2 = generation)
-- Hot path (`get`) only sets a bit — no list movement
+- Hot path (`get`) only sets a bit -- no list movement
 - O(1) amortized eviction via cascading tail evaluation
 
 ### Reference Implementation
 
 ```js
 /**
- * LiteMGLRU – Zero-GC Userspace Multi-Gen LRU
+ * LiteMGLRU -- Zero-GC Userspace Multi-Gen LRU
  *
  * Simplified generational policy inspired by Linux MGLRU.
  * Experimental / v2 track only.
@@ -395,7 +395,7 @@ export class LiteMGLRU {
         this._next[this.capacity - 1] = -1;
     }
 
-    // Iteration order: Gen 3 → Gen 0 (approximate MRU → LRU)
+    // Iteration order: Gen 3 -> Gen 0 (approximate MRU -> LRU)
     * keys() {
         for (let gen = 3; gen >= 0; gen--) {
             let s = this._genHead[gen];
@@ -430,7 +430,7 @@ export class LiteMGLRU {
         return this.entries();
     }
 
-    // ── Internal ──────────────────────────────────────────
+    // -- Internal ------------------------------------------
 
     _allocSlot() {
         const s = this._freeHead;
@@ -490,18 +490,18 @@ export class LiteMGLRU {
                 }
             }
             if (targetGen === -1) {
-                throw new Error("internal: eviction failed – no candidates");
+                throw new Error("internal: eviction failed -- no candidates");
             }
 
             const s = this._genTail[targetGen];
             const visited = this._meta[s] & 0b1;
 
             if (visited) {
-                // Hot → promote to youngest generation
+                // Hot -> promote to youngest generation
                 this._meta[s] = (3 << 1) | 0;
                 this._moveToGen(s, targetGen, 3);
             } else if (targetGen === 0) {
-                // Coldest item – true eviction
+                // Coldest item -- true eviction
                 this._unlinkFromGen(s, 0);
                 this._map.delete(this._keys[s]);
                 return s;
@@ -533,7 +533,7 @@ These are intentional simplifications for a userspace, fixed-capacity experiment
 2. Implement SIEVE as the headline policy (optionally using `lite-fastbit32` for the visited bit).
 3. Add S3-FIFO, W-TinyLFU, and SLRU.
 4. Ship zero-GC TTL, iteration, and stats.
-5. Ship the benchmark harness with the Bélády OPT implementation.
+5. Ship the benchmark harness with the Belady OPT implementation.
 6. Keep LiteMGLRU, self-measuring meta-policy, and other adaptive ideas strictly on the v2 research track.
 
 ---
@@ -543,7 +543,7 @@ These are intentional simplifications for a userspace, fixed-capacity experiment
 - How close can a carefully tuned SIEVE or S3-FIFO get to OPT on real production traces?
 - Is a simplified generational policy (LiteMGLRU) competitive enough with SIEVE/S3-FIFO to justify inclusion, or does it
   mainly serve educational / attention value?
-- What is the cleanest zero-GC way to expose live “distance to OPT” without harming the hot path?
+- What is the cleanest zero-GC way to expose live "distance to OPT" without harming the hot path?
 
 ---
 

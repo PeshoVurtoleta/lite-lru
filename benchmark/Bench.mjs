@@ -22,9 +22,10 @@
  * HONESTY (the suite law 8 + the S9 rulings). Hit ratio is a bench OUTPUT reported
  * against a NAMED trace ("on this trace, ..."), never a headline claim, and never a
  * cross-library "beats X by N%" comparison. ns/op is wall-clock and machine-local:
- * reproduce it on your own hardware; the numbers move with the runtime. The FIXED
- * structural facts (writes-per-hit, zero-GC budgets) are gated in the torture suite,
- * not measured here.
+ * reproduce it on your own hardware; the numbers move with the runtime. All members
+ * are timed in ONE process, so cross-member ns/op carries shared-call-site (inline-cache
+ * / megamorphic) bias -- another reason ns/op is indicative only. The FIXED structural
+ * facts (writes-per-hit, zero-GC budgets) are gated in the torture suite, not measured here.
  *
  * @license MIT
  */
@@ -43,7 +44,7 @@ export function makePrng(seed) {
     return function next() {
         x ^= x << 13;
         x >>>= 0;
-        x ^= x >> 17;
+        x ^= x >>> 17;
         x ^= x << 5;
         x >>>= 0;
         return x >>> 0;
@@ -142,11 +143,20 @@ export function scanTrace(opts) {
 
 /**
  * @param {Array<number>|Uint32Array} trace  the sequence of accessed keys
- * @param {number} capacity                  the cache size limit (>= 1)
+ * @param {number} capacity                  the cache size limit; a positive integer
+ *                                            (0 / negative are documented degenerate fallbacks below)
  * @returns {{ hits:number, misses:number, hitRate:number }}
  */
 export function beladyOpt(trace, capacity) {
     const n = trace.length;
+    // Fail closed on an unverified capacity BEFORE the documented degenerate fallbacks:
+    // a non-number / NaN, or a positive non-integer, is a caller bug -- never coerce it.
+    if (typeof capacity !== "number" || Number.isNaN(capacity)) {
+        throw new RangeError("[lite-lru] beladyOpt capacity must be a number, got " + String(capacity));
+    }
+    if (capacity > 0 && !Number.isInteger(capacity)) {
+        throw new RangeError("[lite-lru] beladyOpt capacity must be an integer, got " + String(capacity));
+    }
     if (n === 0) return {hits: 0, misses: 0, hitRate: 0};
     if (capacity <= 0) return {hits: 0, misses: n, hitRate: 0};
 

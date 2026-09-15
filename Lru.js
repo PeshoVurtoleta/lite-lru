@@ -276,7 +276,66 @@ function validateStats(stats) {
         "[lite-lru] unknown stats option " + String(stats) + " (did you mean true?)");
 }
 
-export const VERSION = "1.15.0";
+/** The option keys every constructor understands. An unknown key is a caller typo,
+ *  and a typo is an error with a hint -- never a silent ignore (the fail-closed law). */
+const KNOWN_OPTS = ["onEvict", "keys", "ttl", "clock", "stats"];
+
+/**
+ * Suggest the closest known option key to an unknown one (cold, throw-path only).
+ * A case-insensitive exact match wins first; else the key sharing the most leading
+ * characters; else we list every valid key. Clarity over cleverness -- this only ever
+ * runs while building a fail-closed error message.
+ */
+function nearestOpt(key) {
+    const lower = String(key).toLowerCase();
+    for (const k of KNOWN_OPTS) {
+        if (k.toLowerCase() === lower) return k;
+    }
+    let best = null, bestScore = 0;
+    for (const k of KNOWN_OPTS) {
+        const kl = k.toLowerCase();
+        const max = Math.min(kl.length, lower.length);
+        let n = 0;
+        while (n < max && kl[n] === lower[n]) n++;
+        if (n > bestScore) { bestScore = n; best = k; }
+    }
+    return bestScore > 0 ? best : KNOWN_OPTS.join(", ");
+}
+
+/**
+ * Validate the options bag itself (the fail-closed law): reject a non-object, and
+ * reject any unknown key with a did-you-mean hint rather than silently ignoring a
+ * typo. Cold: called once per constructor, right after the capacity door.
+ */
+function validateOptions(options) {
+    if (options === undefined) return;
+    if (options === null || typeof options !== "object") {
+        throw new TypeError(
+            "[lite-lru] options must be an object, got " + String(options));
+    }
+    for (const k in options) {
+        if (!KNOWN_OPTS.includes(k)) {
+            throw new TypeError(
+                "[lite-lru] unknown option " + k + " (did you mean " + nearestOpt(k) + "?)");
+        }
+    }
+}
+
+/**
+ * Validate the optional `onEvict` callback (the fail-closed law). Mirrors validateClock:
+ * `undefined` -> the shared NOOP; a function -> itself; anything else fails closed at the
+ * door. Cold: called once per constructor.
+ */
+function validateOnEvict(onEvict) {
+    if (onEvict === undefined) return NOOP;
+    if (typeof onEvict !== "function") {
+        throw new TypeError(
+            "[lite-lru] onEvict must be a function, got " + String(onEvict));
+    }
+    return onEvict;
+}
+
+export const VERSION = "1.16.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -893,6 +952,7 @@ export class LiteLru {
             );
         }
 
+        void validateOptions(options);
         this._capacity = capacity;
 
         // TTL (decisions/0017). Validated fail-closed at the door. `_ttl === undefined`
@@ -918,7 +978,7 @@ export class LiteLru {
         this._size = 0;
 
         // D8 -- optional zero-GC eviction hook (e.g. return the value to a pool).
-        this._onEvict = (options && options.onEvict) || NOOP;
+        this._onEvict = validateOnEvict(options && options.onEvict);
 
         // Reentrancy guard (amends D8; decisions/0002). True only while _onEvict is
         // executing. A mutating method entered during that window throws. A plain
@@ -1249,6 +1309,7 @@ export class Sieve {
             );
         }
 
+        void validateOptions(options);
         this._capacity = capacity;
 
         // TTL (decisions/0017), validated fail-closed at the door -- identical to LiteLru.
@@ -1275,7 +1336,7 @@ export class Sieve {
         this._hand = NIL;  // the sweeping hand; NIL means "start from the tail"
         this._size = 0;
 
-        this._onEvict = (options && options.onEvict) || NOOP;
+        this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
         // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
@@ -1647,6 +1708,7 @@ export class S3Fifo {
             );
         }
 
+        void validateOptions(options);
         this._capacity = capacity;
 
         // TTL (decisions/0017), validated fail-closed at the door -- identical to LiteLru.
@@ -1704,7 +1766,7 @@ export class S3Fifo {
         this._gHead = 0; // ring index of the OLDEST ghost key
         this._gLen = 0;  // live ghost entries (0 .. ghostCap)
 
-        this._onEvict = (options && options.onEvict) || NOOP;
+        this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
         // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
@@ -2293,6 +2355,7 @@ export class WTinyLfu {
             );
         }
 
+        void validateOptions(options);
         this._capacity = capacity;
 
         // TTL (decisions/0017), validated fail-closed at the door -- identical to LiteLru.
@@ -2334,7 +2397,7 @@ export class WTinyLfu {
         this._skSample = 10 * capacity; // D14.3 -- age (halve) after this many bumps
         this._skSize = 0;
 
-        this._onEvict = (options && options.onEvict) || NOOP;
+        this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
         // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
@@ -2802,6 +2865,7 @@ export class Slru {
             );
         }
 
+        void validateOptions(options);
         this._capacity = capacity;
 
         // TTL (decisions/0017), validated fail-closed at the door -- identical to LiteLru.
@@ -2832,7 +2896,7 @@ export class Slru {
         this._protHead = NIL; this._protTail = NIL; this._protSize = 0; // PROTECTED LRU
         this._size = 0;                                                 // _probSize + _protSize
 
-        this._onEvict = (options && options.onEvict) || NOOP;
+        this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
         // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
@@ -3173,6 +3237,7 @@ export class TwoQ {
             );
         }
 
+        void validateOptions(options);
         this._capacity = capacity;
 
         // TTL (decisions/0017), validated fail-closed at the door -- identical to LiteLru.
@@ -3229,7 +3294,7 @@ export class TwoQ {
         this._gHead = 0; // ring index of the OLDEST ghost key
         this._gLen = 0;  // live ghost entries (0 .. ghostCap)
 
-        this._onEvict = (options && options.onEvict) || NOOP;
+        this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
         // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
@@ -3859,6 +3924,7 @@ export class Arc {
             );
         }
 
+        void validateOptions(options);
         this._capacity = capacity;
 
         // TTL (decisions/0017), validated fail-closed at the door -- identical to LiteLru.
@@ -3894,7 +3960,7 @@ export class Arc {
         this._b1 = new ArcGhost(capacity, this._ghostInt);
         this._b2 = new ArcGhost(capacity, this._ghostInt);
 
-        this._onEvict = (options && options.onEvict) || NOOP;
+        this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
         // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
@@ -4350,6 +4416,7 @@ export class Lirs {
             );
         }
 
+        void validateOptions(options);
         this._capacity = capacity;
 
         // TTL (decisions/0017), validated fail-closed -- identical to the rest of the family.
@@ -4394,7 +4461,7 @@ export class Lirs {
         this._histInt = (options && options.keys) === 'int';
         this._hist = new LirsHistory(capacity, this._histInt);
 
-        this._onEvict = (options && options.onEvict) || NOOP;
+        this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
         // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
@@ -4916,6 +4983,7 @@ export class Lfu {
             );
         }
 
+        void validateOptions(options);
         this._capacity = capacity;
 
         // TTL (decisions/0017), validated fail-closed at the door -- identical to LiteLru.
@@ -4958,7 +5026,7 @@ export class Lfu {
         this._bMin = LFU_NIL; // head of the bucket list (lowest frequency); LFU_NIL when empty
 
         this._size = 0;
-        this._onEvict = (options && options.onEvict) || NOOP;
+        this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
         // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
@@ -5451,6 +5519,7 @@ export class ClockPro {
             );
         }
 
+        void validateOptions(options);
         this._capacity = capacity;
 
         // TTL (decisions/0017), validated fail-closed -- identical to the rest of the family.
@@ -5492,7 +5561,7 @@ export class ClockPro {
         this._histInt = (options && options.keys) === 'int';
         this._hist = new ClockProHistory(capacity, this._histInt);
 
-        this._onEvict = (options && options.onEvict) || NOOP;
+        this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
         // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
@@ -6072,6 +6141,7 @@ export class LruK {
             );
         }
 
+        void validateOptions(options);
         this._capacity = capacity;
 
         // TTL (decisions/0017), validated fail-closed -- identical to the rest of the family.
@@ -6115,8 +6185,12 @@ export class LruK {
         this._histInt = (options && options.keys) === 'int';
         this._hist = new LruKHistory(capacity, this._histInt);
 
-        this._onEvict = (options && options.onEvict) || NOOP;
+        this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
+
+        // Retention hygiene for the onEvict fire-after (mirrors ClockPro).
+        this._evKey = undefined;
+        this._evVal = undefined;
 
         // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
         this._stats = validateStats(options && options.stats);
@@ -6693,6 +6767,7 @@ export class Mq {
             );
         }
 
+        void validateOptions(options);
         this._capacity = capacity;
 
         // TTL (decisions/0017) -- the WALL-CLOCK ttl, validated fail-closed, identical to the
@@ -6732,8 +6807,12 @@ export class Mq {
         this._histInt = (options && options.keys) === 'int';
         this._hist = new MqHistory(capacity, this._histInt);
 
-        this._onEvict = (options && options.onEvict) || NOOP;
+        this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
+
+        // Retention hygiene for the onEvict fire-after (mirrors ClockPro).
+        this._evKey = undefined;
+        this._evVal = undefined;
 
         // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
         this._stats = validateStats(options && options.stats);
@@ -7239,6 +7318,7 @@ export class Car {
             );
         }
 
+        void validateOptions(options);
         this._capacity = capacity;
 
         // TTL (decisions/0017), validated fail-closed -- identical to the rest of the family.
@@ -7277,7 +7357,7 @@ export class Car {
         this._b1 = new CarHistory(capacity, this._ghostInt);
         this._b2 = new CarHistory(2 * capacity, this._ghostInt);
 
-        this._onEvict = (options && options.onEvict) || NOOP;
+        this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
         // Retention hygiene for the onEvict fire-after (mirrors ClockPro).

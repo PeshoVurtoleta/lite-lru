@@ -17,7 +17,7 @@ import { makeSieveOracle } from './torture/oracles/sieve.mjs';
 const NIL = -1;
 
 test('exports: VERSION and the named Sieve export are present', async () => {
-    assert.equal(VERSION, '1.15.0');
+    assert.equal(VERSION, '1.16.0');
     const mod = await import('../Lru.js');
     assert.equal(mod.Sieve, Sieve);
 });
@@ -671,7 +671,7 @@ test('both backings match an independent SIEVE oracle over a fuzz stream', () =>
         const c = new Sieve(cap, useInt ? { keys: 'int' } : undefined);
         const o = makeSieveOracle(cap);
         let x = 0x1234567 >>> 0;
-        const rnd = () => { x ^= x << 13; x >>>= 0; x ^= x >> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
+        const rnd = () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
         for (let i = 0; i < 20000; i++) {
             const kind = rnd() % 5;
             const key = rnd() % keyspace;

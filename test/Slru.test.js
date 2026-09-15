@@ -20,7 +20,7 @@ const SLRU_PROBATION = 0; // matches Lru.js tags
 const SLRU_PROTECTED = 1;
 
 test('exports: VERSION and the named Slru export are present', async () => {
-    assert.equal(VERSION, '1.15.0');
+    assert.equal(VERSION, '1.16.0');
     const mod = await import('../Lru.js');
     assert.equal(mod.Slru, Slru);
 });
@@ -573,7 +573,7 @@ test('both backings match an independent Slru oracle over a fuzz stream (caps 1.
             const c = new Slru(cap, useInt ? { keys: 'int' } : undefined);
             const o = makeSlruOracle(cap);
             let x = (0x2468ace ^ cap) >>> 0;
-            const rnd = () => { x ^= x << 13; x >>>= 0; x ^= x >> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
+            const rnd = () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
             for (let i = 0; i < 8000; i++) {
                 const kind = rnd() % 5;
                 const key = rnd() % keyspace;

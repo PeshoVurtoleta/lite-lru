@@ -95,6 +95,7 @@ function scanish(prng, length, hotSize) {
 
 export function run() {
     const prng = makePrng(SEED ^ 0x08);
+    let units = 0; // work units: differential OPT configs + optimality-bound checks
 
     // --- check (1): beladyOpt === brute-force OPT on small seeded traces --------
     // Small enough that the O(N*C*N) brute reference is affordable, varied enough
@@ -118,6 +119,7 @@ export function run() {
                 () => 't8 (1): beladyOpt=' + got + ' != brute OPT=' + want +
                     ' (cap=' + cfg.cap + ' len=' + cfg.len + ' ks=' + cfg.ks + ' rep=' + rep +
                     ')\n  replay: TORTURE_SEED=' + SEED + ' node --expose-gc test/torture.mjs');
+            units++; // one beladyOpt-vs-brute differential config proven
         }
     }
 
@@ -129,6 +131,7 @@ export function run() {
         const want = bruteOptHits(trace, 3);
         check(got === want,
             () => 't8 (1): loop trace beladyOpt=' + got + ' != brute=' + want);
+        units++;
     }
 
     // --- check (2): OPT >= every member on the SAME trace (both members) --------
@@ -154,6 +157,7 @@ export function run() {
             () => 't8 (2): Sieve hits ' + sieve + ' > OPT ' + opt + ' on ' + cfg.name +
                 ' (cap=' + cfg.cap + ') -- no policy can beat OPT' +
                 '\n  replay: TORTURE_SEED=' + SEED + ' node --expose-gc test/torture.mjs');
+        units += 2; // LiteLru + Sieve optimality bounds checked on this trace
     }
 
     // Non-vacuity: the brute reference is not trivially returning 0 on a trace with
@@ -162,5 +166,8 @@ export function run() {
         const trace = [1, 2, 1, 2, 1, 2];
         const want = bruteOptHits(trace, 2);
         check(want === 4, () => 't8: brute OPT vacuous -- expected 4 hits on [1,2]*3, got ' + want);
+        units++;
     }
+
+    return units;
 }

@@ -7,6 +7,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.16.0] - 2026-09-15
+
+### Added
+
+- Fail-closed constructor door for unknown option keys plus `onEvict` validation.
+  Every member now validates its `options` bag at construction: a non-object bag, an
+  unknown key (with a nearest-known-key did-you-mean hint), or a non-function
+  `onEvict` throws a `[lite-lru]`-tagged error at the door. Behavioral change: a
+  typo'd option key that was previously ignored silently now throws.
+- Torture orchestrator per-tier liveness counts. Every tier's `run()` returns a
+  positive work-unit count and `test/torture.mjs` fails closed if a tier reports no
+  work, so a silently-empty gate can no longer pass.
+- Hand-derived CAR/ClockPro victim-order suites (`test/Car.test.js`, `test/ClockPro.test.js`):
+  three cases each, derived by hand from decisions/0028 D28 and decisions/0025 D25 (never by
+  running the implementation and transcribing), pinning the EXACT eviction order and victim
+  identity for a no-reference clock rotation, the reference-bit second chance, and the
+  T1-survivor-to-T2 / bounded-history-re-admit adaptation that changes the next victim.
+- Boundary tests for the new fail-closed doors (`test/Lru.test.js`, `test/Bench.test.js`):
+  the unknown-option-key door (family-wide, proven on a second member), `options: null`/`42`,
+  a fully-populated options bag, the `onEvict` non-function door and its silent-NOOP default,
+  and `beladyOpt`'s `NaN`/`undefined`/non-integer capacity door.
+- Test count 1449 -> 1466 (node:test).
+
+### Changed
+
+- Seeded traces: for a given seed the bench/harness PRNG streams differ from 1.15.0
+  (a consequence of the xorshift32 fix below). The README bench table is regenerated
+  from the corrected default trace, and the two stream-dependent t6 lane floors are
+  re-derived under the new streams: CLOCKPRO cold->hot promotions floor 1 -> 200 (the
+  `cpStream` coverage window now periodically re-references recently-inserted cold
+  keys so promotions land in-window; observed 865, was 2) and LFU bucket-relabel
+  floor 50 -> 20 (observed 45). Zero-GC budgets are unchanged.
+
+### Fixed
+
+- xorshift32 PRNG in the bench + test harness now uses a logical `>>> 17` shift
+  instead of the arithmetic `>> 17` (the arithmetic shift made the state map 2-to-1
+  with a reachable all-zero absorbing state, voiding the full-period guarantee). The
+  `Car.test.js` LCG (which overflowed the 2^53 float mantissa) is replaced with the
+  same xorshift32 stream the sibling suites use.
+- `beladyOpt` rejects a non-numeric / NaN capacity (and a positive non-integer)
+  with a `[lite-lru]`-tagged `RangeError`, before the documented degenerate fallbacks.
+- LruK/Mq eviction-field constructor init: both constructors now initialize
+  `_evKey`/`_evVal` at construction time for hidden-class shape stability, matching Car.
+- t7 soak: the churn-growth baseline is now sampled after a forced GC, and a tracked
+  heap peak is bounded alongside the end sample (the 64 MB backstop is unchanged);
+  the dead `heapLast` sample is removed.
+
 ## [1.15.0] - 2026-09-14
 
 ### Added

@@ -39,7 +39,7 @@ function makePrng(seed) {
     let x = (seed >>> 0) || 1;
     return function next() {
         x ^= x << 13; x >>>= 0;
-        x ^= x >> 17;
+        x ^= x >>> 17;
         x ^= x << 5; x >>>= 0;
         return x >>> 0;
     };

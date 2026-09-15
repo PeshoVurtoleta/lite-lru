@@ -28,7 +28,7 @@ const isRef = (c, k) => (stOf(c, k) & REF) !== 0;
 const inT2 = (c, k) => (stOf(c, k) & T2) !== 0;
 
 test('Car: VERSION is the current, un-bumped value (moves only at /release)', () => {
-    assert.equal(VERSION, '1.15.0');
+    assert.equal(VERSION, '1.16.0');
 });
 
 test('Car: fail-closed capacity -- non-integer / < 1 throws RangeError', () => {
@@ -263,8 +263,8 @@ test('Car: a restored twin decides ALL future evictions identically, from a stat
     // fills all four directory partitions simultaneously (hand-verified below, not assumed).
     const CAP = 16;
     const HOT = 24; // hot working set > capacity -> some hot pages eventually evict T2 -> B2
-    let seed = 12345;
-    const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff);
+    let x = (12345 >>> 0) || 1;
+    const rnd = () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
     function nextKey(coldRef) {
         const r = rnd() % 10;
         if (r < 6) return rnd() % HOT;                 // hot recurrence
@@ -415,4 +415,139 @@ test('Car: iteration fails closed (throws) on a structural mutation mid-walk', (
     for (const _ of c.entries()) count++;
     assert.equal(count, c.size, 'a fresh iterator after the mutation walks the full resident set');
     validate(c);
+});
+
+/* -------------------------------------------------------------------------------- *
+ * HAND-DERIVED VICTIM ORDER (qa TASK 1, CHANGELOG.md:34): CAR and ClockPro share the
+ * SAME circular-clock geometry (a NIL-terminated head=newest..tail=oldest DLL whose
+ * hand wraps `_advance(_tail) -> _head`, decisions/0028 D28.1 / decisions/0025 D25.1)
+ * as the t5 differential oracles they are checked against -- a regression in the
+ * SHARED wrap-around traversal math would reproduce identically on both sides of the
+ * differential and cancel, exactly the blind spot the Arc ghost-trim suite above pins
+ * for ARC's shared-trim geometry. These cases derive the EXACT eviction order BY HAND
+ * from D28.1 (clock realization) + D28.4 (REPLACE), tracing slot assignment, clock
+ * contents, hand position and `_st` bits after every op -- never by running Car and
+ * transcribing its output. (The derivation below was cross-checked step-by-step
+ * against the live member during QA -- as the Arc suite's precedent documents doing
+ * -- and agreed at every step; no discrepancy was found.)
+ *
+ * Slot assignment fact used throughout (D2/D4): a FRESH store's free stack is
+ * 0 -> 1 -> ... -> capacity-1, popped in order, so `new Car(4)` then
+ * `put(0)`,`put(1)`,`put(2)`,`put(3)` (all true misses, nothing resident yet) assigns
+ * key i to slot i, in that order.
+ * -------------------------------------------------------------------------------- */
+
+test('Car HAND-DERIVED (a): no-reference straight rotation -- the hand wraps tail -> ' +
+    'head, so eviction order is NOT plain insertion order past the first victim', () => {
+    // Trace, entirely by hand from D28.1/D28.4 (T1 push is always at HEAD; `_next`
+    // points head->tail; the hand starts parked at the first-ever insert, which is
+    // both head and tail; `_advance`/`_ringSucc` wrap `_next[tail] -> _head`). SLOTS
+    // are fixed physical columns and get REUSED by the next inserted key on eviction
+    // (D2/D4, D28.4 "reuse its slot"); every line below is written `slot:key` to keep
+    // the two distinct -- the hand (`_hT1`) is always a SLOT index, never a key.
+    //
+    //  put(0): T1 [head..tail] = 0:0.                    hT1=0 (sole entry: hand parks here)
+    //  put(1): T1 = 1:1, 0:0.                             hT1=0 (unchanged: push only touches head)
+    //  put(2): T1 = 2:2, 1:1, 0:0.                        hT1=0
+    //  put(3): T1 = 3:3, 2:2, 1:1, 0:0. all st=0 (unref). hT1=0  <- hand sits at the TAIL (slot0, key0)
+    //
+    //  put(4): REPLACE, pTarget=max(1,p=0)=1, |T1|=4>=1 -> take T1. h=hT1=slot0
+    //    (key0). st[0]&REF==0 (unreferenced) -> IMMEDIATE VICTIM: key 0. Ring successor
+    //    of the TAIL (next[slot0]=NIL) wraps to the CURRENT head (slot3, the newest
+    //    resident at this instant) -- NOT to the second-oldest (slot1/key1). hT1 <- 3.
+    //    slot0 is freed and reused for key4: T1 = 0:4, 3:3, 2:2, 1:1(tail).   hT1=3
+    //
+    //  put(5): h=hT1=slot3 (key3), unreferenced -> VICTIM: key 3. next[slot3]=slot2
+    //    (a REGULAR link, slot3 is not the tail) -> ringSucc=2, no wrap. slot3 is
+    //    freed and reused for key5: T1 = 3:5, 0:4, 2:2, 1:1(tail).           hT1=2
+    //
+    //  put(6): h=hT1=slot2 (key2), unreferenced -> VICTIM: key 2. next[slot2]=slot1
+    //    (regular, slot2 not tail) -> ringSucc=1. slot2 freed, reused for key6:
+    //    T1 = 2:6, 3:5, 0:4, 1:1(tail).                                     hT1=1
+    //
+    //  put(7): h=hT1=slot1 (key1, the tail again), unreferenced -> VICTIM: key 1.
+    //    Its ring successor is next[slot1]=NIL (still the tail) -> WRAPS again, to
+    //    the CURRENT head (slot2, which now holds key6, the newest survivor at this
+    //    instant) -- NOT slot index "6". slot1 freed, reused for key7:
+    //    T1 = 1:7, 2:6, 3:5, 0:4(tail).                                     hT1=2
+    //
+    // So the FIRST FOUR victims are, in order: 0, 3, 2, 1 -- the first eviction takes
+    // the oldest (a plain FIFO step), but every eviction AFTER a tail-wrap instead
+    // sweeps newest-to-oldest among the surviving originals, because the tail's ring
+    // successor is the head, not "the next-oldest survivor". A naive reader of "CLOCK
+    // == FIFO order" would wrongly predict 0, 1, 2, 3. The hand ends parked on SLOT 2
+    // (which by then holds key6) -- a coincidence of slot reuse, not a claim about key 2.
+    const order = [];
+    const c = new Car(4, { onEvict: (k) => order.push(k) });
+    for (let i = 0; i < 4; i++) c.put(i, i);
+    assert.equal(c._hT1, 0, 'setup: the hand parks at the first-ever insert (the tail)');
+    c.put(4, 4); c.put(5, 5); c.put(6, 6); c.put(7, 7);
+    assert.deepEqual(order, [0, 3, 2, 1], 'HAND-DERIVED: the tail-wrap victim order, not plain FIFO 0,1,2,3');
+    assert.equal(c._hT1, 2, 'HAND-DERIVED: the hand parks on slot 2 (holding key6) after the fourth (wrapping) eviction');
+    assert.equal(c._keys[c._hT1], 6, 'HAND-DERIVED: slot 2 was reused for key6 by the time the hand re-parks there');
+    validate(c);
+});
+
+test('Car HAND-DERIVED (b): the reference-bit second chance -- a referenced hand ' +
+    'position is skipped (ref cleared, migrated to T2), the NEXT unreferenced page is ' +
+    'the actual victim', () => {
+    // Same fill as (a): T1 = 3,2,1,0 (head..tail), hT1=0 (parked on key0, the tail),
+    // all st=0. Now `get(0)`: D28.5's hit path is `_st[s] |= CAR_REF` only (0 link
+    // writes) -> st[slot0] = CAR_REF(1). Topology is UNCHANGED (a hit moves nothing).
+    //
+    //  put(4): REPLACE, pTarget=1, |T1|=4>=1 -> T1. h=hT1=0 (key0). st[0]&REF!=0
+    //    (REFERENCED) -> SECOND CHANCE, not a victim: ring successor of the tail
+    //    (next[0]=NIL) wraps to the current head (3) -> hT1<-3 BEFORE the detach; the
+    //    survivor migrates: st[0] <- CAR_T2 (ref cleared, inT2 set) and slot0 is
+    //    pushed onto T2 (T2 was empty -> head=tail=hT2=slot0, the "T1 survivor
+    //    migrates to T2" of D28.4). |T1| drops to 3, take-T1 re-evaluated: 3>=1 still
+    //    true -> loop continues with h=hT1=3 (key3). st[3]&REF==0 (unreferenced) ->
+    //    NOW the victim: key 3. Its ring successor is next[3]=2 (regular) -> hT1<-2.
+    //    T1 after evict+push key4 into the freed slot3: head=4(slot3),2,1(tail).
+    //                                                              hT1=2, T2={0}, hT2=0
+    //
+    // Net: the referenced page (key0) was SKIPPED, its ref bit cleared and the page
+    // MIGRATED into T2 (not evicted); the very next unreferenced page found by the
+    // continuing sweep (key3) is the ACTUAL victim -- never key0.
+    const order = [];
+    const c = new Car(4, { onEvict: (k) => order.push(k) });
+    for (let i = 0; i < 4; i++) c.put(i, i);
+    c.get(0); // reference the hand's current position only
+    c.put(4, 4);
+    assert.deepEqual(order, [3], 'HAND-DERIVED: key3 (not key0) is the actual victim');
+    assert.ok(c.has(0), 'the referenced page survived the sweep');
+    assert.equal(stOf(c, 0), T2, 'HAND-DERIVED: key0 migrated to T2 with its reference bit cleared');
+    assert.equal(c._hT1, 2, 'HAND-DERIVED: the hand parks on key2 slot after the eviction');
+    assert.equal(c._hT2, c._store.get(0), 'HAND-DERIVED: the T2 hand parks on the sole migrated survivor');
+    validate(c);
+});
+
+test('Car HAND-DERIVED (c): the T1-survivor migration in (b) is what CHANGES the ' +
+    'victim -- an identical fill with the SAME single get() diverges from a twin ' +
+    'without it', () => {
+    // A direct counterfactual pin (not just an assertion on one cache): build two
+    // caches through the IDENTICAL fill put(0..3), then reference key0 on ONLY one
+    // twin before the capacity-triggering put(4). Per the (a)/(b) derivations above:
+    //   - twin A (no get): hT1 stays at the tail (key0, unreferenced) -> put(4)
+    //     evicts key0 DIRECTLY -- no migration ever happens.
+    //   - twin B (get(0)): the SAME hand position is now referenced -> key0 is given
+    //     a second chance and MIGRATES to T2 instead of being evicted; the sweep
+    //     continues to key3, which becomes the victim.
+    // The ONE bit of extra history (one get() on the page the hand happens to be
+    // parked on) flips the victim from key0 to key3 -- this is the causal claim
+    // "a T1-survivor migration to T2 changes who the next victim is", pinned by
+    // literal divergence between two otherwise-identical caches.
+    const evA = [], evB = [];
+    const a = new Car(4, { onEvict: (k) => evA.push(k) });
+    const b = new Car(4, { onEvict: (k) => evB.push(k) });
+    for (let i = 0; i < 4; i++) { a.put(i, i); b.put(i, i); }
+    b.get(0); // the ONLY difference between the two twins
+    a.put(4, 4);
+    b.put(4, 4);
+    assert.deepEqual(evA, [0], 'HAND-DERIVED: without the migration, the hand-position page (0) is evicted');
+    assert.deepEqual(evB, [3], 'HAND-DERIVED: with the migration, a DIFFERENT page (3) is evicted instead');
+    assert.notEqual(evA[0], evB[0], 'the T1->T2 migration changed the victim identity');
+    assert.ok(b.has(0) && !a.has(0), 'the migrated survivor (0) is resident only in the twin that referenced it');
+    validate(a);
+    validate(b);
 });

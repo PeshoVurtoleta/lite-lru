@@ -21,7 +21,7 @@ const Q_SMALL = 0; // matches Lru.js's S3-FIFO queue tags
 const Q_MAIN = 1;
 
 test('exports: VERSION and the named S3Fifo export are present', async () => {
-    assert.equal(VERSION, '1.15.0');
+    assert.equal(VERSION, '1.16.0');
     const mod = await import('../Lru.js');
     assert.equal(mod.S3Fifo, S3Fifo);
 });
@@ -566,7 +566,7 @@ test('both backings match an independent S3-FIFO oracle over a fuzz stream (caps
             const c = new S3Fifo(cap, useInt ? { keys: 'int' } : undefined);
             const o = makeS3FifoOracle(cap);
             let x = (0x1234567 ^ cap) >>> 0;
-            const rnd = () => { x ^= x << 13; x >>>= 0; x ^= x >> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
+            const rnd = () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x >>> 0; };
             for (let i = 0; i < 8000; i++) {
                 const kind = rnd() % 5;
                 const key = rnd() % keyspace;

@@ -414,12 +414,22 @@ const leak = [];
 const retainSink = [];
 
 export function run() {
+    // Liveness: count every control proven. The differential/gate/round-trip helpers
+    // die on a toothless control, so a completed invocation count == controls proven;
+    // the validate-teeth controls (which expect validate() to THROW) add one each.
+    let units = 0;
+    const _diff = runDifferential, _ops = runOpsGate, _allocs = runAllocsGate, _rt = runRoundTrip;
+    const countDiff = (p, o) => { const r = _diff(p, o); units++; return r; };
+    const countOps = (f, o) => { const r = _ops(f, o); units++; return r; };
+    const countAllocs = (f, o) => { const r = _allocs(f, o); units++; return r; };
+    const countRt = (m, o) => { const r = _rt(m, o); units++; return r; };
+
     // --- C0: non-vacuity -- a CORRECT cache validates clean and matches the oracle.
     {
         const c = new LiteLru(8);
         for (let i = 0; i < 12; i++) c.put(i, i);
         validate(c); // must not throw
-        const r = runDifferential(lruPolicy, { cap: 8, ops: 5000, seed: 12345, keyspace: 24 });
+        const r = countDiff(lruPolicy, { cap: 8, ops: 5000, seed: 12345, keyspace: 24 });
         if (!r.ok) die('t9 C0: a correct LiteLru diverged from its own oracle (the runner is vacuous)');
     }
 
@@ -431,6 +441,7 @@ export function run() {
         let threw = false;
         try { validate(c); } catch (e) { threw = true; }
         if (!threw) die('t9 C1: validate() passed a cache with a dangling prev link (no teeth)');
+        units++;
     }
 
     // --- C2: evict forgets the index delete -> validate() index.size != size -----
@@ -440,6 +451,7 @@ export function run() {
         let threw = false;
         try { validate(c); } catch (e) { threw = true; }
         if (!threw) die('t9 C2: validate() passed a cache leaking an evicted index key (no teeth)');
+        units++;
     }
 
     // --- C3: get skips _moveToFront -> diverges from the LRU oracle --------------
@@ -449,22 +461,22 @@ export function run() {
             real: (cap) => wrapLru(new BrokenGet(cap)),
             oracle: (cap) => makeLruOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 8, ops: 20000, seed: 777, keyspace: 20 });
+        const r = countDiff(brokenPolicy, { cap: 8, ops: 20000, seed: 777, keyspace: 20 });
         if (r.ok) die('t9 C3: a get() that skips promotion did NOT diverge from the LRU oracle (no teeth)');
     }
 
     // --- C4: an allocating hot loop -> both alloc channels reject it -------------
     // ops channel: a retaining typed-array push grows arrayBuffers.
-    const c4ops = runOpsGate(() => { leak.push(new Float64Array(64)); }, { ops: 4000, warmup: 0 });
+    const c4ops = countOps(() => { leak.push(new Float64Array(64)); }, { ops: 4000, warmup: 0 });
     if (c4ops.report.ok) die('t9 C4: an allocating hot loop passed the zero-alloc ops gate');
     leak.length = 0;
     // retained channel: a boxed {} per op survives a forced collection.
-    const c4ret = runAllocsGate((i) => { retainSink.push({ v: i }); }, { iterations: 50000, batches: 8 });
+    const c4ret = countAllocs((i) => { retainSink.push({ v: i }); }, { iterations: 50000, batches: 8 });
     if (c4ret.ok) die('t9 C4: a {}-per-op body passed the retained-alloc gate -- bytesPerCall=' + c4ret.bytesPerCall);
     retainSink.length = 0;
     // non-vacuity: a non-retaining preallocated-slot body passes.
     const slot = new Int32Array(1);
-    const c4ok = runAllocsGate((i) => { slot[0] = i; }, { iterations: 50000, batches: 8 });
+    const c4ok = countAllocs((i) => { slot[0] = i; }, { iterations: 50000, batches: 8 });
     if (!c4ok.ok) {
         die('t9 C4: a non-retaining slot-write body failed the retained-alloc gate (vacuous) -- verdict=' +
             c4ok.report.verdict + ' settled=' + c4ok.result.settled + ' bytesPerCall=' + c4ok.bytesPerCall);
@@ -476,7 +488,7 @@ export function run() {
     // oracle -- proving the runner actually checks the plugged-in policy's victim.
     {
         const brokenFifo = { name: 'fifo-broken', real: makeBrokenFifoReal, oracle: makeFifoOracle };
-        const r = runDifferential(brokenFifo, { cap: 8, ops: 20000, seed: 999, keyspace: 24 });
+        const r = countDiff(brokenFifo, { cap: 8, ops: 20000, seed: 999, keyspace: 24 });
         if (r.ok) die('t9 C5: a FIFO with a wrong victim() did NOT diverge from the FIFO oracle (the seam is toothless)');
         // non-vacuity: the CORRECT FIFO agrees with its oracle (proven in t5), and
         // the divergence above is a victim mismatch, not a value/size accident.
@@ -498,6 +510,7 @@ export function run() {
         let threw = false;
         try { validate(c); } catch (e) { threw = true; }
         if (!threw) die('t9 C6: validate() passed a grown int index buffer (the stability gate is toothless)');
+        units++;
     }
 
     // --- C7: a SIEVE get that promotes-on-hit -> diverges from the sieve oracle ---
@@ -511,7 +524,7 @@ export function run() {
             real: (cap) => wrapSieve(new PromotingSieve(cap)),
             oracle: (cap) => makeSieveOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 8, ops: 20000, seed: 424242, keyspace: 20 });
+        const r = countDiff(brokenPolicy, { cap: 8, ops: 20000, seed: 424242, keyspace: 20 });
         if (r.ok) die('t9 C7: a SIEVE get() that promotes on hit did NOT diverge from the sieve oracle (no teeth)');
         check(r.why === 'victim',
             () => 't9 C7: expected the promoting-get divergence to be a victim mismatch, got ' + r.why);
@@ -529,7 +542,7 @@ export function run() {
             real: (cap) => wrapS3Fifo(new GraduateOnTouchS3Fifo(cap)),
             oracle: (cap) => makeS3FifoOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 32, ops: 20000, seed: 131313, keyspace: 80 });
+        const r = countDiff(brokenPolicy, { cap: 32, ops: 20000, seed: 131313, keyspace: 80 });
         if (r.ok) die('t9 C8: an S3-FIFO get() that graduates on touch did NOT diverge from the s3fifo oracle (no teeth)');
         check(r.why === 'victim' || r.why === 'value' || r.why === 'size',
             () => 't9 C8: divergence reason was ' + r.why + ' (unexpected)');
@@ -547,7 +560,7 @@ export function run() {
             real: (cap) => wrapWTinyLfu(new AdmitAlwaysWTinyLfu(cap)),
             oracle: (cap) => makeWTinyLfuOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 32, ops: 20000, seed: 246810, keyspace: 80 });
+        const r = countDiff(brokenPolicy, { cap: 32, ops: 20000, seed: 246810, keyspace: 80 });
         if (r.ok) die('t9 C9: a W-TinyLFU that admits-always did NOT diverge from the wtinylfu oracle (no teeth)');
         check(r.why === 'victim' || r.why === 'value' || r.why === 'size',
             () => 't9 C9: divergence reason was ' + r.why + ' (unexpected)');
@@ -563,7 +576,7 @@ export function run() {
             real: (cap) => wrapSlru(new PromoteOnFirstHitSlru(cap)),
             oracle: (cap) => makeSlruOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x51501, keyspace: 40 });
+        const r = countDiff(brokenPolicy, { cap: 16, ops: 20000, seed: 0x51501, keyspace: 40 });
         if (r.ok) die('t9 C-slru-promote-on-first-hit: promoting on the FIRST hit did NOT diverge from the slru oracle (no teeth)');
     }
 
@@ -578,7 +591,7 @@ export function run() {
             real: (cap) => wrapTwoQ(new UnboundedGhostTwoQ(cap)),
             oracle: (cap) => makeTwoQOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x2001, keyspace: 40 });
+        const r = countDiff(brokenPolicy, { cap: 16, ops: 20000, seed: 0x2001, keyspace: 40 });
         if (r.ok) die('t9 C-twoq-unbounded-ghost: an unbounded A1out ghost did NOT diverge from the twoq oracle (no teeth)');
         // Teeth on validate() too: the unbounded ghost violates the conservation bound.
         const c = new UnboundedGhostTwoQ(8);
@@ -587,6 +600,7 @@ export function run() {
         let threw = false;
         try { validate(c); } catch (e) { threw = true; }
         if (!threw) die('t9 C-twoq-unbounded-ghost: validate() passed a ghost over its bound (the ghost-bound term is toothless)');
+        units++;
     }
 
     // --- C-arc-p-frozen (decisions/0016): a pinned `p` -> diverges from the arc oracle
@@ -599,7 +613,7 @@ export function run() {
             real: (cap) => wrapArc(new FrozenPArc(cap)),
             oracle: (cap) => makeArcOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0xA2C01, keyspace: 40 });
+        const r = countDiff(brokenPolicy, { cap: 16, ops: 20000, seed: 0xA2C01, keyspace: 40 });
         if (r.ok) die('t9 C-arc-p-frozen: a pinned `p` did NOT diverge from the arc oracle (no teeth)');
         // Teeth on the phase-change law directly: across a RECENCY phase (B1 hits) an
         // adaptive Arc raises p, but a frozen-p Arc does not. B1 only forms while T2 is
@@ -626,7 +640,7 @@ export function run() {
             real: (cap) => wrapArc(new UnboundedGhostArc(cap)),
             oracle: (cap) => makeArcOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0xA2C02, keyspace: 60 });
+        const r = countDiff(brokenPolicy, { cap: 16, ops: 20000, seed: 0xA2C02, keyspace: 60 });
         if (r.ok) die('t9 C-arc-unbounded-ghost: an unbounded B1/B2 ghost did NOT diverge from the arc oracle (no teeth)');
         // Teeth on validate() too: a MIXED workload (hot recurrence -> T2 promotions, cold
         // churn -> evictions, re-references -> ghost hits) makes the un-trimmed ghost grow
@@ -649,6 +663,7 @@ export function run() {
         let threw = false;
         try { validate(c); } catch (e) { threw = true; }
         if (!threw) die('t9 C-arc-unbounded-ghost: validate() passed a ghost over its bound (the ghost-bound term is toothless)');
+        units++;
     }
 
     // --- C-lirs-drop-ins-bit (decisions/0023): ignoring the inS bit -> diverges --------
@@ -662,7 +677,7 @@ export function run() {
             real: (cap) => wrapLirs(new DropInsBitLirs(cap)),
             oracle: (cap) => makeLirsOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x1145, keyspace: 40 });
+        const r = countDiff(brokenPolicy, { cap: 16, ops: 20000, seed: 0x1145, keyspace: 40 });
         if (r.ok) die('t9 C-lirs-drop-ins-bit: ignoring the inS bit did NOT diverge from the lirs oracle (no teeth)');
     }
 
@@ -677,7 +692,7 @@ export function run() {
             real: (cap) => wrapLirs(new NoHistoryLirs(cap)),
             oracle: (cap) => makeLirsOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x1146, keyspace: 40 });
+        const r = countDiff(brokenPolicy, { cap: 16, ops: 20000, seed: 0x1146, keyspace: 40 });
         if (r.ok) die('t9 C-lirs-no-history: omitting the non-resident history did NOT diverge from the lirs oracle (no teeth)');
     }
 
@@ -692,7 +707,7 @@ export function run() {
             real: (cap) => wrapLfu(new ApproxFreqLfu(cap)),
             oracle: (cap) => makeLfuOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x1f24, keyspace: 40 });
+        const r = countDiff(brokenPolicy, { cap: 16, ops: 20000, seed: 0x1f24, keyspace: 40 });
         if (r.ok) die('t9 C-lfu-approx-freq: saturating the frequency counter did NOT diverge from the exact-lfu oracle (no teeth)');
     }
 
@@ -707,7 +722,7 @@ export function run() {
             real: (cap) => wrapClockPro(new NoAdaptClockPro(cap)),
             oracle: (cap) => makeClockProOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x1c9a, keyspace: 40 });
+        const r = countDiff(brokenPolicy, { cap: 16, ops: 20000, seed: 0x1c9a, keyspace: 40 });
         if (r.ok) die('t9 C-clockpro-no-adapt: freezing the adaptive hot target did NOT diverge from the clockpro oracle (no teeth)');
     }
 
@@ -722,7 +737,7 @@ export function run() {
             real: (cap) => wrapLruK(new LruTiebreakLruK(cap)),
             oracle: (cap) => makeLruKOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x2b1e, keyspace: 40 });
+        const r = countDiff(brokenPolicy, { cap: 16, ops: 20000, seed: 0x2b1e, keyspace: 40 });
         if (r.ok) die('t9 C-lruk-lru-tiebreak: LRU-among-warm did NOT diverge from the lruk oracle (no teeth)');
     }
 
@@ -736,7 +751,7 @@ export function run() {
             real: (cap) => wrapMq(new NoAgingMq(cap)),
             oracle: (cap) => makeMqOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x3c2f, keyspace: 40 });
+        const r = countDiff(brokenPolicy, { cap: 16, ops: 20000, seed: 0x3c2f, keyspace: 40 });
         if (r.ok) die('t9 C-mq-no-aging: freezing the aging sweep did NOT diverge from the mq oracle (no teeth)');
     }
 
@@ -750,7 +765,7 @@ export function run() {
             real: (cap) => wrapCar(new NoAdaptCar(cap)),
             oracle: (cap) => makeCarOracle(cap),
         };
-        const r = runDifferential(brokenPolicy, { cap: 16, ops: 20000, seed: 0x4d0a, keyspace: 40 });
+        const r = countDiff(brokenPolicy, { cap: 16, ops: 20000, seed: 0x4d0a, keyspace: 40 });
         if (r.ok) die('t9 C-car-no-adapt: a pinned `p` did NOT diverge from the car oracle (no teeth)');
         // Teeth on the phase-change law directly: across a RECENCY phase (B1 hits) an adaptive Car
         // raises p, but a no-adapt Car does not. Seed referenced T1 (so REPLACE migrates to T2,
@@ -777,7 +792,7 @@ export function run() {
             real: (cap, o) => wrapLru(new SkipTtlGateLru(cap, o)),
             oracle: (cap, o) => makeLruOracle(cap, o),
         };
-        const r = runDifferential(brokenPolicy, { cap: 8, ops: 20000, seed: 0x7771, keyspace: 20, ttl: 8 });
+        const r = countDiff(brokenPolicy, { cap: 8, ops: 20000, seed: 0x7771, keyspace: 20, ttl: 8 });
         if (r.ok) die('t9 C-skip-gate: a get() that skips the ttl gate did NOT diverge from the ttl oracle (no teeth)');
     }
 
@@ -790,7 +805,7 @@ export function run() {
             real: (cap, o) => wrapLru(new StalePromotesLru(cap, o)),
             oracle: (cap, o) => makeLruOracle(cap, o),
         };
-        const r = runDifferential(brokenPolicy, { cap: 8, ops: 20000, seed: 0x7772, keyspace: 20, ttl: 8 });
+        const r = countDiff(brokenPolicy, { cap: 8, ops: 20000, seed: 0x7772, keyspace: 20, ttl: 8 });
         if (r.ok) die('t9 C-stale-promotes: a get() that promotes a stale hit did NOT diverge from the ttl oracle (no teeth)');
     }
 
@@ -806,6 +821,7 @@ export function run() {
         let threw = false;
         try { validate(c); } catch (e) { threw = true; }
         if (!threw) die('t9 C-growing-_exp: validate() passed a grown _exp buffer (the stability gate is toothless)');
+        units++;
     }
 
     // --- C-iter-generator (decisions/0018, D18.2): a generator-based iterator that
@@ -831,7 +847,7 @@ export function run() {
         const isink = new Int32Array(1);
         let git = gCache.keys();
         const genStep = () => { let r = git.next(); if (r.done) git = gCache.keys(); isink[0] += r.value | 0; };
-        const gGate = runAllocsGate(genStep, { iterations: 50000, batches: 8 });
+        const gGate = countAllocs(genStep, { iterations: 50000, batches: 8 });
         if (gGate.ok) {
             die('t9 C-iter-generator: a generator-based iterator that allocates per step PASSED the ' +
                 'iterStep alloc gate (no teeth) -- bytesPerCall=' + gGate.bytesPerCall);
@@ -839,7 +855,7 @@ export function run() {
         // Non-vacuity: the real hand-written iterator over the SAME body is 0 B/op.
         let rit = rCache.keys();
         const realStep = () => { let r = rit.next(); if (r.done) rit = rCache.keys(); isink[0] += r.value | 0; };
-        const rGate = runAllocsGate(realStep, { iterations: 50000, batches: 8 });
+        const rGate = countAllocs(realStep, { iterations: 50000, batches: 8 });
         if (!rGate.ok) {
             die('t9 C-iter-generator: the hand-written iterator FAILED its own zero-alloc gate (vacuous) -- ' +
                 'verdict=' + rGate.report.verdict + ' settled=' + rGate.result.settled + ' bytesPerCall=' + rGate.bytesPerCall);
@@ -1060,17 +1076,19 @@ export function run() {
         ];
         for (const ctl of controls) {
             // Non-vacuity: the CORRECT round-trip agrees with the twin (also proven in t5).
-            const okr = runRoundTrip(ctl.real, cfg);
+            const okr = countRt(ctl.real, cfg);
             if (!okr.ok) {
                 die('t9 C-snap-' + ctl.name + ': the CORRECT round-trip diverged (' + okr.why +
                     ') -- the differential is vacuous');
             }
             // Teeth: dropping the aux state MUST diverge from the twin.
-            const br = runRoundTrip(ctl.broken, cfg);
+            const br = countRt(ctl.broken, cfg);
             if (br.ok) {
                 die('t9 C-snap-' + ctl.name + ': a restore that drops the aux state did NOT diverge ' +
                     'from the twin (the round-trip differential is toothless)');
             }
         }
     }
+
+    return units;
 }

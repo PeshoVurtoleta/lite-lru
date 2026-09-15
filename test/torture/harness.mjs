@@ -56,7 +56,9 @@ export const SEED = (() => {
 /** Deliberately-broken control mode: injects a retained allocation into the T6 hot loop. */
 export const BREAK = process.env.LLRU_TORTURE_BREAK === '1';
 
-/** Base zero-GC rules. maxArrayBuffersGrowth needs measureOps stabilize:'deep'. */
+/** Zero-GC gate scope: zero MAJOR GCs + zero retained bytes + no buffer growth; minor
+ *  GCs (transient scavenges) are not individually gated -- sustained transient allocation
+ *  surfaces via promotion to major. maxArrayBuffersGrowth needs measureOps stabilize:'deep'. */
 export const RULES = { maxMajor: 0, maxPauseMs: 4, maxArrayBuffersGrowth: 0 };
 
 /** Smallest heap object V8 can place: the floor of any real retention regression. */
@@ -70,7 +72,7 @@ export function makePrng(seed) {
     let x = (seed >>> 0) || 1;
     return function next() {
         x ^= x << 13; x >>>= 0;
-        x ^= x >> 17;
+        x ^= x >>> 17;
         x ^= x << 5; x >>>= 0;
         return x >>> 0;
     };

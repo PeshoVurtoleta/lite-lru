@@ -6,11 +6,15 @@
  * divergence the runner returns a record; this tier prints the seed + op index so
  * the case replays via  TORTURE_SEED=<n> node --expose-gc test/torture.mjs.
  *
- * THREE policies are driven, proving the runner is policy-parameterized (not a
- * single-policy harness): classic LRU on the DEFAULT Map backing, classic LRU on
- * the INTEGER substrate backing (`keys: 'int'`) -- BOTH against the SAME lru oracle
- * so the substrate is byte-identical (decisions/0011) -- and FIFO (real Map+queue
- * vs brute array oracle). A future member is a fourth line.
+ * All 13 policies are driven through the ONE parameterized runner, proving it is
+ * policy-parameterized (not a single-policy harness): every member on BOTH backings
+ * (the DEFAULT Map and the INTEGER open-addressed substrate `keys: 'int'`, each
+ * against the SAME per-member oracle so the substrate is byte-identical,
+ * decisions/0011), the FIFO SEAM policy (real Map+queue vs a brute array oracle),
+ * the TTL virtual-clock lanes (per-put ttlMs, entries expiring mid-stream against
+ * the lazy-stale oracle, decisions/0017), and the SNAPSHOT round-trip lanes (every
+ * member x both backings x ttl off/on: dump -> restore -> dump is a fixed point and
+ * the restored twin decides FUTURE evictions identically, decisions/0021).
  */
 
 import {
@@ -33,8 +37,10 @@ import {
 
 const OPS = 100000;
 
-/** Run one policy across several capacities and keyspaces; die on any divergence. */
+/** Run one policy across several capacities and keyspaces; die on any divergence.
+ *  Returns the number of differential configs completed (a liveness work-unit count). */
 function fuzzPolicy(policy, configs) {
+    let done = 0;
     for (let ci = 0; ci < configs.length; ci++) {
         const cfg = configs[ci];
         const seed = (SEED ^ cfg.salt) >>> 0 || 1;
@@ -45,10 +51,13 @@ function fuzzPolicy(policy, configs) {
                 ' kind=' + r.kind + ' cap=' + cfg.cap + ' keyspace=' + cfg.keyspace +
                 '\n  replay: TORTURE_SEED=' + SEED + ' node --expose-gc test/torture.mjs');
         }
+        done++;
     }
+    return done;
 }
 
 export function run() {
+    let units = 0; // work units: differential fuzz configs + snapshot round-trip lanes completed
     // Keyspace tuned so hits and evictions both happen often: keyspace ~ 2..4x cap.
     const lruConfigs = [
         { cap: 1, keyspace: 4, ops: OPS, salt: 0x51 },   // degenerate cap-1
@@ -56,18 +65,18 @@ export function run() {
         { cap: 64, keyspace: 200, ops: OPS, salt: 0x53 },
         { cap: 256, keyspace: 300, ops: OPS, salt: 0x54 }, // high hit rate
     ];
-    fuzzPolicy(lruPolicy, lruConfigs);
+    units += fuzzPolicy(lruPolicy, lruConfigs);
 
     // The SUBSTRATE proof (decisions/0011): the integer open-addressed backing is
     // driven across the SAME corpus against the SAME lru oracle -- identical values
     // + victims. Keys are `prng() % keyspace` (non-negative int32), valid int-mode.
-    fuzzPolicy(lruIntPolicy, lruConfigs);
+    units += fuzzPolicy(lruIntPolicy, lruConfigs);
 
     // The MEMBER proof (decisions/0012): SIEVE on BOTH backings against its own
     // independent oracle -- same value AND same next victim AND same size after
     // every op. The int backing rides the SAME strict-zero substrate.
-    fuzzPolicy(sievePolicy, lruConfigs);
-    fuzzPolicy(sieveIntPolicy, lruConfigs);
+    units += fuzzPolicy(sievePolicy, lruConfigs);
+    units += fuzzPolicy(sieveIntPolicy, lruConfigs);
 
     // The S3-FIFO MEMBER proof (decisions/0013): admission control on BOTH backings
     // against its own independent three-structure oracle -- same value AND same next
@@ -80,8 +89,8 @@ export function run() {
         s3Configs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0x70 + cap });
     }
     s3Configs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0x7f });
-    fuzzPolicy(s3fifoPolicy, s3Configs);
-    fuzzPolicy(s3fifoIntPolicy, s3Configs);
+    units += fuzzPolicy(s3fifoPolicy, s3Configs);
+    units += fuzzPolicy(s3fifoIntPolicy, s3Configs);
 
     // The W-TinyLFU MEMBER proof (decisions/0014): window + SLRU + count-min sketch on
     // BOTH backings against its own independent oracle -- same value AND same next
@@ -95,8 +104,8 @@ export function run() {
         wConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0x90 + cap });
     }
     wConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0x9f });
-    fuzzPolicy(wtinylfuPolicy, wConfigs);
-    fuzzPolicy(wtinylfuIntPolicy, wConfigs);
+    units += fuzzPolicy(wtinylfuPolicy, wConfigs);
+    units += fuzzPolicy(wtinylfuIntPolicy, wConfigs);
 
     // The Slru MEMBER proof (decisions/0015): the Segmented-LRU member on BOTH backings
     // against its own independent probation/protected oracle -- same value AND same next
@@ -108,8 +117,8 @@ export function run() {
         slruConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0xb0 + cap });
     }
     slruConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0xbf });
-    fuzzPolicy(slruPolicy, slruConfigs);
-    fuzzPolicy(slruIntPolicy, slruConfigs);
+    units += fuzzPolicy(slruPolicy, slruConfigs);
+    units += fuzzPolicy(slruIntPolicy, slruConfigs);
 
     // The TwoQ MEMBER proof (decisions/0015): the full-2Q member on BOTH backings against
     // its own independent A1in/Am/A1out-ghost oracle -- same value AND same next victim
@@ -121,8 +130,8 @@ export function run() {
         twoqConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0xc0 + cap });
     }
     twoqConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0xcf });
-    fuzzPolicy(twoqPolicy, twoqConfigs);
-    fuzzPolicy(twoqIntPolicy, twoqConfigs);
+    units += fuzzPolicy(twoqPolicy, twoqConfigs);
+    units += fuzzPolicy(twoqIntPolicy, twoqConfigs);
 
     // The Arc MEMBER proof (decisions/0016): the adaptive member on BOTH backings against
     // its own independent two-list/two-ghost/`p` oracle -- same value AND same next victim
@@ -135,8 +144,8 @@ export function run() {
         arcConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0xd0 + cap });
     }
     arcConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0xdf });
-    fuzzPolicy(arcPolicy, arcConfigs);
-    fuzzPolicy(arcIntPolicy, arcConfigs);
+    units += fuzzPolicy(arcPolicy, arcConfigs);
+    units += fuzzPolicy(arcIntPolicy, arcConfigs);
 
     // The Lirs MEMBER proof (decisions/0023): the LIRS member on BOTH backings against its
     // own independent stack-S / Q / bounded-history oracle -- same value AND same next victim
@@ -150,8 +159,8 @@ export function run() {
     }
     lirsConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0xef });
     lirsConfigs.push({ cap: 256, keyspace: 300, ops: OPS, salt: 0xe1f });
-    fuzzPolicy(lirsPolicy, lirsConfigs);
-    fuzzPolicy(lirsIntPolicy, lirsConfigs);
+    units += fuzzPolicy(lirsPolicy, lirsConfigs);
+    units += fuzzPolicy(lirsIntPolicy, lirsConfigs);
 
     // The Lfu MEMBER proof (decisions/0024): the exact-LFU member on BOTH backings against
     // its own independent exact-frequency + LRU-tie-break oracle -- same value AND same next
@@ -164,8 +173,8 @@ export function run() {
     }
     lfuConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0xff });
     lfuConfigs.push({ cap: 256, keyspace: 300, ops: OPS, salt: 0xf1f });
-    fuzzPolicy(lfuPolicy, lfuConfigs);
-    fuzzPolicy(lfuIntPolicy, lfuConfigs);
+    units += fuzzPolicy(lfuPolicy, lfuConfigs);
+    units += fuzzPolicy(lfuIntPolicy, lfuConfigs);
 
     // The ClockPro MEMBER proof (decisions/0025): the CLOCK-approximation-of-LIRS member on
     // BOTH backings against its own independent clock/three-hand/bounded-history oracle -- same
@@ -183,8 +192,8 @@ export function run() {
     }
     clockProConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0x1af });
     clockProConfigs.push({ cap: 256, keyspace: 300, ops: OPS, salt: 0x1a1f });
-    fuzzPolicy(clockProPolicy, clockProConfigs);
-    fuzzPolicy(clockProIntPolicy, clockProConfigs);
+    units += fuzzPolicy(clockProPolicy, clockProConfigs);
+    units += fuzzPolicy(clockProIntPolicy, clockProConfigs);
 
     // The LruK MEMBER proof (decisions/0026): the LRU-K (K=2) member on BOTH backings against
     // its own independent cold/warm/reference-time/bounded-history oracle -- same value AND same
@@ -198,8 +207,8 @@ export function run() {
         lrukConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0x2b0 + cap });
     }
     lrukConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0x2bf });
-    fuzzPolicy(lrukPolicy, lrukConfigs);
-    fuzzPolicy(lrukIntPolicy, lrukConfigs);
+    units += fuzzPolicy(lrukPolicy, lrukConfigs);
+    units += fuzzPolicy(lrukIntPolicy, lrukConfigs);
 
     // The Mq MEMBER proof (decisions/0027): the Multi-Queue (m=8) member on BOTH backings against
     // its own independent 8-band/refcount/logical-clock/bounded-Qout oracle -- same value AND same
@@ -213,8 +222,8 @@ export function run() {
         mqConfigs.push({ cap, keyspace: cap * 3 + 2, ops: OPS, salt: 0x3c0 + cap });
     }
     mqConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0x3cf });
-    fuzzPolicy(mqPolicy, mqConfigs);
-    fuzzPolicy(mqIntPolicy, mqConfigs);
+    units += fuzzPolicy(mqPolicy, mqConfigs);
+    units += fuzzPolicy(mqIntPolicy, mqConfigs);
 
     // The Car MEMBER proof (decisions/0028): the CLOCK-reformulation-of-ARC member on BOTH
     // backings against its own independent two-clock/two-ghost/`p` oracle -- same value AND same
@@ -230,11 +239,11 @@ export function run() {
     }
     carConfigs.push({ cap: 64, keyspace: 200, ops: OPS, salt: 0x4df });
     carConfigs.push({ cap: 256, keyspace: 300, ops: OPS, salt: 0x4d1f });
-    fuzzPolicy(carPolicy, carConfigs);
-    fuzzPolicy(carIntPolicy, carConfigs);
+    units += fuzzPolicy(carPolicy, carConfigs);
+    units += fuzzPolicy(carIntPolicy, carConfigs);
 
     // The SEAM proof: the SAME runner drives a second policy unchanged.
-    fuzzPolicy(fifoPolicy, [
+    units += fuzzPolicy(fifoPolicy, [
         { cap: 1, keyspace: 4, ops: OPS, salt: 0x61 },
         { cap: 8, keyspace: 24, ops: OPS, salt: 0x62 },
         { cap: 64, keyspace: 200, ops: OPS, salt: 0x63 },
@@ -250,19 +259,19 @@ export function run() {
         { cap: 8, keyspace: 24, ops: OPS, salt: 0xa1, ttl: 8 },
         { cap: 64, keyspace: 200, ops: OPS, salt: 0xa2, ttl: 8 },
     ];
-    fuzzPolicy(lruTtlPolicy, ttlConfigs);
-    fuzzPolicy(sieveTtlPolicy, ttlConfigs);
-    fuzzPolicy(s3fifoTtlPolicy, ttlConfigs);
-    fuzzPolicy(wtinylfuTtlPolicy, ttlConfigs);
-    fuzzPolicy(slruTtlPolicy, ttlConfigs);
-    fuzzPolicy(twoqTtlPolicy, ttlConfigs);
-    fuzzPolicy(arcTtlPolicy, ttlConfigs);
-    fuzzPolicy(lirsTtlPolicy, ttlConfigs);
-    fuzzPolicy(lfuTtlPolicy, ttlConfigs);
-    fuzzPolicy(clockProTtlPolicy, ttlConfigs);
-    fuzzPolicy(lrukTtlPolicy, ttlConfigs);
-    fuzzPolicy(mqTtlPolicy, ttlConfigs);
-    fuzzPolicy(carTtlPolicy, ttlConfigs);
+    units += fuzzPolicy(lruTtlPolicy, ttlConfigs);
+    units += fuzzPolicy(sieveTtlPolicy, ttlConfigs);
+    units += fuzzPolicy(s3fifoTtlPolicy, ttlConfigs);
+    units += fuzzPolicy(wtinylfuTtlPolicy, ttlConfigs);
+    units += fuzzPolicy(slruTtlPolicy, ttlConfigs);
+    units += fuzzPolicy(twoqTtlPolicy, ttlConfigs);
+    units += fuzzPolicy(arcTtlPolicy, ttlConfigs);
+    units += fuzzPolicy(lirsTtlPolicy, ttlConfigs);
+    units += fuzzPolicy(lfuTtlPolicy, ttlConfigs);
+    units += fuzzPolicy(clockProTtlPolicy, ttlConfigs);
+    units += fuzzPolicy(lrukTtlPolicy, ttlConfigs);
+    units += fuzzPolicy(mqTtlPolicy, ttlConfigs);
+    units += fuzzPolicy(carTtlPolicy, ttlConfigs);
 
     // The SNAPSHOT proof (decisions/0021): for EVERY member, on BOTH backings, ttl OFF
     // and ttl ON, over the 100k corpus -- dump -> restore -> dump is a fixed point AND a
@@ -302,7 +311,10 @@ export function run() {
                         ' keys=' + String(lane.keys) + ' ttl=' + String(lane.ttl) +
                         '\n  replay: TORTURE_SEED=' + SEED + ' node --expose-gc test/torture.mjs');
                 }
+                units++; // one snapshot round-trip lane completed
             }
         }
     }
+
+    return units;
 }

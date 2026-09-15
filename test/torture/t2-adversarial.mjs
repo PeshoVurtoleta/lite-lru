@@ -13,7 +13,9 @@ import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro,
 import { makePrng, SEED, check, validate, wrapLru, wrapWTinyLfu, wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK, wrapMq, wrapCar } from './harness.mjs';
 
 export function run() {
+    let units = 0; // work units: adversarial scenarios completed
     // --- A: re-hit the MRU N times (the head-re-hit fast path) -------------------
+    units++;
     {
         const c = new LiteLru(8);
         for (let i = 0; i < 8; i++) c.put(i, i);
@@ -27,6 +29,7 @@ export function run() {
     }
 
     // --- B: re-hit the tail then insert, repeatedly ------------------------------
+    units++;
     {
         const c = new LiteLru(8, { onEvict: () => {} });
         for (let i = 0; i < 8; i++) c.put(i, i);
@@ -41,6 +44,7 @@ export function run() {
     }
 
     // --- C: alternate insert/delete at the free-list boundary --------------------
+    units++;
     {
         const c = new LiteLru(3);
         for (let r = 0; r < 500; r++) {
@@ -61,6 +65,7 @@ export function run() {
     }
 
     // --- D: fill / delete-all (3 orders) / refill, conservation each phase -------
+    units++;
     {
         const CAP = 32;
         const prng = makePrng(SEED ^ 0xd0);
@@ -93,6 +98,7 @@ export function run() {
     }
 
     // --- E: single-capacity cache (head===tail whenever non-empty) --------------
+    units++;
     {
         let evictions = 0;
         const c = new LiteLru(1, { onEvict: () => { evictions++; } });
@@ -113,6 +119,7 @@ export function run() {
     }
 
     // --- F: clear() mid-life then reuse, conservation intact --------------------
+    units++;
     {
         const c = new LiteLru(16);
         for (let i = 0; i < 10; i++) c.put(i, i);
@@ -127,6 +134,7 @@ export function run() {
     }
 
     // --- G: SIEVE scan resistance -- a hot key survives a one-hit-wonder flood ---
+    units++;
     // The canonical SIEVE property (decisions/0012): a repeatedly-accessed key stays
     // visited, so the sweeping hand always grants it a second chance and it survives
     // an unbounded scan of unique one-hit-wonder keys. A plain FIFO would evict it.
@@ -154,6 +162,7 @@ export function run() {
     }
 
     // --- H: S3-FIFO scan flood -- a proven-hot SET survives distinct one-hit keys -
+    units++;
     // (decisions/0013) S3-FIFO admits newcomers to SMALL (probation); a distinct
     // one-hit-wonder each op enters SMALL unvisited and sweeps straight out. A hot
     // set kept visited graduates to MAIN and keeps earning second chances, so the
@@ -184,6 +193,7 @@ export function run() {
     }
 
     // --- I: W-TinyLFU degenerate caps + proven-hot-set survival ------------------
+    units++;
     // (decisions/0014) Two adversarial angles. First the degenerate small caps where
     // main==0 (cap 1) or probation==0 (cap 2/3): every put churns, head/tail stay
     // coherent, conservation holds. Then a proven-hot SET survives a distinct one-hit
@@ -228,6 +238,7 @@ export function run() {
     }
 
     // --- K: Slru degenerate caps + a cap-sized scan evicts 0 protected (decisions/0015)
+    units++;
     {
         const SLRU_PROTECTED = 1;
         for (const cap of [1, 2, 3]) {
@@ -266,6 +277,7 @@ export function run() {
     }
 
     // --- L: TwoQ degenerate caps + a cap-sized scan evicts 0 Am (decisions/0015) -
+    units++;
     {
         const TWOQ_AM = 1;
         for (const cap of [1, 2, 3]) {
@@ -309,6 +321,7 @@ export function run() {
     }
 
     // --- M: Arc degenerate caps + scan flood + the PHASE-CHANGE law (decisions/0016) -
+    units++;
     {
         const ARC_T2 = 1;
         // Degenerate caps 1/2/3: every put churns, head/tail stay coherent, conservation
@@ -394,6 +407,7 @@ export function run() {
 
     // --- O: Lirs degenerate caps + the ADVERSARIAL max-pruning trace + scan/loop
     // resistance + conservation (decisions/0023) -----------------------------------
+    units++;
     {
         const LIRS_LIR = 1;
         // Degenerate caps 1..4: every put churns, conservation holds, the split is honored
@@ -469,6 +483,7 @@ export function run() {
 
     // --- P: Lfu degenerate caps + exact-frequency law + the min-bucket eviction +
     // in-place-relabel + scan resistance + conservation (decisions/0024) ------------
+    units++;
     {
         // Degenerate caps 1..4: every put churns, conservation holds, and the exact
         // frequency of a repeatedly-touched key climbs by exactly one per access.
@@ -527,6 +542,7 @@ export function run() {
 
     // --- Q: ClockPro degenerate caps + reference-bit second chance + scan resistance +
     // the bounded-history bound + conservation (decisions/0025) --------------------
+    units++;
     {
         // Degenerate caps 1..4: every put churns, conservation holds, the history stays
         // bounded, and hot+cold == size always.
@@ -571,6 +587,7 @@ export function run() {
 
     // --- R: LruK degenerate caps + cold-first eviction + all-warm min-r1 scan +
     // the bounded-history bound + conservation (decisions/0026) --------------------
+    units++;
     {
         // Degenerate caps 1..4: every put churns, conservation holds, the history stays
         // bounded, |cold| + |warm| == size, and every cold page sits at the -Infinity sentinel.
@@ -635,6 +652,7 @@ export function run() {
 
     // --- S: Mq degenerate caps + band decay + lowest-queue eviction + bounded Qout +
     // conservation (decisions/0027) --------------------------------------------------
+    units++;
     {
         // Degenerate caps 1..4: every put churns, conservation holds, Qout stays bounded,
         // sum(|Q0..Q7|) == size, and every resident's _qn is a valid 0..7 band index.
@@ -683,6 +701,7 @@ export function run() {
 
     // --- T: Car degenerate caps + reference-bit second chance + scan resistance + the
     // PHASE-CHANGE p law + the two ghost bounds + conservation (decisions/0028) -----
+    units++;
     {
         const CAR_T2 = 2;
         // Degenerate caps 1..4: every put churns, conservation holds, both ghost bounds respected,
@@ -768,6 +787,7 @@ export function run() {
     }
 
     // --- J: the LAZY-SEMANTICS TRIPLE as executable laws (decisions/0017, D17.3) --
+    units++;
     // For EVERY member: an expired entry is a MISS through get/has/peek alike, and each
     // of the three REAPS it in place (fires onEvict once, size drops). A fresh Infinity
     // sibling is untouched by any of them. validate() nets each reap.
@@ -865,4 +885,6 @@ export function run() {
             }
         }
     }
+
+    return units;
 }

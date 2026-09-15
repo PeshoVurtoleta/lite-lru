@@ -31,7 +31,7 @@ const isRef = (c, k) => (stOf(c, k) & REF) !== 0;
 const isTest = (c, k) => (stOf(c, k) & TEST) !== 0;
 
 test('ClockPro: VERSION is the current, un-bumped value (moves only at /release)', () => {
-    assert.equal(VERSION, '1.15.0');
+    assert.equal(VERSION, '1.16.0');
 });
 
 test('ClockPro: fail-closed capacity -- non-integer / < 1 throws RangeError', () => {
@@ -364,6 +364,178 @@ test('ClockPro: worst-case miss+evict SCALES with capacity -- a full-scan-then-i
         '64->256 (4x capacity) write ratio ' + ratio64to256.toFixed(2) + ' is not consistent with O(capacity) scaling');
     assert.ok(ratio256to1024 > 2 && ratio256to1024 < 8,
         '256->1024 (4x capacity) write ratio ' + ratio256to1024.toFixed(2) + ' is not consistent with O(capacity) scaling');
+});
+
+/* -------------------------------------------------------------------------------- *
+ * HAND-DERIVED VICTIM ORDER (qa TASK 1, CHANGELOG.md:34): ClockPro and CAR share the
+ * SAME circular-clock geometry (a NIL-terminated head=newest..tail=oldest DLL whose
+ * hand wraps `_advance(_tail) -> _head`, decisions/0025 D25.1 / decisions/0028 D28.1)
+ * as the t5 differential oracles they are checked against -- a regression in the
+ * SHARED wrap-around traversal math would reproduce identically on both sides of the
+ * differential and cancel (the same blind spot test/Arc.test.js pins for ARC's shared
+ * ghost-trim geometry). These cases derive the EXACT eviction order BY HAND from
+ * D25.1 (clock realization) + D25.3 (`_mHot`) + `_evictOne` (D25.5's honest-cost
+ * text), tracing slot assignment, ring contents, all three hand positions and `_st`
+ * bits after every op -- never by running ClockPro and transcribing its output. (The
+ * derivation was cross-checked step-by-step against the live member during QA -- as
+ * the Arc suite's precedent documents doing -- and agreed at every step; no
+ * discrepancy was found.)
+ *
+ * Slot assignment fact used throughout (D2/D4): a FRESH store's free stack is
+ * 0 -> 1 -> ... -> capacity-1, popped in order, so `new ClockPro(4)` then
+ * `put(0)`,`put(1)`,`put(2)`,`put(3)` (all true misses) assigns key i to slot i.
+ * SLOTS are fixed physical columns and get REUSED by the next inserted key on
+ * eviction -- every line below is written `slot:key` to keep the two distinct; the
+ * hands (`_handCold`/`_handHot`/`_handTest`) are always SLOT indices, never keys.
+ *
+ * A capacity-4 test-period case that ALSO changes the immediate outcome in one step
+ * is not cleanly hand-derivable: at this size all three hands start colocated on the
+ * same slot and re-synchronize after every eviction (see case (b) below), so a plain
+ * reference during the test period nets the SAME residency for the referenced page
+ * either way (promoted, then immediately demoted back since `_mHot` is still 0) --
+ * the only way to make the test period matter LASTINGLY at cap 4 is via the bounded-
+ * history re-admit path (D25.3's OTHER `_mHot`-raising rule), which is what case (c)
+ * uses instead, per this task's documented fallback.
+ * -------------------------------------------------------------------------------- */
+
+test('ClockPro HAND-DERIVED (a): no-reference straight rotation -- the hand wraps ' +
+    'tail -> head, so eviction order is NOT plain insertion order past the first victim', () => {
+    // Trace, entirely by hand from D25.1 (`_pushFront` always inserts at HEAD; `_next`
+    // points head->tail; ALL THREE hands start colocated at the first-ever insert,
+    // both head and tail; `_advance`/`_ringSucc` wrap `_next[tail] -> _head`):
+    //
+    //  put(0): ring [head..tail] = 0:0.                   all hands = slot0 (sole entry)
+    //  put(1): ring = 1:1, 0:0.                            hands unchanged (push touches only head)
+    //  put(2): ring = 2:2, 1:1, 0:0.                       hands unchanged
+    //  put(3): ring = 3:3, 2:2, 1:1, 0:0. all st=TEST(4).  hands = slot0 (the TAIL, oldest, key0)
+    //
+    //  put(4): `_evictOne`: nCold=4 (no demote-guarantee needed). c=handCold=slot0
+    //    (key0). st=TEST, not HOT, not REF -> unreferenced cold -> IMMEDIATE VICTIM:
+    //    key 0 (a test page, so it is remembered in the bounded history). Ring
+    //    successor of the TAIL (next[slot0]=NIL) wraps to the CURRENT head (slot3,
+    //    the newest resident) -- NOT to the second-oldest (slot1/key1); ALL THREE
+    //    hands were colocated at slot0, so all three move to slot3 together. slot0
+    //    is freed and reused for key4 (a fresh cold/test page):
+    //    ring = 0:4, 3:3, 2:2, 1:1(tail).                  all hands = slot3
+    //
+    //  put(5): c=handCold=slot3 (key3), unreferenced -> VICTIM: key 3. next[slot3]=
+    //    slot2 (a REGULAR link, slot3 is not the tail) -> ringSucc=2, no wrap. slot3
+    //    freed, reused for key5: ring = 3:5, 0:4, 2:2, 1:1(tail).   all hands = slot2
+    //
+    //  put(6): c=handCold=slot2 (key2), unreferenced -> VICTIM: key 2. next[slot2]=
+    //    slot1 (regular) -> ringSucc=1. slot2 freed, reused for key6:
+    //    ring = 2:6, 3:5, 0:4, 1:1(tail).                  all hands = slot1
+    //
+    //  put(7): c=handCold=slot1 (key1, the tail again), unreferenced -> VICTIM: key 1.
+    //    next[slot1]=NIL (still the tail) -> WRAPS again to the CURRENT head (slot2,
+    //    which now holds key6) -- NOT slot index "6". slot1 freed, reused for key7:
+    //    ring = 1:7, 2:6, 3:5, 0:4(tail).                  all hands = slot2
+    //
+    // So the FIRST FOUR victims are, in order: 0, 3, 2, 1 -- IDENTICAL to CAR's T1
+    // rotation (the shared clock geometry), not plain FIFO 0, 1, 2, 3.
+    const order = [];
+    const c = new ClockPro(4, { onEvict: (k) => order.push(k) });
+    for (let i = 0; i < 4; i++) c.put(i, i);
+    assert.equal(c._handCold, 0, 'setup: all three hands park at the first-ever insert (the tail)');
+    c.put(4, 4); c.put(5, 5); c.put(6, 6); c.put(7, 7);
+    assert.deepEqual(order, [0, 3, 2, 1], 'HAND-DERIVED: the tail-wrap victim order, not plain FIFO 0,1,2,3');
+    assert.equal(c._handCold, 2, 'HAND-DERIVED: handCold parks on slot 2 (holding key6) after the fourth eviction');
+    assert.equal(c._keys[c._handCold], 6, 'HAND-DERIVED: slot 2 was reused for key6 by the time the hand re-parks there');
+    assert.equal(c._handHot, c._handCold, 'HAND-DERIVED: all three hands stay colocated (no reference activity ever ran)');
+    assert.equal(c._handTest, c._handCold, 'HAND-DERIVED: all three hands stay colocated (no reference activity ever ran)');
+    validate(c);
+});
+
+test('ClockPro HAND-DERIVED (b): the reference-bit second chance -- a referenced ' +
+    'test-period page is PROMOTED (then immediately demoted, _mHot==0) instead of ' +
+    'evicted; the sweep continues and evicts the NEXT unreferenced page', () => {
+    // Same fill as (a): ring = 3:3,2:2,1:1,0:0 (head..tail), all hands = slot0, all
+    // st=TEST(4). Now `get(0)`: D25.5's hit path is `_st[s] |= CLOCKPRO_REF` only (0
+    // link writes) -> st[slot0] = TEST|REF = 4|2 = 6. Topology is UNCHANGED.
+    //
+    //  put(4): `_evictOne`: c=handCold=slot0. st=6: not HOT (bit0=0); REF set (bit1);
+    //    TEST set (bit2) -> the page is COLD, REFERENCED, IN ITS TEST PERIOD ->
+    //    PROMOTED to hot (D25.3): st[slot0] <- HOT(1) only (ref+test cleared),
+    //    nHot 0->1, nCold 4->3. handCold advances (next[slot0]=NIL, wraps to head
+    //    slot3) -> handCold <- 3. `_handTestStep()` then reads handTest (still
+    //    slot0): st[slot0] is now HOT, so the "test period ends" branch does NOT
+    //    fire (a hot page is never in test); handTest unconditionally advances to
+    //    slot3 too. Since `_mHot` is still 0, `nHot(1) > _mHot(0)` -> `_handHotDemote`
+    //    runs: handHot (still slot0) is HOT and UNREFERENCED (the promote overwrote
+    //    st to bare HOT) -> DEMOTED back to cold/test: st[slot0] <- TEST(4),
+    //    nHot 1->0, nCold 3->4; handHot advances to slot3 too. The sweep CONTINUES
+    //    (the promote branch `continue`s): c=handCold=slot3 (key3), st=TEST(4),
+    //    unreferenced -> THIS is the actual VICTIM: key 3. wasTest=true -> key3
+    //    goes to the bounded history. ringSucc(slot3)=slot2 (regular) -> ALL THREE
+    //    hands (recolocated at slot3 by the cascade above) move to slot2 together.
+    //    slot3 is freed and reused for key4 (fresh cold/test):
+    //    ring = 3:4, 0:0, 2:2, 1:1(tail).      all hands = slot2, nHot=0, nCold=4
+    //
+    // Net: key0 was never evicted -- it took a round trip through HOT and back to
+    // cold/TEST (a real, if momentary, second chance) while key3, untouched the
+    // whole time, is the page actually reclaimed.
+    const order = [];
+    const c = new ClockPro(4, { onEvict: (k) => order.push(k) });
+    for (let i = 0; i < 4; i++) c.put(i, i);
+    c.get(0); // reference the hand's current position only
+    c.put(4, 4);
+    assert.deepEqual(order, [3], 'HAND-DERIVED: key3 (not key0) is the actual victim');
+    assert.ok(c.has(0), 'the referenced page survived the sweep');
+    assert.equal(stOf(c, 0), TEST, 'HAND-DERIVED: key0 round-tripped through HOT and back to cold/TEST, ref cleared');
+    assert.equal(c._nHot, 0, 'HAND-DERIVED: the momentary promotion was immediately demoted (_mHot stayed 0)');
+    assert.equal(c._nCold, 4, 'HAND-DERIVED: the resident cold count is back to capacity');
+    assert.equal(c._handCold, 2, 'HAND-DERIVED: all three hands re-park on slot 2 after the eviction');
+    assert.equal(c._handHot, 2, 'HAND-DERIVED: handHot recolocated with handCold');
+    assert.equal(c._handTest, 2, 'HAND-DERIVED: handTest recolocated with handCold');
+    validate(c);
+});
+
+test('ClockPro HAND-DERIVED (c): a bounded-history re-admit promotes STICKILY to ' +
+    'hot and raises _mHot, changing every subsequent victim -- the test-period-' +
+    'derived third case (D25.3, documented fallback: a same-step test-period flip ' +
+    'is not cleanly derivable at capacity <= 4, see the suite header above)', () => {
+    // Fill as (a): ring = 3:3,2:2,1:1,0:0, all hands = slot0, all st=TEST, _mHot=0.
+    //
+    //  put(4): identical to (a)'s first step (no references anywhere) -> IMMEDIATE
+    //    VICTIM key 0 (unreferenced tail), a test page -> remembered in the bounded
+    //    history (`_hist` = {0}). All hands wrap tail(slot0) -> head(slot3). slot0
+    //    reused for key4: ring = 0:4, 3:3, 2:2, 1:1(tail).  all hands = slot3, _mHot=0
+    //
+    //  put(0, 'reborn'): key0 is NOT resident (a true miss on the index) but IS still
+    //    in `_hist` -- `inHist=true`. Being at capacity, `_evictOne` STILL runs FIRST
+    //    (D25's insert order: evict, then re-admit): c=handCold=slot3 (key3),
+    //    unreferenced -> VICTIM: key 3 (a test page -> also remembered: `_hist` =
+    //    {0, 3}). ringSucc(slot3)=slot2 (regular) -> all hands -> slot2. slot3 freed.
+    //    THEN the re-admit branch runs: `_hist.consume(0)` (hist = {3}), `_mHot`
+    //    0->1 (D25.3's re-admit-raises rule), key0 inserted into the freed slot3 as
+    //    HOT DIRECTLY (st[slot3] <- HOT(1), nHot 0->1, nCold stays 3): pushed to the
+    //    CURRENT head (slot0/key4): ring = 3:0("reborn"), 0:4, 2:2, 1:1(tail).
+    //    `nHot(1) > _mHot(1)` is FALSE -> no immediate demotion (UNLIKE case (b),
+    //    where `_mHot` was still 0). Hands stay at slot2 (untouched by a re-admit).
+    //    Final: nHot=1, nCold=3, _mHot=1 -- key0 is now PERSISTENTLY hot.
+    //
+    // Because `_handHotDemote` only ever fires while `nHot > _mHot`, and both are 1,
+    // key0 is skipped by every future cold sweep indefinitely: the SAME shape of
+    // churn that evicted every other page in rotation (case (a)) now evicts
+    // everything EXCEPT key0. This is the test-period history mattering LASTINGLY,
+    // not just for one step.
+    const order = [];
+    const c = new ClockPro(4, { onEvict: (k) => order.push(k) });
+    for (let i = 0; i < 4; i++) c.put(i, i);
+    c.put(4, 4); // evicts key0 (unreferenced tail) -> remembered in the bounded history
+    assert.deepEqual(order, [0], 'setup: key0 evicted first, exactly as in case (a)');
+    assert.ok(c._hist.has(0), 'setup: the evicted test page is remembered');
+    c.put(0, 'reborn'); // key0 is still in history -> sticky HOT re-admit
+    assert.deepEqual(order, [0, 3], 'HAND-DERIVED: the re-admit evicts key3 first, THEN key0 re-enters as HOT');
+    assert.equal(c._nHot, 1, 'HAND-DERIVED: the re-admit is directly HOT');
+    assert.equal(c._mHot, 1, 'HAND-DERIVED: the re-admit raised the adaptive hot target to 1');
+    assert.equal(stOf(c, 0), HOT, 'HAND-DERIVED: key0 is HOT with ref/test cleared');
+    // Run the SAME shape of unreferenced churn as case (a), far past capacity: key0
+    // must survive every single eviction from here on (nHot(1) never exceeds mHot(1)).
+    for (let i = 5; i < 40; i++) c.put(i, i);
+    assert.ok(c.has(0), 'HAND-DERIVED: the sticky hot page survives unbounded further unreferenced churn');
+    assert.ok(!order.slice(2).includes(0), 'HAND-DERIVED: key0 is never evicted again after the re-admit');
+    validate(c);
 });
 
 test('ClockPro: scan/loop resistance -- a referenced hot set survives a distinct one-hit flood > capacity', () => {

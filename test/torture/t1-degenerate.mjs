@@ -13,6 +13,7 @@ import { LiteLru, Sieve, S3Fifo, WTinyLfu, Arc } from '../../Lru.js';
 import { check, validate } from './harness.mjs';
 
 export function run() {
+    let units = 0; // work units: degenerate-key/value scenarios validated
     // --- SameValueZero key collapse: 0 and -0 are ONE key -----------------------
     {
         const c = new LiteLru(4);
@@ -22,6 +23,7 @@ export function run() {
         check(c.get(0) === 'neg-zero', () => 't1: -0 did not overwrite 0');
         check(c.get(-0) === 'neg-zero', () => 't1: get(-0) missed the shared slot');
         validate(c);
+        units++;
     }
 
     // --- NaN is a single usable key (SameValueZero: NaN matches NaN) -------------
@@ -33,6 +35,7 @@ export function run() {
         check(c.get(NaN) === 'nan2', () => 't1: get(NaN) did not return the latest value');
         check(c.has(NaN) === true, () => 't1: has(NaN) false');
         validate(c);
+        units++;
     }
 
     // --- empty string, null, undefined as DISTINCT keys -------------------------
@@ -47,6 +50,7 @@ export function run() {
         check(c.get(undefined) === 'undef-key', () => 't1: undefined key lost');
         check(c.has(null) === true && c.has(undefined) === true, () => 't1: has() missed null/undefined key');
         validate(c);
+        units++;
     }
 
     // --- object identity keys + a long string key -------------------------------
@@ -63,6 +67,7 @@ export function run() {
         check(c.get(o2) === 'second', () => 't1: o2 identity key lost');
         check(c.get(longKey) === 'long', () => 't1: long string key lost');
         validate(c);
+        units++;
     }
 
     // --- D7: a stored `undefined` VALUE -- pin every answer ---------------------
@@ -79,6 +84,7 @@ export function run() {
         check(c.peek('k') === undefined, () => 't1 D7: peek(stored-undefined) !== undefined');
         check(c.peek('absent') === undefined, () => 't1 D7: peek(miss) !== undefined');
         validate(c);
+        units++;
     }
 
     // --- other degenerate VALUES round-trip exactly -----------------------------
@@ -97,6 +103,7 @@ export function run() {
         check(c.has('null') && c.has('zero') && c.has('nan') && c.has('obj'),
             () => 't1: has() false on a present falsy value');
         validate(c);
+        units++;
     }
 
     // --- Arc degenerate keys + values (decisions/0016) --------------------------
@@ -132,6 +139,7 @@ export function run() {
         e.put('null', null); e.put('zero', 0); e.put('nan', NaN);
         check(e.get('null') === null && e.get('zero') === 0 && Number.isNaN(e.get('nan')), () => 't1 arc: falsy value not preserved');
         validate(e);
+        units += 3; // arc: key-collapse + distinct-keys + D7/falsy scenarios
     }
 
     // --- TTL fail-closed validation (decisions/0017, D17.2/D17.4) ----------------
@@ -167,6 +175,7 @@ export function run() {
                 () => 't1 TTL: ' + name + ' ttlMs NaN did not throw');
             // a valid per-put ttlMs + Infinity are accepted.
             { const c = new C(4, { ttl: 10 }); c.put('k', 1, 5); c.put('n', 2, Infinity); validate(c); }
+            units++; // one member's full TTL fail-closed matrix proven
         }
     }
 
@@ -185,5 +194,8 @@ export function run() {
         check(c.peek('u') === undefined, () => 't1 D7-TTL: stale peek != undefined');
         check(c.size === 0, () => 't1 D7-TTL: stale entry not reaped (size ' + c.size + ')');
         validate(c);
+        units++;
     }
+
+    return units;
 }

@@ -10,7 +10,7 @@
  * and throws if nested). The tiers (ROADMAP section 4):
  *
  *     t0 recency laws          t1 degenerate keys/values
- *     t2 adversarial + conservation   t5 differential fuzz (2 policies)
+ *     t2 adversarial + conservation   t5 differential fuzz (all 13 policies, both backings, TTL + snapshot lanes)
  *     t6 zero-alloc + writes-per-hit  t7 soak + conservation
  *     t8 Belady OPT (bench oracle correctness + optimality bound)
  *     t9 controls (every gate must be able to fail)
@@ -70,16 +70,25 @@ async function main() {
     ];
 
     for (const [name, run] of TIERS) {
+        let n;
         try {
             // Tiers normally fail via die() (which exits). A thrown error is an
             // unexpected fault -- surface it with the replay seed and stop.
-            await run();
+            n = await run();
         } catch (err) {
             process.stderr.write(
                 'torture: FAIL -- ' + name + ' threw: ' + (err && err.stack || err) +
                 '\n  replay: TORTURE_SEED=' + SEED + ' node --expose-gc test/torture.mjs\n');
             process.exit(1);
         }
+        // Liveness: every tier must report a positive count of real work units done.
+        // A tier that reports nothing is a silently-empty gate -- fail closed.
+        if (!Number.isSafeInteger(n) || n <= 0) {
+            process.stderr.write(
+                'torture: FAIL -- ' + name + ' reported no work (n=' + String(n) + ')\n');
+            process.exit(1);
+        }
+        process.stderr.write(name + ': ' + n + ' units\n');
     }
 
     // Reaching here in BREAK mode means the T6 control did not trip -- a fault.

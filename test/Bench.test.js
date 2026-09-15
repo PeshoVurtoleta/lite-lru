@@ -85,6 +85,43 @@ test('beladyOpt: negative capacity behaves identically to capacity 0 (no throw)'
     assert.deepEqual(r, { hits: 0, misses: 3, hitRate: 0 });
 });
 
+test('beladyOpt: a negative NON-integer capacity ALSO falls back cleanly (the <= 0 door is checked first)', () => {
+    const r = beladyOpt([1, 2, 3], -2.5);
+    assert.deepEqual(r, { hits: 0, misses: 3, hitRate: 0 });
+});
+
+/* -------------------------------------------------------------------------- *
+ * beladyOpt -- the fail-CLOSED capacity door (qa TASK 3): NaN, undefined and a
+ * non-integer POSITIVE capacity throw a tagged RangeError BEFORE the degenerate
+ * capacity<=0 fallback above ever runs (Bench.mjs checks `typeof`/`NaN` first,
+ * then non-integer-ness ONLY when capacity > 0 -- a non-integer capacity <= 0
+ * still reaches the fallback, per the case above, never this door).
+ * -------------------------------------------------------------------------- */
+
+test('beladyOpt: capacity NaN throws a [lite-lru]-tagged RangeError', () => {
+    assert.throws(() => beladyOpt([1, 2, 3], NaN), (err) => {
+        assert.ok(err instanceof RangeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        return true;
+    });
+});
+
+test('beladyOpt: capacity undefined throws a [lite-lru]-tagged RangeError', () => {
+    assert.throws(() => beladyOpt([1, 2, 3], undefined), (err) => {
+        assert.ok(err instanceof RangeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        return true;
+    });
+});
+
+test('beladyOpt: capacity 2.5 (a non-integer > 0) throws a [lite-lru]-tagged RangeError', () => {
+    assert.throws(() => beladyOpt([1, 2, 3], 2.5), (err) => {
+        assert.ok(err instanceof RangeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        return true;
+    });
+});
+
 /* -------------------------------------------------------------------------- *
  * beladyOpt -- the optimality bound, mirrored at small scale (t8 proves this
  * at bench scale under torture; this pins the invariant is at least true on a

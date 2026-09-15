@@ -22,8 +22,9 @@ export async function run() {
     const tracker = createLeakTracker({ name: 'lru-soak' });
     const refs = []; // WeakRefs to value objects that SHOULD be collectible after teardown
 
+    let units = 0; // work units: soak cycles + no-retention censuses completed
     let heapFirst = 0;
-    let heapLast = 0;
+    let heapPeak = 0;
 
     for (let cyc = 0; cyc < CYCLES; cyc++) {
         const cache = new LiteLru(CAP);
@@ -45,11 +46,16 @@ export async function run() {
         validate(cache); // conservation after clear
         tracker.untrack(h);
 
-        if (cyc === 0) heapFirst = process.memoryUsage().heapUsed;
+        if (cyc === 0) {
+            globalThis.gc(); // settle the baseline before the first heap sample
+            heapFirst = process.memoryUsage().heapUsed;
+        }
         if ((cyc & 511) === 0) {
             globalThis.gc();
-            heapLast = process.memoryUsage().heapUsed;
+            const heapNow = process.memoryUsage().heapUsed;
+            if (heapNow > heapPeak) heapPeak = heapNow;
         }
+        units++;
     }
 
     // The tracker must have released every cycle's registration.
@@ -67,7 +73,8 @@ export async function run() {
     const heapEnd = process.memoryUsage().heapUsed;
     check(heapEnd < heapFirst + 64 * 1024 * 1024,
         () => 't7: heap grew from ' + heapFirst + ' to ' + heapEnd + ' across churn (retention trend)');
-    void heapLast;
+    check(heapPeak < heapFirst + 64 * 1024 * 1024,
+        () => 't7: heap peaked at ' + heapPeak + ' vs first ' + heapFirst + ' across churn (retention trend)');
 
     // --- S3-FIFO soak: churn + conservation + the GHOST-retains-no-values census -
     // (decisions/0013) The unique S3-FIFO hazard: the ghost outlives the entry it
@@ -79,7 +86,7 @@ export async function run() {
     {
         const s3refs = [];
         const s3tracker = createLeakTracker({ name: 's3fifo-soak' });
-        for (let cyc = 0; cyc < 1024; cyc++) {
+        for (let cyc = 0; cyc < 1024; cyc++) { units++;
             const cache = new S3Fifo(CAP, { keys: 'int' });
             const h = s3tracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
             for (let i = 0; i < CAP * 3; i++) {
@@ -112,7 +119,7 @@ export async function run() {
     {
         const wrefs = [];
         const wtracker = createLeakTracker({ name: 'wtinylfu-soak' });
-        for (let cyc = 0; cyc < 1024; cyc++) {
+        for (let cyc = 0; cyc < 1024; cyc++) { units++;
             const cache = new WTinyLfu(CAP);
             const h = wtracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
             for (let i = 0; i < CAP * 3; i++) {
@@ -144,7 +151,7 @@ export async function run() {
     {
         const lrefs = [];
         const ltracker = createLeakTracker({ name: 'slru-soak' });
-        for (let cyc = 0; cyc < 1024; cyc++) {
+        for (let cyc = 0; cyc < 1024; cyc++) { units++;
             const cache = new Slru(CAP);
             const h = ltracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
             for (let i = 0; i < CAP * 3; i++) {
@@ -175,7 +182,7 @@ export async function run() {
     {
         const qrefs = [];
         const qtracker = createLeakTracker({ name: 'twoq-soak' });
-        for (let cyc = 0; cyc < 1024; cyc++) {
+        for (let cyc = 0; cyc < 1024; cyc++) { units++;
             const cache = new TwoQ(CAP, { keys: 'int' });
             const h = qtracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
             for (let i = 0; i < CAP * 3; i++) {
@@ -210,7 +217,7 @@ export async function run() {
     {
         const arefs = [];
         const atracker = createLeakTracker({ name: 'arc-soak' });
-        for (let cyc = 0; cyc < 1024; cyc++) {
+        for (let cyc = 0; cyc < 1024; cyc++) { units++;
             const cache = new Arc(CAP, { keys: 'int' });
             const h = atracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
             for (let i = 0; i < CAP * 3; i++) {
@@ -248,7 +255,7 @@ export async function run() {
     {
         const lrefs = [];
         const ltracker = createLeakTracker({ name: 'lirs-soak' });
-        for (let cyc = 0; cyc < 1024; cyc++) {
+        for (let cyc = 0; cyc < 1024; cyc++) { units++;
             const cache = new Lirs(CAP, { keys: 'int' });
             const h = ltracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
             for (let i = 0; i < CAP * 3; i++) {
@@ -285,7 +292,7 @@ export async function run() {
         const frefs = [];
         const ftracker = createLeakTracker({ name: 'lfu-soak' });
         let bFreqBytes = -1;
-        for (let cyc = 0; cyc < 1024; cyc++) {
+        for (let cyc = 0; cyc < 1024; cyc++) { units++;
             const cache = new Lfu(CAP, { keys: 'int' });
             if (bFreqBytes < 0) bFreqBytes = cache._bFreq.buffer.byteLength;
             const h = ftracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
@@ -323,7 +330,7 @@ export async function run() {
     {
         const cprefs = [];
         const cptracker = createLeakTracker({ name: 'clockpro-soak' });
-        for (let cyc = 0; cyc < 1024; cyc++) {
+        for (let cyc = 0; cyc < 1024; cyc++) { units++;
             const cache = new ClockPro(CAP, { keys: 'int' });
             const h = cptracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
             for (let i = 0; i < CAP * 3; i++) {
@@ -363,7 +370,7 @@ export async function run() {
     {
         const lkrefs = [];
         const lktracker = createLeakTracker({ name: 'lruk-soak' });
-        for (let cyc = 0; cyc < 1024; cyc++) {
+        for (let cyc = 0; cyc < 1024; cyc++) { units++;
             const cache = new LruK(CAP, { keys: 'int' });
             const h = lktracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
             check(cache._r0.byteLength === 8 * CAP, () => 't7 lruk: _r0 column byteLength != 8*capacity (cycle ' + cyc + ')');
@@ -407,7 +414,7 @@ export async function run() {
     {
         const mqrefs = [];
         const mqtracker = createLeakTracker({ name: 'mq-soak' });
-        for (let cyc = 0; cyc < 1024; cyc++) {
+        for (let cyc = 0; cyc < 1024; cyc++) { units++;
             const cache = new Mq(CAP, { keys: 'int' });
             const h = mqtracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
             check(cache._rc.byteLength === 8 * CAP, () => 't7 mq: _rc column byteLength != 8*capacity (cycle ' + cyc + ')');
@@ -454,7 +461,7 @@ export async function run() {
     {
         const carrefs = [];
         const cartracker = createLeakTracker({ name: 'car-soak' });
-        for (let cyc = 0; cyc < 1024; cyc++) {
+        for (let cyc = 0; cyc < 1024; cyc++) { units++;
             const cache = new Car(CAP, { keys: 'int' });
             const h = cartracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
             check(cache._st.byteLength === CAP, () => 't7 car: _st column byteLength != capacity (cycle ' + cyc + ')');
@@ -497,7 +504,7 @@ export async function run() {
         const ttlrefs = [];
         const ttltracker = createLeakTracker({ name: 'ttl-soak' });
         let totalPurged = 0;
-        for (let cyc = 0; cyc < 1024; cyc++) {
+        for (let cyc = 0; cyc < 1024; cyc++) { units++;
             let now = 0; const clock = () => now;
             const cache = new LiteLru(CAP, { ttl: 5, clock });
             const h = ttltracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
@@ -538,7 +545,7 @@ export async function run() {
         const snaptracker = createLeakTracker({ name: 'snapshot-soak' });
         const srefs = [];
         const MEM = [LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car];
-        for (let cyc = 0; cyc < 4096; cyc++) {
+        for (let cyc = 0; cyc < 4096; cyc++) { units++;
             const C = MEM[cyc % MEM.length];
             const cache = new C(CAP, { keys: 'int' });
             const h = snaptracker.track(cache, () => {}, 'cache'); // cleanup must NOT close over cache
@@ -579,7 +586,10 @@ export async function run() {
         check(snaptracker.size() === 0, () => 't7 snap: leak tracker size ' + snaptracker.size() + ' != 0 after churn');
         await settleGc(6);
         check(srefs.length > 0, () => 't7 snap: census sample was empty (nothing to prove)');
+        units++; // snapshot soak census completed
         check(censusOk(srefs),
             () => 't7 snap: a value captured by a dropped snapshot/cache is still live -- a retention leak');
     }
+
+    return units;
 }

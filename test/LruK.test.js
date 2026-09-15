@@ -33,7 +33,7 @@ function r0Of(c, k) { const s = c._store.get(k); return s < 0 ? undefined : c._r
 function r1Of(c, k) { const s = c._store.get(k); return s < 0 ? undefined : c._r1[s]; }
 
 test('LruK: VERSION is the current, un-bumped value (moves only at /release)', () => {
-    assert.equal(VERSION, '1.15.0');
+    assert.equal(VERSION, '1.16.0');
 });
 
 test('LruK: fail-closed capacity -- non-integer / < 1 throws RangeError', () => {

@@ -8,7 +8,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LiteLru, VERSION } from '../Lru.js';
+import { LiteLru, Sieve, VERSION } from '../Lru.js';
 import { validate } from './validate.mjs';
 
 /** The key at the LRU (tail) -- the next eviction victim. Test-only introspection. */
@@ -17,7 +17,7 @@ function victim(c) {
 }
 
 test('exports: VERSION and both named + default export are LiteLru', async () => {
-    assert.equal(VERSION, '1.15.0');
+    assert.equal(VERSION, '1.16.0');
     const mod = await import('../Lru.js');
     assert.equal(mod.LiteLru, LiteLru);
     assert.equal(mod.default, LiteLru);
@@ -183,6 +183,81 @@ test('capacity 1 works: every put evicts, head === tail', () => {
     assert.equal(c.get('b'), 2);
     assert.equal(c.size, 1);
     assert.equal(evictions, 1);
+    validate(c);
+});
+
+// --- fail-closed options door (family-wide: validateOptions/validateOnEvict) --
+// qa TASK 3. `validateOptions`/`validateOnEvict` are SHARED helpers every member's
+// constructor calls (right after the capacity door) -- pinned here once on the
+// reference member, plus ONE non-LiteLru member (Sieve) to prove the door is
+// family-wide, not a LiteLru-only accident.
+
+test('fail-closed: an unknown option key throws a TypeError tagged [lite-lru], names ' +
+    'the bad key, and offers a did-you-mean hint', () => {
+    assert.throws(() => new LiteLru(4, { onEvcit: () => {} }), (err) => {
+        assert.ok(err instanceof TypeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        assert.match(err.message, /onEvcit/);
+        assert.match(err.message, /did you mean onEvict/);
+        return true;
+    });
+});
+
+test('fail-closed: the unknown-option-key door is FAMILY-WIDE (a non-LiteLru member, Sieve)', () => {
+    assert.throws(() => new Sieve(4, { onEvcit: () => {} }), (err) => {
+        assert.ok(err instanceof TypeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        assert.match(err.message, /onEvcit/);
+        assert.match(err.message, /did you mean onEvict/);
+        return true;
+    });
+});
+
+test('fail-closed: options: null throws a TypeError tagged [lite-lru]', () => {
+    assert.throws(() => new LiteLru(4, null), (err) => {
+        assert.ok(err instanceof TypeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        return true;
+    });
+});
+
+test('fail-closed: options: 42 (a non-object) throws a TypeError tagged [lite-lru]', () => {
+    assert.throws(() => new LiteLru(4, 42), (err) => {
+        assert.ok(err instanceof TypeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        return true;
+    });
+});
+
+test('an options object carrying ALL FIVE known keys constructs fine', () => {
+    const c = new LiteLru(4, {
+        onEvict: () => {},
+        keys: 'int',
+        ttl: 1000,
+        clock: () => 0,
+        stats: true,
+    });
+    c.put(1, 'a');
+    assert.equal(c.get(1), 'a');
+    validate(c);
+});
+
+// --- fail-closed onEvict door ---------------------------------------------------
+
+test('fail-closed: onEvict: 42 (not a function) throws a TypeError tagged [lite-lru]', () => {
+    assert.throws(() => new LiteLru(4, { onEvict: 42 }), (err) => {
+        assert.ok(err instanceof TypeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        return true;
+    });
+});
+
+test('onEvict: undefined keeps the documented silent NOOP default -- evicting without a handler works', () => {
+    const c = new LiteLru(2, { onEvict: undefined });
+    c.put('a', 1); c.put('b', 2);
+    assert.doesNotThrow(() => c.put('c', 3)); // evicts 'a' via the NOOP default, no handler required
+    assert.equal(c.has('a'), false);
+    assert.equal(c.size, 2);
     validate(c);
 });
 

@@ -367,7 +367,7 @@ Run directly, it prints a table; imported, it returns structured results and pri
 
 | Constant  | Value     | Meaning                                                       |
 | --------- | --------- | ------------------------------------------------------------ |
-| `VERSION` | `'1.15.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
+| `VERSION` | `'1.16.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
 
 All thirteen members and `VERSION` are named exports; `LiteLru` is also the default export.
 
@@ -476,15 +476,15 @@ The default run reports each member on three named, seeded workloads -- `zipf` (
 
 | Workload | Policy    | Hit % | % of OPT | Writes/hit |
 | -------- | --------- | ----- | -------- | ---------- |
-| `zipf`   | OPT       | 74.4  | 100.0    | -          |
-| `zipf`   | `LiteLru` | 57.4  | 77.2     | 4.824      |
-| `zipf`   | `Sieve`   | 66.8  | 89.8     | 1.000      |
+| `zipf`   | OPT       | 74.6  | 100.0    | -          |
+| `zipf`   | `LiteLru` | 57.7  | 77.4     | 4.819      |
+| `zipf`   | `Sieve`   | 67.1  | 90.0     | 1.000      |
 | `loop`   | OPT       | 24.9  | 100.0    | -          |
 | `loop`   | `LiteLru` | 0.0   | 0.0      | 0.000      |
 | `loop`   | `Sieve`   | 0.0   | 0.0      | 0.000      |
 | `scan`   | OPT       | 49.9  | 100.0    | -          |
-| `scan`   | `LiteLru` | 36.0  | 72.1     | 4.967      |
-| `scan`   | `Sieve`   | 49.9  | 100.0    | 1.000      |
+| `scan`   | `LiteLru` | 36.1  | 72.4     | 4.970      |
+| `scan`   | `Sieve`   | 49.9  | 99.9     | 1.000      |
 
 Hit % and % of OPT are deterministic (seeded trace, deterministic policies); `ns/op` is wall-clock and MACHINE-LOCAL -- the tool prints it with a `node`/`arch` fingerprint, and it is an example only, not a comparable number across machines. These are outputs of these specific traces, not general claims: the `loop` row is exactly why LRU is a floor and not a headline, and the `scan` row is the scan-resistance story as a measurement. Replay YOUR trace by passing `workloads` to `runBench`, and trust the number because the bench drives the same policies the package ships.
 
@@ -504,10 +504,10 @@ Hit % and % of OPT are deterministic (seeded trace, deterministic policies); `ns
 
 ## Testing
 
-**1322 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
+**1466 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
 
 ```bash
-npm test               # 1446 node:test cases (all members, laws, TTL, iteration, stats, snapshot round-trip, boundary, dts drift)
+npm test               # 1466 node:test cases (all members, laws, TTL, iteration, stats, snapshot round-trip, boundary, dts drift)
 npm run test:types     # tsc: the LiteCache<K,V> surface + one-line-swap type-check
 npm run torture        # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + gated numbers
 npm run torture:controls  # the deliberately-broken variants -- every gate must fail
