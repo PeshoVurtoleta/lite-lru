@@ -122,6 +122,19 @@ test('beladyOpt: capacity 2.5 (a non-integer > 0) throws a [lite-lru]-tagged Ran
     });
 });
 
+// qa (final pipeline gap-close, 1.16.0): Infinity is `typeof "number"` and not NaN, so it
+// clears the first door, but `Number.isInteger(Infinity) === false` -- it must fall into the
+// SAME non-integer-positive-capacity door as 2.5 above, not silently pass through or hang
+// building an Int32Array/heap sized off it.
+test('beladyOpt: capacity Infinity (a non-integer > 0) throws a [lite-lru]-tagged RangeError, not a hang/OOM', () => {
+    assert.throws(() => beladyOpt([1, 2, 3], Infinity), (err) => {
+        assert.ok(err instanceof RangeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        assert.match(err.message, /Infinity/);
+        return true;
+    });
+});
+
 /* -------------------------------------------------------------------------- *
  * beladyOpt -- the optimality bound, mirrored at small scale (t8 proves this
  * at bench scale under torture; this pins the invariant is at least true on a

@@ -7,6 +7,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.16.1] - 2026-09-15
+
+### Changed
+
+- Completed the v1.16.0 shape-hygiene pass: `ClockPro` and `Lirs` now initialize
+  the `onEvict` fire-after fields (`_evKey`/`_evVal`) in their constructors, matching
+  `Car`, `LruK`, and `Mq`. Previously these two acquired the fields lazily on first
+  eviction, causing a one-time hidden-class transition on the eviction path (no
+  retention, no measured allocation -- the fields are snapshotted and cleared before
+  `onEvict` fires -- but an inconsistency across the five members that use them). All
+  five now declare the fields at construction with an identical comment; the prior
+  comment on `Car`/`LruK`/`Mq` naming `ClockPro` as the precedent (which did not
+  initialize them at construction) was corrected to a precedent-neutral note.
+
+### Added
+
+- `test/Options.test.js` -- a 287-case boundary suite parameterized over all thirteen
+  members, locking the v1.16.0 constructor doors that previously had no regression test
+  (the v1.16.0 additions were the CAR/ClockPro victim-order suites): unknown option key
+  rejection with a did-you-mean hint, non-object options-bag rejection (including `null`),
+  non-function `onEvict` rejection (and acceptance of `undefined` / a real callback), and
+  the Symbol/BigInt options footgun (a clean `[lite-lru]` error, never a raw `TypeError`).
+- One `beladyOpt` boundary case (`test/Bench.test.js`): an `Infinity` capacity throws a
+  tagged `RangeError`. Test count 1466 -> 1754 (node:test).
+
 ## [1.16.0] - 2026-09-15
 
 ### Added

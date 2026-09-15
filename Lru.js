@@ -335,7 +335,7 @@ function validateOnEvict(onEvict) {
     return onEvict;
 }
 
-export const VERSION = "1.16.0";
+export const VERSION = "1.16.1";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -4464,6 +4464,10 @@ export class Lirs {
         this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
+        // Retention hygiene for the onEvict fire-after: declared at construction so the object shape never transitions on first eviction.
+        this._evKey = undefined;
+        this._evVal = undefined;
+
         // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
         this._stats = validateStats(options && options.stats);
     }
@@ -5564,6 +5568,10 @@ export class ClockPro {
         this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
+        // Retention hygiene for the onEvict fire-after: declared at construction so the object shape never transitions on first eviction.
+        this._evKey = undefined;
+        this._evVal = undefined;
+
         // Opt-in runtime stats (decisions/0019): null when off, a fresh holder when on.
         this._stats = validateStats(options && options.stats);
     }
@@ -6188,7 +6196,7 @@ export class LruK {
         this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
-        // Retention hygiene for the onEvict fire-after (mirrors ClockPro).
+        // Retention hygiene for the onEvict fire-after: declared at construction so the object shape never transitions on first eviction.
         this._evKey = undefined;
         this._evVal = undefined;
 
@@ -6810,7 +6818,7 @@ export class Mq {
         this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
-        // Retention hygiene for the onEvict fire-after (mirrors ClockPro).
+        // Retention hygiene for the onEvict fire-after: declared at construction so the object shape never transitions on first eviction.
         this._evKey = undefined;
         this._evVal = undefined;
 
@@ -7360,7 +7368,7 @@ export class Car {
         this._onEvict = validateOnEvict(options && options.onEvict);
         this._inOnEvict = false;
 
-        // Retention hygiene for the onEvict fire-after (mirrors ClockPro).
+        // Retention hygiene for the onEvict fire-after: declared at construction so the object shape never transitions on first eviction.
         this._evKey = undefined;
         this._evVal = undefined;
 

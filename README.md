@@ -367,7 +367,7 @@ Run directly, it prints a table; imported, it returns structured results and pri
 
 | Constant  | Value     | Meaning                                                       |
 | --------- | --------- | ------------------------------------------------------------ |
-| `VERSION` | `'1.16.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
+| `VERSION` | `'1.16.1'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
 
 All thirteen members and `VERSION` are named exports; `LiteLru` is also the default export.
 
@@ -504,10 +504,10 @@ Hit % and % of OPT are deterministic (seeded trace, deterministic policies); `ns
 
 ## Testing
 
-**1466 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
+**1754 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
 
 ```bash
-npm test               # 1466 node:test cases (all members, laws, TTL, iteration, stats, snapshot round-trip, boundary, dts drift)
+npm test               # 1754 node:test cases (all members, laws, TTL, iteration, stats, snapshot round-trip, boundary, dts drift)
 npm run test:types     # tsc: the LiteCache<K,V> surface + one-line-swap type-check
 npm run torture        # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + gated numbers
 npm run torture:controls  # the deliberately-broken variants -- every gate must fail
