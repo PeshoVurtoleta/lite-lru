@@ -7,6 +7,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.18.0] - 2026-09-20
+
+### Added
+
+- `benchmark/Bench.mjs` skew + variance axes (BRIEF findings 1-4), all additive and
+  deterministic; the default `runBench()` still emits exactly `['zipf','loop','scan']`
+  with byte-identical traces and unchanged `config` `{capacity,length,seed}`:
+  - `runBench` / `defaultWorkloads` gain `alphas` (zipf exponent sweep, default
+    `[1.0]`) and `keyspaceRatio` (keyspace = `capacity*ratio`, default 16 -- was a
+    hardcoded `*16`). `alphas: [1.0]` keeps the workload named `zipf`; any other set
+    names each `zipf-a<A>` (e.g. `zipf-a0.7`). Per-alpha seed is derived
+    deterministically, so `zipf-a1.0` reproduces the default `zipf` trace exactly.
+  - `ZIPF_ALPHAS = [0.7, 0.9, 1.0, 1.2]` -- the opt-in skew-sweep constant.
+  - `measureTiming` gains a `repeats` param (default 5): one warmup + `repeats` timed
+    passes. Members now surface `nsPerOpMedian` and `nsPerOpP95` (nearest-rank);
+    `nsPerOp === nsPerOpMedian` for back-compat. The printed table gains ONE `p95`
+    column. No single-throughput headline number is introduced.
+  - `runBench` echoes the new knobs (`alphas`, `keyspaceRatio`, `repeats`) in a NEW
+    top-level `tuning` object; `config` is left untouched at three keys.
+  - `webTrace(opts)` -- a seeded, deterministic "web-like" generator: a diurnal hot
+    set that slowly rotates across the keyspace interleaved with a zipf tail.
+    Exported; NOT added to the default workload set.
+  - `parseIntTrace(text, opts?)` -- a columnar/CSV text -> integer Array loader
+    (`delimiter`, `column`, `comment` prefix, `skipHeader`). Takes a STRING, not a
+    path (no `node:fs`); throws a `[lite-lru]`-tagged `RangeError` on a non-integer
+    token. Feed the result to `runBench({ workloads })` to replay your own trace.
+  - Documented `beladyOpt`'s scale ceiling: it allocates an `Int32Array(n)` next-use
+    table + a `Map` over the whole trace, so OPT (not the caches) caps a "scale" run
+    -- fine at ~5M ops, heavy toward ~50M.
+
 ## [1.17.0] - 2026-09-20
 
 ### Added

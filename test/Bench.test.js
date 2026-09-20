@@ -11,7 +11,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { beladyOpt, runBench, backingCompare } from '../benchmark/Bench.mjs';
+import { beladyOpt, runBench, backingCompare, parseIntTrace, webTrace, ZIPF_ALPHAS } from '../benchmark/Bench.mjs';
 import { LiteLru, Sieve } from '../Lru.js';
 
 /* -------------------------------------------------------------------------- *
@@ -332,5 +332,268 @@ test('adversarial: two workload entries aliasing the SAME trace array report ide
         assert.equal(a.members[i].misses, b.members[i].misses);
         assert.equal(a.members[i].writesPerHit, b.members[i].writesPerHit);
         assert.equal(a.members[i].pctOptimal, b.members[i].pctOptimal);
+    }
+});
+
+/* ============================================================================ *
+ * QA: planner ASSERTIONS on the alphas/keyspaceRatio/repeats/loader/webTrace
+ * benchmark enhancements. Each block below is one numbered planner assertion.
+ * Config sizes are kept as small as each assertion allows -- large enough to be
+ * a real measurement, small enough that `npm test` stays fast -- EXCEPT the one
+ * explicit full-default-scale call assertion 1 requires, which is deliberately
+ * run at the library's real default (capacity 256 / length 200000) and costs
+ * several seconds by itself; see the QA report for the measured wall time.
+ * ============================================================================ */
+
+const DEFAULT_SEED = 0x9e3779b9;
+const SWEEP_CFG = { capacity: 64, length: 20000 };
+
+// Computed ONCE at module load and reused across assertions 1 and 2 (both use
+// the identical {capacity:64, length:20000} config with the default seed) to
+// avoid re-running the same ~1.2s bench pass twice.
+const TRIPWIRE_OUT = runBench(SWEEP_CFG);
+const SWEEP_OUT = runBench({ ...SWEEP_CFG, alphas: ZIPF_ALPHAS });
+
+/* -------------------------------------------------------------------------- *
+ * ASSERTION 1 -- BACK-COMPAT TRIPWIRE
+ * -------------------------------------------------------------------------- */
+
+test('ASSERTION 1: runBench({capacity,length}) returns exactly 3 workloads named [zipf,loop,scan]', () => {
+    assert.deepStrictEqual(TRIPWIRE_OUT.workloads.map((w) => w.name), ['zipf', 'loop', 'scan']);
+    assert.equal(TRIPWIRE_OUT.workloads.length, 3);
+});
+
+test('ASSERTION 1: out.config deepEquals {capacity,length,seed} with EXACTLY 3 keys -- no new knob leaks in', () => {
+    assert.deepStrictEqual(TRIPWIRE_OUT.config, { capacity: 64, length: 20000, seed: DEFAULT_SEED });
+    assert.deepStrictEqual(Object.keys(TRIPWIRE_OUT.config).sort(), ['capacity', 'length', 'seed']);
+    // Explicit negative check: the new knobs must NOT leak into config by any name.
+    assert.equal('alphas' in TRIPWIRE_OUT.config, false);
+    assert.equal('keyspaceRatio' in TRIPWIRE_OUT.config, false);
+    assert.equal('repeats' in TRIPWIRE_OUT.config, false);
+});
+
+test('ASSERTION 1: the new knobs live ONLY under out.tuning, with the documented defaults', () => {
+    assert.deepStrictEqual(Object.keys(TRIPWIRE_OUT.tuning).sort(), ['alphas', 'keyspaceRatio', 'repeats']);
+    assert.deepStrictEqual(TRIPWIRE_OUT.tuning.alphas, [1.0]);
+    assert.equal(TRIPWIRE_OUT.tuning.keyspaceRatio, 16);
+    assert.equal(TRIPWIRE_OUT.tuning.repeats, 5);
+});
+
+test('ASSERTION 1: runBench() with NO options (the real library default, capacity=256/length=200000) still emits exactly [zipf,loop,scan]', () => {
+    // Deliberately the full default scale -- this is the actual back-compat
+    // tripwire the planner asked for, not a scaled-down stand-in. MEASURED to
+    // take several seconds; see the QA report.
+    const out = runBench();
+    assert.deepStrictEqual(out.workloads.map((w) => w.name), ['zipf', 'loop', 'scan']);
+    assert.equal(out.config.capacity, 256);
+    assert.equal(out.config.length, 200000);
+});
+
+/* -------------------------------------------------------------------------- *
+ * ASSERTION 2 -- ALPHA SWEEP
+ * -------------------------------------------------------------------------- */
+
+test('ASSERTION 2: runBench({alphas: ZIPF_ALPHAS}) yields 6 workloads including zipf-a0.7 and zipf-a1.2', () => {
+    const names = SWEEP_OUT.workloads.map((w) => w.name);
+    assert.equal(names.length, 6);
+    assert.deepStrictEqual(names, ['zipf-a0.7', 'zipf-a0.9', 'zipf-a1.0', 'zipf-a1.2', 'loop', 'scan']);
+    assert.ok(names.includes('zipf-a0.7'));
+    assert.ok(names.includes('zipf-a1.2'));
+});
+
+test('ASSERTION 2: two runs with the same alpha-sweep opts give identical opt.hits per workload (determinism)', () => {
+    const cfg = { alphas: ZIPF_ALPHAS, capacity: 32, length: 2000 };
+    const a = runBench(cfg);
+    const b = runBench(cfg);
+    assert.equal(a.workloads.length, b.workloads.length);
+    for (let i = 0; i < a.workloads.length; i++) {
+        assert.equal(a.workloads[i].name, b.workloads[i].name);
+        assert.equal(a.workloads[i].opt.hits, b.workloads[i].opt.hits, a.workloads[i].name + ' opt.hits drifted across identical runs');
+    }
+});
+
+test('ASSERTION 2: zipf-a1.0 (from the sweep) matches the default single-alpha zipf workload (naming/seed reduction). Trace itself is NOT exposed on the result, so this compares opt.hits + every member hits/misses (the measurable proxy)', () => {
+    const swept = SWEEP_OUT.workloads.find((w) => w.name === 'zipf-a1.0');
+    const single = TRIPWIRE_OUT.workloads.find((w) => w.name === 'zipf');
+    assert.ok(swept, 'zipf-a1.0 workload present in the sweep');
+    assert.ok(single, 'zipf workload present in the default run');
+    assert.deepStrictEqual(swept.opt, single.opt);
+    assert.equal(swept.members.length, single.members.length);
+    for (let i = 0; i < swept.members.length; i++) {
+        assert.equal(swept.members[i].name, single.members[i].name);
+        assert.equal(swept.members[i].hits, single.members[i].hits, swept.members[i].name + ' hits drifted');
+        assert.equal(swept.members[i].misses, single.members[i].misses, swept.members[i].name + ' misses drifted');
+        assert.equal(swept.members[i].writesPerHit, single.members[i].writesPerHit, swept.members[i].name + ' writesPerHit drifted');
+    }
+});
+
+test('FAIL-CLOSED (assertion 2 family): runBench({alphas:[]}) throws a [lite-lru]-tagged RangeError -- an empty sweep must NOT silently collapse to [loop,scan] or fall back to the 3-workload default', () => {
+    assert.throws(
+        () => runBench({ alphas: [], capacity: 32, length: 2000 }),
+        (e) => e instanceof RangeError && e.message.startsWith('[lite-lru]'),
+    );
+});
+
+/* -------------------------------------------------------------------------- *
+ * ASSERTION 3 -- TIMING SHAPE
+ * -------------------------------------------------------------------------- */
+
+test('ASSERTION 3: every member has finite nsPerOpMedian/nsPerOpP95 with p95 >= median > 0, and nsPerOp === nsPerOpMedian', () => {
+    const out = runBench({ capacity: 32, length: 4000, seed: 0x2a });
+    for (const wl of out.workloads) {
+        for (const m of wl.members) {
+            const tag = wl.name + '.' + m.name;
+            assert.ok(Number.isFinite(m.nsPerOpMedian), tag + ' nsPerOpMedian not finite');
+            assert.ok(Number.isFinite(m.nsPerOpP95), tag + ' nsPerOpP95 not finite');
+            assert.ok(m.nsPerOpMedian > 0, tag + ' nsPerOpMedian not > 0: ' + m.nsPerOpMedian);
+            assert.ok(m.nsPerOpP95 >= m.nsPerOpMedian, tag + ' p95 ' + m.nsPerOpP95 + ' < median ' + m.nsPerOpMedian);
+            assert.equal(m.nsPerOp, m.nsPerOpMedian, tag + ' nsPerOp !== nsPerOpMedian');
+        }
+    }
+});
+
+/* -------------------------------------------------------------------------- *
+ * ASSERTION 4 -- FAIL-CLOSED on `repeats` (measureTiming is NOT exported; the
+ * only reachable entry point is runBench({repeats}), which forwards it
+ * straight to measureTiming for the very first member -- so the throw
+ * happens immediately, before any expensive work).
+ * -------------------------------------------------------------------------- */
+
+const TINY = { capacity: 16, length: 500 };
+
+const BAD_REPEATS = [
+    { label: '0', value: 0 },
+    { label: '-1', value: -1 },
+    { label: '1.5', value: 1.5 },
+    { label: '-0', value: -0 },
+    { label: 'NaN', value: NaN },
+    { label: 'null', value: null },
+];
+
+for (const { label, value } of BAD_REPEATS) {
+    test('ASSERTION 4: runBench({repeats:' + label + '}) throws a [lite-lru]-tagged RangeError', () => {
+        assert.throws(() => runBench({ ...TINY, repeats: value }), (err) => {
+            assert.ok(err instanceof RangeError, 'expected RangeError, got ' + err);
+            assert.match(err.message, /\[lite-lru\]/);
+            return true;
+        });
+    });
+}
+
+test('ASSERTION 4: runBench({repeats:1}) works (no throw) and produces a single-sample median===p95', () => {
+    const out = runBench({ ...TINY, repeats: 1 });
+    assert.equal(out.tuning.repeats, 1);
+    for (const wl of out.workloads) {
+        for (const m of wl.members) {
+            assert.ok(Number.isFinite(m.nsPerOpMedian) && m.nsPerOpMedian > 0);
+            assert.equal(m.nsPerOpP95, m.nsPerOpMedian, 'a single timed pass must have p95 === median');
+        }
+    }
+});
+
+test('ASSERTION 4: runBench({repeats:undefined}) is the documented "use the default" door, NOT a fail-closed rejection', () => {
+    const out = runBench({ ...TINY, repeats: undefined });
+    assert.equal(out.tuning.repeats, 5);
+});
+
+/* -------------------------------------------------------------------------- *
+ * ASSERTION 5 -- LOADER: parseIntTrace
+ * -------------------------------------------------------------------------- */
+
+test('ASSERTION 5: parseIntTrace parses newline-delimited integers (one record per line)', () => {
+    assert.deepStrictEqual(parseIntTrace('1\n2\n3\n4\n5\n'), [1, 2, 3, 4, 5]);
+});
+
+test('ASSERTION 5: parseIntTrace trims surrounding whitespace/tabs around each single-token record line', () => {
+    assert.deepStrictEqual(parseIntTrace('  10  \n\t20\t\n   30\n'), [10, 20, 30]);
+});
+
+test('ASSERTION 5: within a line, the default column (0) reads the FIRST whitespace-split token -- other tokens on that line are ignored unless requested via `column`', () => {
+    assert.deepStrictEqual(parseIntTrace('1 2  3\n4\n5\n'), [1, 4, 5]);
+});
+
+test('ASSERTION 5: parseIntTrace honors a column option', () => {
+    // column 0 (the default) vs column 1 vs the boundary column N-1 / N / N+1 on a
+    // 3-token line ("10,20,30" -> valid indices 0,1,2; index 3 is out of range).
+    assert.deepStrictEqual(parseIntTrace('10,20,30\n40,50,60', { delimiter: ',', column: 1 }), [20, 50]);
+    assert.deepStrictEqual(parseIntTrace('10,20,30', { delimiter: ',', column: 2 }), [30]); // N-1 (last valid column)
+    assert.throws(() => parseIntTrace('10,20,30', { delimiter: ',', column: 3 }), /\[lite-lru\]/); // N (out of range)
+    assert.throws(() => parseIntTrace('10,20,30', { delimiter: ',', column: 4 }), /\[lite-lru\]/); // N+1
+});
+
+test('ASSERTION 5: parseIntTrace strips a whole-line and a trailing comment-prefix', () => {
+    assert.deepStrictEqual(parseIntTrace('# a whole-line comment\n1\n2 # inline\n3', { comment: '#' }), [1, 2, 3]);
+});
+
+test('ASSERTION 5: parseIntTrace skipHeader drops the first non-blank data line even if it is non-numeric', () => {
+    assert.deepStrictEqual(parseIntTrace('key\n1\n2\n3\n', { skipHeader: true }), [1, 2, 3]);
+});
+
+test('ASSERTION 5: parseIntTrace returns [] for empty / whitespace-only input (documented contract, not an error)', () => {
+    assert.deepStrictEqual(parseIntTrace(''), []);
+    assert.deepStrictEqual(parseIntTrace('   \n\t\n   \n'), []);
+    assert.deepStrictEqual(parseIntTrace('\n\n\n'), []);
+});
+
+test('ASSERTION 5: parseIntTrace throws a [lite-lru]-tagged RangeError on a non-integer token', () => {
+    assert.throws(() => parseIntTrace('1\nabc\n3'), (err) => {
+        assert.ok(err instanceof RangeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        return true;
+    });
+});
+
+test('ASSERTION 5: parseIntTrace throws a [lite-lru]-tagged RangeError on a float token', () => {
+    assert.throws(() => parseIntTrace('1\n2.5\n3'), (err) => {
+        assert.ok(err instanceof RangeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        return true;
+    });
+});
+
+test('ASSERTION 5: parseIntTrace throws a [lite-lru]-tagged RangeError on non-string input (null, number)', () => {
+    assert.throws(() => parseIntTrace(null), (err) => {
+        assert.ok(err instanceof RangeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        assert.match(err.message, /null/);
+        return true;
+    });
+    assert.throws(() => parseIntTrace(123), (err) => {
+        assert.ok(err instanceof RangeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        return true;
+    });
+    assert.throws(() => parseIntTrace(undefined), (err) => {
+        assert.ok(err instanceof RangeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        return true;
+    });
+});
+
+/* -------------------------------------------------------------------------- *
+ * ASSERTION 6 -- WEBTRACE
+ * -------------------------------------------------------------------------- */
+
+test('ASSERTION 6: webTrace is deterministic -- same seed produces a byte-identical trace', () => {
+    const opts = { length: 2000, keyspace: 100, seed: 0x1234 };
+    const a = webTrace(opts);
+    const b = webTrace(opts);
+    assert.deepStrictEqual(a, b);
+});
+
+test('ASSERTION 6: webTrace is seed-sensitive -- a different seed produces a different trace', () => {
+    const a = webTrace({ length: 2000, keyspace: 100, seed: 0x1234 });
+    const b = webTrace({ length: 2000, keyspace: 100, seed: 0x4321 });
+    assert.notDeepStrictEqual(a, b);
+});
+
+test('ASSERTION 6: every webTrace key is an integer in [0, keyspace)', () => {
+    const keyspace = 100;
+    const trace = webTrace({ length: 5000, keyspace, seed: 0x777, period: 137, hotSize: 7, hotFraction: 0.65, exponent: 0.9 });
+    assert.equal(trace.length, 5000);
+    for (let i = 0; i < trace.length; i++) {
+        const k = trace[i];
+        assert.ok(Number.isInteger(k), 'index ' + i + ' key ' + k + ' is not an integer');
+        assert.ok(k >= 0 && k < keyspace, 'index ' + i + ' key ' + k + ' out of [0,' + keyspace + ')');
     }
 });

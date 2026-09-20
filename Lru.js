@@ -346,7 +346,7 @@ function validateOnEvict(onEvict) {
     return onEvict;
 }
 
-export const VERSION = "1.17.0";
+export const VERSION = "1.18.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit

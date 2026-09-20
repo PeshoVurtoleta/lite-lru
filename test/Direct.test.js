@@ -35,7 +35,7 @@ function prng(seed) {
 }
 
 test('dense: VERSION is the current value (moves only at /release)', () => {
-    assert.equal(VERSION, '1.17.0');
+    assert.equal(VERSION, '1.18.0');
 });
 
 test('dense: exports DirectLru', async () => {
