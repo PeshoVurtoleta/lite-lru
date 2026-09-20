@@ -31,7 +31,7 @@ const isRef = (c, k) => (stOf(c, k) & REF) !== 0;
 const isTest = (c, k) => (stOf(c, k) & TEST) !== 0;
 
 test('ClockPro: VERSION is the current, un-bumped value (moves only at /release)', () => {
-    assert.equal(VERSION, '1.16.1');
+    assert.equal(VERSION, '1.17.0');
 });
 
 test('ClockPro: fail-closed capacity -- non-integer / < 1 throws RangeError', () => {

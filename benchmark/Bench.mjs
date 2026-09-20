@@ -344,6 +344,53 @@ function measureTiming(CacheClass, trace, capacity) {
     return ((t1 - t0) * 1e6) / trace.length; // ns per op
 }
 
+/** Machine-local ns/op for a cache built by a FACTORY (so the keyed-index backing --
+ *  default Map / keys:'int' / keys:'dense' -- can be varied for the same LRU policy). */
+function measureTimingFactory(factory, trace, capacity) {
+    const warm = factory(capacity);
+    for (let i = 0; i < trace.length; i++) { const k = trace[i]; if (warm.get(k) === undefined) warm.put(k, k); }
+    const cache = factory(capacity);
+    const t0 = performance.now();
+    for (let i = 0; i < trace.length; i++) { const k = trace[i]; if (cache.get(k) === undefined) cache.put(k, k); }
+    const t1 = performance.now();
+    return ((t1 - t0) * 1e6) / trace.length; // ns per op
+}
+
+/**
+ * The KEYED-INDEX BACKING comparison (decisions/0011 + 0029): the SAME LiteLru recency
+ * policy over its three index backings on an integer, dense-domain workload --
+ *   - default Map: arbitrary keys, honestly AMORTIZED (internal resize can allocate)
+ *   - keys:'int' : open-addressed typed-array index, STRICT zero-alloc (large/sparse)
+ *   - keys:'dense': direct-mapped generation-stamped index, STRICT zero-alloc, O(maxKey)
+ *     space, hot body a single array read (no hash, no probe) -- DirectLru's engine.
+ * Hit ratio + eviction order are IDENTICAL across all three (same policy); only ns/op and
+ * the space/allocation posture differ. RETURNS structured rows; does NOT print.
+ */
+export function backingCompare(opts) {
+    const o = opts || {};
+    const capacity = o.capacity === undefined ? 256 : o.capacity;
+    const length = o.length === undefined ? 200000 : o.length;
+    const seed = o.seed === undefined ? 0x9e3779b9 : (o.seed >>> 0) || 1;
+    const maxKey = capacity * 16 - 1; // dense domain covers the zipf keyspace exactly
+    const trace = zipfTrace({length, keyspace: maxKey + 1, exponent: 1.0, seed: seed ^ 0x33});
+    const backings = [
+        {name: 'Map (default)', factory: (cap) => new LiteLru(cap)},
+        {name: "keys:'int'", factory: (cap) => new LiteLru(cap, {keys: 'int'})},
+        {name: "keys:'dense'", factory: (cap) => new LiteLru(cap, {keys: 'dense', maxKey})},
+    ];
+    const ratio = measureRatio(LiteLru, trace, capacity); // shared: identical across backings
+    const rows = [];
+    for (let i = 0; i < backings.length; i++) {
+        const b = backings[i];
+        rows.push({
+            backing: b.name,
+            nsPerOp: measureTimingFactory(b.factory, trace, capacity),
+            hitRatio: ratio.hitRatio,
+        });
+    }
+    return {version: VERSION, node: process.version, arch: process.arch, capacity, ops: length, maxKey, rows};
+}
+
 const MEMBERS = [
     {name: 'LiteLru', ctor: LiteLru},
     {name: 'Sieve', ctor: Sieve},
@@ -483,10 +530,26 @@ function printBench(out) {
     process.stdout.write(lines.join('\n') + '\n');
 }
 
+function printBackingCompare(out) {
+    const lines = [];
+    lines.push('');
+    lines.push('keyed-index backing comparison  (same LRU policy, integer dense-domain zipf)');
+    lines.push('capacity=' + out.capacity + '  ops=' + out.ops + '  maxKey=' + out.maxKey +
+        '  hit%=' + (out.rows[0].hitRatio * 100).toFixed(1) + ' (identical across backings)');
+    const header = pad('backing', 16) + padLeft('ns/op', 10);
+    lines.push(header);
+    lines.push('-'.repeat(header.length));
+    for (const r of out.rows) {
+        lines.push(pad(r.backing, 16) + padLeft(r.nsPerOp.toFixed(1), 10));
+    }
+    process.stdout.write(lines.join('\n') + '\n');
+}
+
 // Run the printer only when invoked directly (node benchmark/Bench.mjs / npm run bench),
 // not when imported. Kept dependency-free: node:url is a builtin.
 import {pathToFileURL} from 'node:url';
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
     printBench(runBench());
+    printBackingCompare(backingCompare());
 }

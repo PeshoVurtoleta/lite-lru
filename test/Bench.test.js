@@ -11,7 +11,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { beladyOpt, runBench } from '../benchmark/Bench.mjs';
+import { beladyOpt, runBench, backingCompare } from '../benchmark/Bench.mjs';
 import { LiteLru, Sieve } from '../Lru.js';
 
 /* -------------------------------------------------------------------------- *
@@ -223,6 +223,24 @@ test('runBench: SIEVE writesPerHit <= LiteLru writesPerHit on the skewed (zipf) 
     assert.ok(sieve.hits > 0 && lru.hits > 0, 'both members must register hits for the comparison to be meaningful');
     assert.ok(sieve.writesPerHit <= lru.writesPerHit,
         'Sieve writesPerHit=' + sieve.writesPerHit + ' > LiteLru writesPerHit=' + lru.writesPerHit);
+});
+
+test('backingCompare: reports the 3 keyed-index backings with IDENTICAL hit ratios (same policy, decisions/0029)', () => {
+    const out = backingCompare({ capacity: 32, length: 4000, seed: 0x2a });
+    assert.equal(typeof out.version, 'string');
+    assert.equal(out.capacity, 32);
+    assert.equal(out.ops, 4000);
+    assert.equal(out.maxKey, 32 * 16 - 1);
+    assert.ok(Array.isArray(out.rows));
+    assert.equal(out.rows.length, 3); // Map (default), keys:'int', keys:'dense'
+    assert.deepEqual(out.rows.map((r) => r.backing), ['Map (default)', "keys:'int'", "keys:'dense'"]);
+    // The backing is a substrate swap under ONE policy: the hit ratio is identical.
+    const h0 = out.rows[0].hitRatio;
+    for (const r of out.rows) {
+        assert.equal(r.hitRatio, h0, r.backing + ' hitRatio drifted from the Map backing');
+        assert.ok(r.hitRatio >= 0 && r.hitRatio <= 1, r.backing + ' hitRatio out of [0,1]');
+        assert.ok(Number.isFinite(r.nsPerOp) && r.nsPerOp > 0, r.backing + ' nsPerOp not a positive finite number');
+    }
 });
 
 test('runBench: deterministic for a fixed seed -- hitRatio/pctOptimal/writesPerHit are IDENTICAL across two runs (nsPerOp is NOT asserted)', () => {

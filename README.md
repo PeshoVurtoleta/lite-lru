@@ -116,6 +116,7 @@ The honest competitive read: `lru-cache` is already typed-array-backed and featu
 - **One `LiteCache<K,V>` surface** -- all thirteen members expose exactly `get` / `put` / `has` / `peek` / `delete` / `clear`, plus `size` and `capacity`. The recency/lazy-promotion/admission/adaptive/frequency difference is INTERNAL. Types ship in [`Lru.d.ts`](./Lru.d.ts); the interface is the type-checked contract that makes the one-line swap safe.
 - **`Bench.mjs`** -- a runnable ESM tool AND an importable module: `runBench(opts)` and `beladyOpt(trace, capacity)`. Feed it a trace, get per-policy hit ratio, writes-per-hit, machine-local ns/op, and percentage of Belady OPT.
 - **A `keys: 'int'` backing** -- opt in and the keyed index becomes an open-addressed typed-array table for STRICT zero allocation (even the index never allocates), with a fail-closed door for 32-bit signed integer keys.
+- **A `keys: 'dense'` backing (+ `DirectLru`)** -- for a SMALL, DENSE integer key domain `[0, maxKey]`, opt in and the keyed index becomes a **direct map** (`k -> slot`): the hot body is a single array read, **no hash, no probe, no per-op init**, and `clear()` is **O(1)**. STRICT zero allocation; the honest cost is **O(maxKey) space**, not O(entries). `DirectLru` is the one-line convenience wrapper (`new DirectLru(cap, { maxKey })`).
 - **A zero-GC `onEvict` hook** -- fired once per eviction with the evicted `(key, value)`, e.g. to return the value to a pool.
 
 ---
@@ -222,7 +223,8 @@ cache.capacity: number                      // fixed maximum, set at constructio
 ```ts
 interface LiteCacheOptions<K, V> {
   onEvict?: (key: K, value: V) => void;
-  keys?: "int";
+  keys?: "int" | "dense";
+  maxKey?: number;         // REQUIRED with keys: "dense" -- the dense domain [0, maxKey]
   ttl?: number;            // opt-in TTL default in ms (Infinity = never); see below
   clock?: () => number;    // injectable clock, defaults to Date.now
   stats?: true;            // opt into runtime counters; see Stats below
@@ -231,9 +233,41 @@ interface LiteCacheOptions<K, V> {
 
 - **`onEvict(key, value)`** -- called once per eviction with the evicted pair (e.g. to return a value to a pool). Zero-GC: pass a hoisted function, not a fresh closure per construction.
   - **Reentrancy contract (fires LAST, fail-closed).** `onEvict` fires AFTER the cache is fully consistent -- the newcomer already inserted, the victim already gone. It MUST NOT call `put`/`get`/`delete`/`clear` on the same instance; doing so throws a `[lite-lru]`-tagged `Error` rather than corrupting the intrusive lists mid-eviction. `has` and `peek` ARE allowed from within the callback (they cannot mutate) -- use them to inspect. An expiry reap fires `onEvict` under the same contract.
-- **`keys: "int"`** -- opt into the open-addressed typed-array keyed index for STRICT zero allocation (even the index never allocates -- no pre-fill caveat). Keys MUST be 32-bit signed integers in `[-2147483648, 2147483647]`; a non-integer or out-of-range key throws a `[lite-lru]`-tagged `TypeError` (fail-closed). Values remain arbitrary. Omitted, the default is a JS `Map`: arbitrary keys, honestly AMORTIZED (its internal resize can allocate), byte-identical to the pre-`keys` behavior. An unknown `keys` value throws with a did-you-mean hint.
+- **`keys: "int"`** -- opt into the open-addressed typed-array keyed index for STRICT zero allocation (even the index never allocates -- no pre-fill caveat). Keys MUST be 32-bit signed integers in `[-2147483648, 2147483647]`; a non-integer or out-of-range key throws a `[lite-lru]`-tagged `TypeError` (fail-closed). Values remain arbitrary. Omitted, the default is a JS `Map`: arbitrary keys, honestly AMORTIZED (its internal resize can allocate), byte-identical to the pre-`keys` behavior. An unknown `keys` value throws with a did-you-mean hint (naming both `'int'` and `'dense'`).
+- **`keys: "dense"` + `maxKey`** -- opt into the **direct-mapped, generation-stamped** typed-array index for a SMALL, DENSE integer key domain `[0, maxKey]`. The hot body is a single array read (`_gen[k] === _epoch ? _ixSlot[k] : NIL`) -- **no hash, no probe, no per-op init** -- and `clear()` is **O(1)** (an epoch bump; a disclosed-amortized O(U) reset only on epoch overflow). STRICT zero allocation. `maxKey` is **REQUIRED** (an integer in `[0, 2147483647]`, else a `[lite-lru]` `TypeError`); a key outside `[0, maxKey]` or non-integer throws (typeof guard first -- `0` is a legal key, never a miss sentinel). The honest cost is **O(maxKey) space** (two `[0, maxKey]` `Int32Array`s), NOT O(entries) -- reach for it when the domain is small and dense; use `keys: "int"` for large/sparse integer domains. `DirectLru` (below) is the convenience wrapper.
 - **`ttl` / `clock`** -- opt into time-to-live (see [TTL](#ttl----opt-in-lazy-expiry) below). Both are validated fail-closed at the door.
 - **`stats: true`** -- opt into runtime counters (see [Stats](#stats----opt-in-runtime-counters) below). Any value other than `true` (or omitted) throws a `[lite-lru]`-tagged `TypeError` with a did-you-mean hint.
+
+### `DirectLru` -- the dense-backing wrapper
+
+`DirectLru` is `LiteLru` pinned to the `keys: 'dense'` backing. `new DirectLru(cap, { maxKey })` is **byte-identical** to `new LiteLru(cap, { keys: 'dense', maxKey })` -- zero policy duplication, every hot path and `dump()`/`restore()` inherited:
+
+```ts
+import { DirectLru } from '@zakkster/lite-lru';
+
+const frames = new DirectLru<number, Frame>(1024, { maxKey: 65535 }); // ids 0..65535
+frames.put(42, frame);
+frames.get(42);   // direct map: one array read, no hash, no probe
+frames.clear();   // O(1): an epoch bump, not an O(entries) walk
+```
+
+**When to reach for which backing** -- same LRU policy, same hit ratio; only speed and space/allocation posture differ:
+
+| backing                      | keys                          | hot path              | allocation             | space        | best for |
+|------------------------------|-------------------------------|-----------------------|------------------------|--------------|----------|
+| default `Map`                | arbitrary (objects/strings/...) | `Map.get` + relink    | **amortized** (resize) | O(entries)   | arbitrary keys; the general case |
+| `keys: 'int'`                | 32-bit signed int, sparse ok  | hash + probe + relink | **strict zero**        | O(capacity)  | large / sparse integer domains |
+| `keys: 'dense'` / `DirectLru`| int `[0, maxKey]`, dense       | **one array read** (no hash/probe) + relink | **strict zero**, **O(1) `clear()`** | **O(maxKey)** | small, dense integer domains |
+
+Machine-local bench (same policy, integer dense-domain zipf, `capacity=256`, identical **57.4%** hit ratio -- reproduce on your own hardware with `npm run bench`):
+
+| backing          | ns/op |
+|------------------|------:|
+| default `Map`    | ~64   |
+| `keys: 'int'`    | ~50   |
+| `keys: 'dense'`  | ~40   |
+
+`keys: 'dense'` is the fastest of the three here (no hash, no probe) -- the trade is **O(maxKey) space** and integer-only keys in `[0, maxKey]`. When the key domain is large or sparse, `keys: 'int'` wins on space; when keys are not integers, the default `Map` is the only option.
 
 ### TTL -- opt-in, lazy expiry
 
@@ -367,7 +401,7 @@ Run directly, it prints a table; imported, it returns structured results and pri
 
 | Constant  | Value     | Meaning                                                       |
 | --------- | --------- | ------------------------------------------------------------ |
-| `VERSION` | `'1.16.1'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
+| `VERSION` | `'1.17.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
 
 All thirteen members and `VERSION` are named exports; `LiteLru` is also the default export.
 
@@ -427,6 +461,7 @@ An LRU has a hard capacity ceiling by definition, so all `capacity` slots are pr
 | ---------------------------------- | ------------------------ |
 | `get` / `put` / `delete` / `has` / `peek` (slot + list layer) | **0** |
 | keyed index, `keys: 'int'`         | **0** (open-addressed typed arrays, fixed at construction) |
+| keyed index, `keys: 'dense'`       | **0** (direct-mapped `_ixSlot` + `_gen` typed arrays, fixed at construction; `clear()` is O(1)) |
 | keyed index, default `Map`         | amortized (the Map's internal resize can allocate) |
 | construction                       | once (all slots + columns, then reused) |
 

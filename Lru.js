@@ -84,6 +84,17 @@ const INT_KEY_MSG =
 const INT_MIN = -2147483648;
 const INT_MAX = 2147483647;
 
+/** Fail-closed message for a bad dense-mode key (decisions/0029). Built once. Typeof
+ *  is guarded FIRST at the call site (null is not zero); this message carries the value. */
+const DENSE_KEY_MSG =
+    "[lite-lru] keys:'dense' requires an integer key in [0, maxKey], got ";
+
+/** Fail-closed message for a bad/absent `maxKey` on the dense backing (decisions/0029).
+ *  Built once. The dense backing direct-maps k -> slot over a fixed [0, maxKey] domain,
+ *  so `maxKey` is REQUIRED and must be a non-negative int32 (null is not zero). */
+const MAX_KEY_MSG =
+    "[lite-lru] keys:'dense' requires a maxKey integer in [0, " + INT_MAX + "], got ";
+
 /** S3-FIFO (decisions/0013) queue tags: which of the two intrusive rings a slot is
  *  in. Stored one byte per slot in `_q` so `_detach` can fix the RIGHT ring's
  *  head/tail without a per-slot object. A slot is in exactly one ring at a time. */
@@ -278,7 +289,7 @@ function validateStats(stats) {
 
 /** The option keys every constructor understands. An unknown key is a caller typo,
  *  and a typo is an error with a hint -- never a silent ignore (the fail-closed law). */
-const KNOWN_OPTS = ["onEvict", "keys", "ttl", "clock", "stats"];
+const KNOWN_OPTS = ["onEvict", "keys", "ttl", "clock", "stats", "maxKey"];
 
 /**
  * Suggest the closest known option key to an unknown one (cold, throw-path only).
@@ -335,7 +346,7 @@ function validateOnEvict(onEvict) {
     return onEvict;
 }
 
-export const VERSION = "1.16.1";
+export const VERSION = "1.17.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -453,6 +464,9 @@ class MapSlotStore extends SlotStore {
         // The hash half (D1/D3): key -> slot index. JS Map handles arbitrary key
         // types and SameValueZero equality for free. Amortized O(1).
         this._map = new Map();
+        // Explicit backing tag (decisions/0029). snapBase reads this instead of
+        // duck-typing on `checkStable` (which DirectSlotStore also has).
+        this._kind = "map";
     }
     get(key) { const s = this._map.get(key); return s === undefined ? NIL : s; }
     set(key, slot) { this._map.set(key, slot); }
@@ -487,6 +501,9 @@ class IntSlotStore extends SlotStore {
         // fixed. Captured here; checkStable() asserts they never change.
         this._ixSlotBytes = this._ixSlot.buffer.byteLength;
         this._ixKeyBytes = this._ixKey.buffer.byteLength;
+
+        // Explicit backing tag (decisions/0029). See MapSlotStore._kind.
+        this._kind = "int";
     }
 
     _ck(key) {
@@ -568,15 +585,123 @@ class IntSlotStore extends SlotStore {
 }
 
 /**
- * The shared store factory (decisions/0011). Fail closed on an unknown `keys`
+ * Direct-mapped, generation-stamped keyed index (opt-in `keys: 'dense'`), STRICT
+ * zero-alloc (decisions/0029). For a DENSE small-integer key domain [0, maxKey] the
+ * index is a DIRECT map k -> slot: no hash, no probe, no collision handling -- the
+ * hot body is a single `_gen[k] === _epoch ? _ixSlot[k] : NIL` array read.
+ *
+ * The no-init trick (borrowed from the sparse-set / SparseSet family): `_gen` is a
+ * zero-initialized Int32Array and `_epoch` starts at 1, so a NEVER-WRITTEN key reads
+ * `_gen[k] === 0 !== _epoch` = absent with NO O(U) pre-fill. clearIndex bumps the
+ * epoch (genuinely O(1)), which makes EVERY previously-stamped key read absent at once;
+ * the epoch domain is [1, INT_MAX] and 0 is the reserved DEAD sentinel (a deleted key).
+ * On the disclosed-amortized epoch overflow the `_gen` array is filled back to 0 and
+ * the epoch reset to 1 (a single O(U) event roughly every 2^31 clears).
+ *
+ * Space is O(maxKey), NOT O(entries): the two [0, maxKey] Int32Arrays are the honest
+ * co-headline (decisions/0029). Use this when the key domain is small and dense; use
+ * `keys: 'int'` when it is large/sparse.
+ */
+class DirectSlotStore extends SlotStore {
+    constructor(capacity, hasTtl, maxKey) {
+        super(capacity, hasTtl);
+        this._maxKey = maxKey;
+        // Direct map over the whole [0, maxKey] domain. `_ixSlot[k]` is the slot;
+        // `_gen[k]` is the generation stamp that makes it live iff it equals _epoch.
+        const span = maxKey + 1;
+        this._ixSlot = new Int32Array(span); // k -> slot (only meaningful when live)
+        this._gen = new Int32Array(span);    // k -> generation stamp; 0 = never/dead
+        this._epoch = 1;                     // current generation; 0 is the dead sentinel
+        this._count = 0;
+
+        // The index never resizes: the domain is fixed at construction. Captured here;
+        // checkStable() asserts the backing buffers never grow (mirrors IntSlotStore).
+        this._ixSlotBytes = this._ixSlot.buffer.byteLength;
+        this._genBytes = this._gen.buffer.byteLength;
+
+        // Explicit backing tag (decisions/0029). See MapSlotStore._kind.
+        this._kind = "dense";
+    }
+
+    _ck(key) {
+        if (typeof key !== "number" || !Number.isInteger(key) || key < 0 || key > this._maxKey) {
+            throw new TypeError(DENSE_KEY_MSG + String(key));
+        }
+    }
+
+    get(key) {
+        this._ck(key);
+        return this._gen[key] === this._epoch ? this._ixSlot[key] : NIL;
+    }
+
+    set(key, slot) {
+        this._ck(key);
+        if (this._gen[key] === this._epoch) {
+            this._ixSlot[key] = slot; // live update: same key, new slot
+            return;
+        }
+        this._gen[key] = this._epoch; // new stamp
+        this._ixSlot[key] = slot;
+        this._count++;
+    }
+
+    has(key) { return this.get(key) !== NIL; }
+
+    delete(key) {
+        this._ck(key);
+        if (this._gen[key] !== this._epoch) return; // absent
+        this._gen[key] = 0; // invalidate: 0 is the dead sentinel, never a live epoch
+        this._count--;
+    }
+
+    clearIndex() {
+        // Bumping the epoch makes every previously-stamped key read absent at once -- a
+        // genuine O(1) clear. Only on the disclosed-amortized wrap past INT_MAX do we pay
+        // one O(U) fill to reclaim the epoch domain (roughly once per 2^31 clears).
+        if (++this._epoch > INT_MAX) { this._gen.fill(0); this._epoch = 1; }
+        this._count = 0;
+    }
+
+    indexSize() { return this._count; }
+
+    indexEntries(cb) {
+        // O(U) -- cold path (dump only), never a hot path.
+        const slots = this._ixSlot, gen = this._gen, epoch = this._epoch;
+        for (let k = 0; k <= this._maxKey; k++) if (gen[k] === epoch) cb(k, slots[k]);
+    }
+
+    /** validate() cross-check (decisions/0029): the index buffers are fixed at
+     *  construction and must NEVER grow. Throws if either backing store resized. */
+    checkStable() {
+        if (this._ixSlot.buffer.byteLength !== this._ixSlotBytes ||
+            this._gen.buffer.byteLength !== this._genBytes) {
+            throw new Error(
+                '[validate] dense index buffer grew (must be fixed at construction)');
+        }
+    }
+}
+
+/** Validate a dense-backing `maxKey` (decisions/0029). Fail closed at the door: a
+ *  non-number / non-integer / out-of-[0, INT_MAX] value throws (null is not zero).
+ *  Cold, called once per dense-store construction. */
+function validateMaxKey(maxKey) {
+    if (typeof maxKey !== "number" || !Number.isInteger(maxKey) || maxKey < 0 || maxKey > INT_MAX) {
+        throw new TypeError(MAX_KEY_MSG + String(maxKey));
+    }
+    return maxKey;
+}
+
+/**
+ * The shared store factory (decisions/0011 + 0029). Fail closed on an unknown `keys`
  * value. Both `LiteLru` and `Sieve` (decisions/0012) ride this ONE factory so the
  * keyed-index backing choice + int-key door stay identical across the family.
  */
-function newStore(capacity, keys, hasTtl) {
+function newStore(capacity, keys, hasTtl, maxKey) {
     if (keys === undefined) return new MapSlotStore(capacity, hasTtl);
     if (keys === 'int') return new IntSlotStore(capacity, hasTtl);
+    if (keys === 'dense') return new DirectSlotStore(capacity, hasTtl, validateMaxKey(maxKey));
     throw new TypeError(
-        "[lite-lru] unknown keys option " + String(keys) + " (did you mean 'int'?)");
+        "[lite-lru] unknown keys option " + String(keys) + " (did you mean 'int' or 'dense'?)");
 }
 
 /* -------------------------------------------------------------------------- *
@@ -690,18 +815,25 @@ const SNAP_FORMAT = "litelru/1";
  *  not zero": a corrupt/mismatched snapshot is a caller bug, never a silent empty cache. */
 const SNAP_BAD = "[lite-lru] cannot restore snapshot: ";
 
-/** Base tag for a dump (decisions/0021, D21.3). `keys` is the backing kind ('int' for
- *  the open-addressed typed-array index, else null for the Map backing), `ttl` records
- *  whether an `_exp` column exists, and `t` stamps capture time (D21 TTL-verbatim note). */
+/** Base tag for a dump (decisions/0021 + 0029, D21.3). `keys` is the backing kind read
+ *  from the store's explicit `_kind` tag -- 'int' (open-addressed typed-array index),
+ *  'dense' (direct-mapped index; also emits `mk` = maxKey so restore rebuilds the right
+ *  size), else null for the Map backing. Reading `_kind` (not duck-typing on `checkStable`,
+ *  which BOTH the int AND dense stores have) is what keeps the two typed-array backings
+ *  distinct. `ttl` records whether an `_exp` column exists; `t` stamps capture time. */
 function snapBase(cache, member) {
-    return {
+    const store = cache._store;
+    const kind = store._kind;
+    const o = {
         f: SNAP_FORMAT,
         m: member,
         cap: cache._capacity,
-        keys: (typeof cache._store.checkStable === "function") ? "int" : null,
+        keys: kind === "map" ? null : kind,
         ttl: cache._exp !== null,
         t: cache._clock(),
     };
+    if (kind === "dense") o.mk = store._maxKey; // maxKey: restore rebuilds the [0, mk] domain
+    return o;
 }
 
 /** Capture one intrusive list (head -> _next -> NIL) as aligned plain arrays: the
@@ -770,8 +902,17 @@ function snapRead(snap, member, opts) {
     if (!Number.isInteger(cap) || cap < 1) {
         throw new Error(SNAP_BAD + "capacity must be an integer >= 1, got " + String(cap));
     }
-    if (snap.keys !== "int" && snap.keys !== null) {
-        throw new Error(SNAP_BAD + "keys backing must be 'int' or null, got " + String(snap.keys));
+    if (snap.keys !== "int" && snap.keys !== "dense" && snap.keys !== null) {
+        throw new Error(SNAP_BAD + "keys backing must be 'int', 'dense' or null, got " + String(snap.keys));
+    }
+    if (snap.keys === "dense") {
+        // The dense backing direct-maps over [0, mk]; restore MUST know mk to size the
+        // index (null is not zero -- a missing/bad mk fails closed, decisions/0029).
+        if (!Number.isInteger(snap.mk) || snap.mk < 0 || snap.mk > INT_MAX) {
+            throw new Error(SNAP_BAD + "dense snapshot mk (maxKey) must be an integer in [0, " + INT_MAX + "], got " + String(snap.mk));
+        }
+    } else if (snap.mk !== undefined) {
+        throw new Error(SNAP_BAD + "non-dense snapshot carries an mk (maxKey) field it must not");
     }
     if (typeof snap.ttl !== "boolean") {
         throw new Error(SNAP_BAD + "ttl flag must be a boolean, got " + String(snap.ttl));
@@ -780,7 +921,10 @@ function snapRead(snap, member, opts) {
     if (o.capacity !== undefined && o.capacity !== cap) {
         throw new Error(SNAP_BAD + "capacity opt (" + String(o.capacity) + ") conflicts with the snapshot (" + cap + ")");
     }
-    if (o.keys !== undefined && ((o.keys === "int") !== (snap.keys === "int"))) {
+    // The backing kind the opts would build must match the snapshot's backing exactly.
+    const wantKind = o.keys === undefined ? undefined : (o.keys === "int" || o.keys === "dense" ? o.keys : "map");
+    const snapKind = snap.keys === null ? "map" : snap.keys;
+    if (wantKind !== undefined && wantKind !== snapKind) {
         throw new Error(SNAP_BAD + "keys opt (" + String(o.keys) + ") conflicts with the snapshot backing (" + String(snap.keys) + ")");
     }
     if (snap.ttl) {
@@ -800,6 +944,7 @@ function snapOpts(snap, opts) {
     const o = opts || {};
     const c = {};
     if (snap.keys === "int") c.keys = "int";
+    if (snap.keys === "dense") { c.keys = "dense"; c.maxKey = snap.mk; } // rebuild the [0, mk] domain
     if (snap.ttl) c.ttl = o.ttl;             // required (validated in snapRead); sets the future default
     if (o.clock !== undefined) c.clock = o.clock;
     if (o.onEvict !== undefined) c.onEvict = o.onEvict;
@@ -963,7 +1108,7 @@ export class LiteLru {
         // The keyed-index backing is chosen ONCE here (decisions/0011); each hot
         // path stays monomorphic. The store owns the columns + free stack (and the
         // opt-in `_exp` ttl column).
-        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined, options && options.maxKey);
 
         // Cache references to the store's columns so the DLL relinks stay direct
         // (and so test/debug introspection -- validate, torture -- keeps working).
@@ -994,8 +1139,8 @@ export class LiteLru {
     /** The store factory (decisions/0011), delegating to the shared `newStore` so
      *  every family member composes the SAME substrate + int-key door. A
      *  member/control can override this to compose a different substrate. */
-    _makeStore(capacity, keys, hasTtl) {
-        return newStore(capacity, keys, hasTtl);
+    _makeStore(capacity, keys, hasTtl, maxKey) {
+        return newStore(capacity, keys, hasTtl, maxKey);
     }
 
     get size() { return this._size; }
@@ -1270,6 +1415,57 @@ export class LiteLru {
 }
 
 /* -------------------------------------------------------------------------- *
+ * DirectLru -- LiteLru pinned to the DIRECT-MAPPED dense backing (decisions/0029).
+ * A THIN convenience subclass: it fixes `keys: 'dense'` and forwards `maxKey` to the
+ * SAME LiteLru constructor, so there is ZERO policy duplication -- every hot path
+ * (get/put/delete/has/peek/clear), the DLL, and dump/restore are inherited verbatim.
+ * `new DirectLru(cap, { maxKey })` is byte-for-byte equivalent to
+ * `new LiteLru(cap, { keys: 'dense', maxKey })`.
+ * -------------------------------------------------------------------------- */
+
+/** Merge the caller's options with the fixed `keys: 'dense'` (decisions/0029). COLD
+ *  (one object built at construction, never on a hot path). Fail closed on a
+ *  contradictory `keys` value (null is not zero); everything else forwards unchanged
+ *  and LiteLru's own `validateOptions` vets the rest. An explicit build (not a spread)
+ *  keeps the options object a stable, monomorphic shape. */
+function denseOptions(options) {
+    if (options !== undefined && (options === null || typeof options !== "object")) {
+        throw new TypeError("[lite-lru] options must be an object, got " + String(options));
+    }
+    const o = options || {};
+    if (o.keys !== undefined && o.keys !== "dense") {
+        throw new TypeError(
+            "[lite-lru] DirectLru fixes keys:'dense'; got a conflicting keys option " + String(o.keys));
+    }
+    return {
+        keys: "dense",
+        maxKey: o.maxKey,
+        onEvict: o.onEvict,
+        ttl: o.ttl,
+        clock: o.clock,
+        stats: o.stats,
+    };
+}
+
+export class DirectLru extends LiteLru {
+    /**
+     * @param {number} capacity  Max entries. Must be an integer >= 1.
+     * @param {{ maxKey: number, onEvict?, ttl?, clock?, stats? }} options  `maxKey` is
+     *        REQUIRED (the dense key domain [0, maxKey]); the rest match LiteCacheOptions.
+     */
+    constructor(capacity, options) {
+        super(capacity, denseOptions(options));
+    }
+
+    /** Reconstruct from a dense `dump()` snapshot (decisions/0021 + 0029). Delegates to
+     *  LiteLru.restore: the snapshot already carries keys:'dense' + mk, so the rebuilt
+     *  instance is a LiteLru with the dense backing (a DirectLru is exactly that). */
+    static restore(snap, opts) {
+        return LiteLru.restore(snap, opts);
+    }
+}
+
+/* -------------------------------------------------------------------------- *
  * Sieve -- a lazy-promotion FIFO policy over the SAME SlotStore substrate
  * (decisions/0012, D12). The first modern eviction-policy family member; ships as
  * a SECOND named export in this file (the file-shape ruling: single main file +
@@ -1317,7 +1513,7 @@ export class Sieve {
         this._ttl = validateTtl(options && options.ttl);
 
         // Same shared substrate + int-key door as LiteLru (decisions/0011, 0012).
-        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined, options && options.maxKey);
 
         // Cache the store's columns so the ring relinks stay direct (and so the
         // conservation invariant + torture introspection keep working).
@@ -1344,8 +1540,8 @@ export class Sieve {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys, hasTtl) {
-        return newStore(capacity, keys, hasTtl);
+    _makeStore(capacity, keys, hasTtl, maxKey) {
+        return newStore(capacity, keys, hasTtl, maxKey);
     }
 
     get size() { return this._size; }
@@ -1716,7 +1912,7 @@ export class S3Fifo {
         this._ttl = validateTtl(options && options.ttl);
 
         // Same shared substrate + int-key door as the rest of the family.
-        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined, options && options.maxKey);
 
         // Cache the store's columns so the ring relinks stay direct (and so the
         // conservation invariant + torture introspection keep working).
@@ -1774,8 +1970,8 @@ export class S3Fifo {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys, hasTtl) {
-        return newStore(capacity, keys, hasTtl);
+    _makeStore(capacity, keys, hasTtl, maxKey) {
+        return newStore(capacity, keys, hasTtl, maxKey);
     }
 
     get size() { return this._size; }
@@ -2363,7 +2559,7 @@ export class WTinyLfu {
         this._ttl = validateTtl(options && options.ttl);
 
         // Same shared substrate + int-key door as the rest of the family.
-        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined, options && options.maxKey);
 
         // Cache the store's columns so the list relinks stay direct.
         this._keys = this._store._keys;
@@ -2405,8 +2601,8 @@ export class WTinyLfu {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys, hasTtl) {
-        return newStore(capacity, keys, hasTtl);
+    _makeStore(capacity, keys, hasTtl, maxKey) {
+        return newStore(capacity, keys, hasTtl, maxKey);
     }
 
     get size() { return this._size; }
@@ -2873,7 +3069,7 @@ export class Slru {
         this._ttl = validateTtl(options && options.ttl);
 
         // Same shared substrate + int-key door as the rest of the family.
-        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined, options && options.maxKey);
 
         // Cache the store's columns so the list relinks stay direct.
         this._keys = this._store._keys;
@@ -2904,8 +3100,8 @@ export class Slru {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys, hasTtl) {
-        return newStore(capacity, keys, hasTtl);
+    _makeStore(capacity, keys, hasTtl, maxKey) {
+        return newStore(capacity, keys, hasTtl, maxKey);
     }
 
     get size() { return this._size; }
@@ -3245,7 +3441,7 @@ export class TwoQ {
         this._ttl = validateTtl(options && options.ttl);
 
         // Same shared substrate + int-key door as the rest of the family.
-        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined, options && options.maxKey);
 
         // Cache the store's columns so the queue relinks stay direct.
         this._keys = this._store._keys;
@@ -3302,8 +3498,8 @@ export class TwoQ {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys, hasTtl) {
-        return newStore(capacity, keys, hasTtl);
+    _makeStore(capacity, keys, hasTtl, maxKey) {
+        return newStore(capacity, keys, hasTtl, maxKey);
     }
 
     get size() { return this._size; }
@@ -3932,7 +4128,7 @@ export class Arc {
         this._ttl = validateTtl(options && options.ttl);
 
         // Same shared substrate + int-key door as the rest of the family.
-        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined, options && options.maxKey);
 
         // Cache the store's columns so the list relinks stay direct.
         this._keys = this._store._keys;
@@ -3968,8 +4164,8 @@ export class Arc {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys, hasTtl) {
-        return newStore(capacity, keys, hasTtl);
+    _makeStore(capacity, keys, hasTtl, maxKey) {
+        return newStore(capacity, keys, hasTtl, maxKey);
     }
 
     get size() { return this._size; }
@@ -4424,7 +4620,7 @@ export class Lirs {
         this._ttl = validateTtl(options && options.ttl);
 
         // Same shared substrate + int-key door as every other member.
-        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined, options && options.maxKey);
 
         // Cache the store's columns so the relinks stay direct.
         this._keys = this._store._keys;
@@ -4473,8 +4669,8 @@ export class Lirs {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys, hasTtl) {
-        return newStore(capacity, keys, hasTtl);
+    _makeStore(capacity, keys, hasTtl, maxKey) {
+        return newStore(capacity, keys, hasTtl, maxKey);
     }
 
     get size() { return this._size; }
@@ -4995,7 +5191,7 @@ export class Lfu {
         this._ttl = validateTtl(options && options.ttl);
 
         // Same shared substrate + int-key door as the rest of the family.
-        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined, options && options.maxKey);
 
         // Cache the store's columns. Lfu's ACTIVE key lists ride the member columns
         // `_fNext`/`_fPrev` (below), NOT the shared `_next`/`_prev`; the store's `_next`
@@ -5038,8 +5234,8 @@ export class Lfu {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys, hasTtl) {
-        return newStore(capacity, keys, hasTtl);
+    _makeStore(capacity, keys, hasTtl, maxKey) {
+        return newStore(capacity, keys, hasTtl, maxKey);
     }
 
     get size() { return this._size; }
@@ -5531,7 +5727,7 @@ export class ClockPro {
         this._ttl = validateTtl(options && options.ttl);
 
         // Same shared substrate + int-key door as every other member.
-        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined, options && options.maxKey);
 
         // Cache the store's columns so the ring relinks stay direct. `_next` toward the
         // tail (older), `_prev` toward the head (newer); the hands WRAP `_next[tail] -> head`.
@@ -5577,8 +5773,8 @@ export class ClockPro {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys, hasTtl) {
-        return newStore(capacity, keys, hasTtl);
+    _makeStore(capacity, keys, hasTtl, maxKey) {
+        return newStore(capacity, keys, hasTtl, maxKey);
     }
 
     get size() { return this._size; }
@@ -6157,7 +6353,7 @@ export class LruK {
         this._ttl = validateTtl(options && options.ttl);
 
         // Same shared substrate + int-key door as every other member.
-        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined, options && options.maxKey);
 
         // Cache the store's columns so the relinks stay direct. `_next` toward the tail
         // (older), `_prev` toward the head (newer); the two lists are disjoint over them.
@@ -6205,8 +6401,8 @@ export class LruK {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys, hasTtl) {
-        return newStore(capacity, keys, hasTtl);
+    _makeStore(capacity, keys, hasTtl, maxKey) {
+        return newStore(capacity, keys, hasTtl, maxKey);
     }
 
     get size() { return this._size; }
@@ -6784,7 +6980,7 @@ export class Mq {
         this._ttl = validateTtl(options && options.ttl);
 
         // Same shared substrate + int-key door as every other member.
-        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined, options && options.maxKey);
 
         // Cache the store's columns so the relinks stay direct. The 8 queues are DISJOINT over
         // the shared `_next`/`_prev` columns (a slot is in exactly one), so validate()/iteration/
@@ -6827,8 +7023,8 @@ export class Mq {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys, hasTtl) {
-        return newStore(capacity, keys, hasTtl);
+    _makeStore(capacity, keys, hasTtl, maxKey) {
+        return newStore(capacity, keys, hasTtl, maxKey);
     }
 
     get size() { return this._size; }
@@ -7334,7 +7530,7 @@ export class Car {
         this._ttl = validateTtl(options && options.ttl);
 
         // Same shared substrate + int-key door as every other member.
-        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined);
+        this._store = this._makeStore(capacity, options && options.keys, this._ttl !== undefined, options && options.maxKey);
 
         // Cache the store's columns so the clock relinks stay direct. `_next` toward the
         // tail (older), `_prev` toward the head (newer); the hands WRAP `_next[tail] -> head`.
@@ -7377,8 +7573,8 @@ export class Car {
     }
 
     /** The store factory, delegating to the shared `newStore` (decisions/0011). */
-    _makeStore(capacity, keys, hasTtl) {
-        return newStore(capacity, keys, hasTtl);
+    _makeStore(capacity, keys, hasTtl, maxKey) {
+        return newStore(capacity, keys, hasTtl, maxKey);
     }
 
     get size() { return this._size; }

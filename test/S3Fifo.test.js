@@ -21,7 +21,7 @@ const Q_SMALL = 0; // matches Lru.js's S3-FIFO queue tags
 const Q_MAIN = 1;
 
 test('exports: VERSION and the named S3Fifo export are present', async () => {
-    assert.equal(VERSION, '1.16.1');
+    assert.equal(VERSION, '1.17.0');
     const mod = await import('../Lru.js');
     assert.equal(mod.S3Fifo, S3Fifo);
 });
@@ -226,7 +226,7 @@ for (const bad of ['Int', 'INT', 'string', 'map', 0, 1, true, {}, [], null]) {
             assert.ok(err instanceof TypeError);
             assert.match(err.message, /\[lite-lru\]/);
             assert.match(err.message, /unknown keys option/);
-            assert.match(err.message, /did you mean 'int'\?/);
+            assert.match(err.message, /did you mean 'int' or 'dense'\?/);
             return true;
         });
     });

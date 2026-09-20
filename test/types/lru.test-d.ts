@@ -9,7 +9,7 @@
  * stops happening (tsc flags an unused directive). Test-only; not in files[].
  * ASCII-only.
  */
-import LiteLru, { VERSION, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu } from "../../Lru.js";
+import LiteLru, { VERSION, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, DirectLru } from "../../Lru.js";
 import type { LiteCache, LiteCacheOptions } from "../../Lru.js";
 
 // A type-equality check with teeth (identity holds only for exact-equal types).
@@ -334,3 +334,33 @@ new Lfu<number, number>(10, { keys: "lfu" });
 
 // @ts-expect-error -- size is readonly on Lfu.
 lf.size = 5;
+
+// ---- keys:'dense' backing + maxKey (decisions/0029) --------------------------
+new LiteLru<number, number>(10, { keys: "dense", maxKey: 1023 });
+const denseOpts: LiteCacheOptions<number, number> = { keys: "dense", maxKey: 64 };
+void denseOpts;
+
+// @ts-expect-error -- maxKey must be a number.
+new LiteLru<number, number>(10, { keys: "dense", maxKey: "1023" });
+
+// ---- DirectLru: LiteLru pinned to the dense backing SATISFIES LiteCache -------
+// (decisions/0029) The one-line policy swap: `new DirectLru(n, { maxKey })` is a
+// LiteLru and type-checks into the SAME `LiteCache` binding as every other member.
+const dl = new DirectLru<number, number>(10, { maxKey: 255 });
+const dlGot = dl.get(1);
+expectTrue<Equal<typeof dlGot, number | undefined>>();
+expectTrue<Equal<ReturnType<typeof dl.has>, boolean>>();
+expectTrue<Equal<typeof dl.capacity, number>>();
+const dlIface: LiteCache<number, number> = new DirectLru<number, number>(10, { maxKey: 255 });
+dlIface.put(1, 1);
+const dlTtl = new DirectLru<number, number>(10, { maxKey: 255, ttl: 5 });
+expectTrue<Equal<ReturnType<typeof dlTtl.purgeStale>, number>>();
+
+// @ts-expect-error -- maxKey is required on DirectLru.
+new DirectLru<number, number>(10);
+
+// @ts-expect-error -- V is number; a string value is rejected on DirectLru too.
+dl.put(1, "not-a-number");
+
+// @ts-expect-error -- size is readonly on DirectLru.
+dl.size = 5;

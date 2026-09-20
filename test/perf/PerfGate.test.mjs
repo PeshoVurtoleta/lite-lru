@@ -111,12 +111,74 @@ function putChurnScenario(m) {
     };
 }
 
-/** 26 scenarios: get-hit + put-churn for each of the 13 members. */
+/**
+ * The dense-backing zero-alloc counter (decisions/0029): the direct-mapped index is
+ * the `_ixSlot` (k -> slot) + `_gen` (generation stamp) typed arrays -- fixed at
+ * construction, so the delta across the window must be 0. Dense stores expose `_gen`
+ * (not `_ixKey`), so it needs its own counter reader.
+ */
+function denseGrows(c) {
+    return c._store._ixSlot.buffer.byteLength + c._store._gen.buffer.byteLength;
+}
+
+// A dense domain comfortably larger than CAP so a cycling key stream drives real
+// insert+evict churn, yet bounded so keys never leave [0, DENSE_MK] (fail-closed door).
+const DENSE_MK = CAP * 4 - 1;
+const DENSE_SPAN = CAP * 4;
+
+/** dense get-hit: a pre-filled at-capacity dense cache; every op is a resident direct-map
+ *  hit + relink (NO hash, NO probe). Scavenge-clean; the index buffers never grow. */
+function denseGetHitScenario(m) {
+    return {
+        name: m.name + ' get-hit (dense)',
+        setup() {
+            const c = new m.Ctor(CAP, { keys: 'dense', maxKey: DENSE_MK });
+            for (let i = 0; i < CAP; i++) c.put(i, (i * 3 + 1) & 0xffff);
+            return { c, acc: 0 };
+        },
+        hot(s, n) {
+            const c = s.c;
+            let acc = s.acc | 0;
+            for (let i = 0; i < n; i++) acc = (acc + (c.get(i & MASK) | 0)) | 0; // int32-wrapped
+            s.acc = acc | 0;
+        },
+        statsOf(s) { return { grows: denseGrows(s.c) }; },
+    };
+}
+
+/** dense put-churn: keys cycle over a domain 4x capacity, so most ops insert a fresh key
+ *  and evict the LRU (a generation-stamp write + a stamp invalidate) -- the rest update in
+ *  place. Bounded to [0, DENSE_MK] so the fail-closed key door never fires. Scavenge-clean. */
+function densePutChurnScenario(m) {
+    return {
+        name: m.name + ' put-churn (dense)',
+        setup() {
+            const c = new m.Ctor(CAP, { keys: 'dense', maxKey: DENSE_MK });
+            for (let i = 0; i < CAP; i++) c.put(i, i & 0xffff);
+            return { c, k: 0 };
+        },
+        hot(s, n) {
+            const c = s.c;
+            let k = s.k | 0;
+            for (let i = 0; i < n; i++) {
+                c.put(k, k & 0xffff);          // SMI value; direct-map, no hash/probe
+                k = (k + 1) % DENSE_SPAN;      // cycle within the bounded dense domain
+            }
+            s.k = k | 0;
+        },
+        statsOf(s) { return { grows: denseGrows(s.c) }; },
+    };
+}
+
+/** 26 int scenarios (get-hit + put-churn per member) + 2 dense scenarios on the
+ *  reference member (the dense backing is a shared substrate, LiteLru proves it). */
 const scenarios = [];
 for (let i = 0; i < MEMBERS.length; i++) {
     scenarios.push(getHitScenario(MEMBERS[i]));
     scenarios.push(putChurnScenario(MEMBERS[i]));
 }
+scenarios.push(denseGetHitScenario(MEMBERS[0]));
+scenarios.push(densePutChurnScenario(MEMBERS[0]));
 
 /**
  * The teeth: an object-key churn on the Map backing that allocates one `{ id }` per

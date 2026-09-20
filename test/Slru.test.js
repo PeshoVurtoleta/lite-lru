@@ -20,7 +20,7 @@ const SLRU_PROBATION = 0; // matches Lru.js tags
 const SLRU_PROTECTED = 1;
 
 test('exports: VERSION and the named Slru export are present', async () => {
-    assert.equal(VERSION, '1.16.1');
+    assert.equal(VERSION, '1.17.0');
     const mod = await import('../Lru.js');
     assert.equal(mod.Slru, Slru);
 });
@@ -201,7 +201,7 @@ for (const bad of ['Int', 'map', 0, true, {}, null]) {
         assert.throws(() => new Slru(4, { keys: bad }), (err) => {
             assert.ok(err instanceof TypeError);
             assert.match(err.message, /\[lite-lru\]/);
-            assert.match(err.message, /did you mean 'int'\?/);
+            assert.match(err.message, /did you mean 'int' or 'dense'\?/);
             return true;
         });
     });

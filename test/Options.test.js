@@ -26,7 +26,7 @@ const MEMBERS = [
     ['ClockPro', ClockPro], ['LruK', LruK], ['Mq', Mq], ['Car', Car],
 ];
 
-const KNOWN_KEYS = ['onEvict', 'keys', 'ttl', 'clock', 'stats'];
+const KNOWN_KEYS = ['onEvict', 'keys', 'ttl', 'clock', 'stats', 'maxKey'];
 
 /* ============================================================================ *
  * TASK 1 -- unknown option key: did-you-mean hint (near-miss) + the full valid
@@ -247,7 +247,7 @@ for (const [name, Cls] of MEMBERS) {
             assert.ok(err instanceof TypeError);
             assert.match(err.message, /\[lite-lru\]/);
             assert.match(err.message, /unknown keys option/);
-            assert.match(err.message, /did you mean 'int'\?/);
+            assert.match(err.message, /did you mean 'int' or 'dense'\?/);
             return true;
         });
     });
@@ -280,3 +280,57 @@ test('BONUS adversarial: a Proxy hiding onEvict from ownKeys/for...in enumeratio
         return true;
     });
 });
+
+/* ============================================================================ *
+ * TASK 5 -- the keys:'dense' backing doors (decisions/0029), parameterized over
+ * all 13 members. The dense backing direct-maps k -> slot over a fixed [0, maxKey]
+ * domain, so `maxKey` is REQUIRED and every dense key must fall in that domain --
+ * both fail CLOSED at the door (null is not zero), with the typeof guard FIRST.
+ * ============================================================================ */
+
+for (const [name, Cls] of MEMBERS) {
+    test(name + ": keys:'dense' without maxKey throws a tagged [lite-lru] maxKey error", () => {
+        assert.throws(() => new Cls(4, { keys: 'dense' }), (err) => {
+            assert.ok(err instanceof TypeError);
+            assert.match(err.message, /\[lite-lru\]/);
+            assert.match(err.message, /maxKey/);
+            return true;
+        });
+    });
+
+    for (const badMk of [-1, 1.5, 2147483648, '10', null, true]) {
+        test(name + ": keys:'dense' with maxKey " + String(badMk) + ' fails closed', () => {
+            assert.throws(() => new Cls(4, { keys: 'dense', maxKey: badMk }), (err) => {
+                assert.ok(err instanceof TypeError);
+                assert.match(err.message, /\[lite-lru\]/);
+                assert.match(err.message, /maxKey/);
+                return true;
+            });
+        });
+    }
+
+    test(name + ": keys:'dense' with a valid maxKey rejects an out-of-[0,maxKey] key, fail closed", () => {
+        const c = new Cls(4, { keys: 'dense', maxKey: 15 });
+        for (const badKey of [-1, 16, 1.5, '3', null, {}]) {
+            assert.throws(() => c.get(badKey), (err) => {
+                assert.ok(err instanceof TypeError);
+                assert.match(err.message, /\[lite-lru\]/);
+                assert.match(err.message, /dense/);
+                return true;
+            }, name + ' key ' + String(badKey));
+        }
+        // A legal in-domain key (incl. 0 and maxKey) round-trips.
+        c.put(0, 'a'); c.put(15, 'b');
+        assert.equal(c.get(0), 'a');
+        assert.equal(c.get(15), 'b');
+    });
+
+    test(name + ": an unknown keys value suggests both 'int' and 'dense'", () => {
+        assert.throws(() => new Cls(4, { keys: 'nope' }), (err) => {
+            assert.ok(err instanceof TypeError);
+            assert.match(err.message, /\[lite-lru\]/);
+            assert.match(err.message, /did you mean 'int' or 'dense'\?/);
+            return true;
+        });
+    });
+}

@@ -395,6 +395,137 @@ export async function run() {
             ' settled=' + gia.result.settled + ' bytesPerCall=' + gia.bytesPerCall);
     }
 
+    // --- Gate DENSE: the direct-mapped backing -- STRICT, NO pre-fill caveat -----
+    // (decisions/0029) The dense (keys:'dense') index direct-maps k -> slot over a
+    // fixed [0, maxKey] domain: the hot body is a single `_gen[k] === _epoch` array
+    // read, NO hash + NO probe. Two lanes prove the whole hot surface is 0 B/op:
+    //   (1) CHURN: fresh, strictly-increasing dense keys from an EMPTY cache over a
+    //       LARGE domain, so after warm-up every op inserts a fresh key AND evicts the
+    //       LRU (a live-stamp write + a stamp invalidate). The `_ixSlot`/`_gen` index
+    //       buffers must never grow.
+    //   (2) MIXED + O(1) CLEAR: get/put/delete/has/peek on a SMALL bounded domain, plus
+    //       repeated clear() cycles (the epoch-bump O(1) clear) -- all zero-alloc.
+    const DENSE_MK = (1 << 20) - 1; // large domain so the churn keys never wrap/throw
+    const dcache = new LiteLru(CAP, { keys: 'dense', maxKey: DENSE_MK });
+    const dNextBytes = dcache._next.buffer.byteLength;
+    const dIxSlotBytes = dcache._store._ixSlot.buffer.byteLength;
+    const dGenBytes = dcache._store._gen.buffer.byteLength;
+    let dk = 0;
+    const denseHot = () => {
+        dcache.put(dk, dk & 0xffff); // fresh dense key each op; SMI value (no boxing)
+        dk++;
+    };
+    const gd = countOps(denseHot, { ops: OPS, warmup: WARMUP });
+    check(dcache._next.buffer.byteLength === dNextBytes,
+        () => 't6 Gate DENSE: _next.buffer grew ' + dNextBytes + ' -> ' + dcache._next.buffer.byteLength);
+    check(dcache._store._ixSlot.buffer.byteLength === dIxSlotBytes,
+        () => 't6 Gate DENSE: _ixSlot.buffer grew ' + dIxSlotBytes + ' -> ' + dcache._store._ixSlot.buffer.byteLength);
+    check(dcache._store._gen.buffer.byteLength === dGenBytes,
+        () => 't6 Gate DENSE: _gen.buffer grew ' + dGenBytes + ' -> ' + dcache._store._gen.buffer.byteLength);
+    check(dcache.size === CAP, () => 't6 Gate DENSE: churn did not stay at capacity (size ' + dcache.size + ')');
+    if (!gd.report.ok) {
+        const g = gd.summary.gc;
+        die('t6 Gate DENSE (dense churn) ops gate rejected -- verdict=' + gd.report.verdict +
+            ' source=' + gd.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gda = countAllocs(denseHot, { iterations: 50000, batches: 8 });
+    if (!gda.ok) {
+        die('t6 Gate DENSE (dense churn) retained-alloc gate rejected -- verdict=' + gda.report.verdict +
+            ' settled=' + gda.result.settled + ' bytesPerCall=' + gda.bytesPerCall);
+    }
+
+    // Lane 2: get/put/delete/has/peek on a SMALL bounded domain + the O(1) clear cycle.
+    // A pre-filled at-capacity dense cache over [0, CAP-1]; the mixed body only touches
+    // resident keys (direct-map reads + a link relink / value write), zero-alloc.
+    const dm = new LiteLru(CAP, { keys: 'dense', maxKey: MASK });
+    for (let i = 0; i < CAP; i++) dm.put(i, i * 3 + 1);
+    check(dm.size === CAP, () => 't6 Gate DENSE: mixed pre-fill did not reach capacity');
+    const dmNextBytes = dm._next.buffer.byteLength;
+    const dmGenBytes = dm._store._gen.buffer.byteLength;
+    const dsink = new Int32Array(1);
+    const denseMixed = (i) => {
+        const k = i & MASK;
+        const r = i % 5;
+        if (r === 0) dsink[0] += dm.get(k) | 0;
+        else if (r === 1) dm.put(k, i);
+        else if (r === 2) { if (dm.has(k)) dsink[0] += 1; }
+        else if (r === 3) dsink[0] += dm.peek(k) | 0;
+        else { dm.delete(k); dm.put(k, i); } // delete + reinsert (stamp invalidate + fresh stamp)
+    };
+    const gdm = countOps(denseMixed, { ops: OPS, warmup: WARMUP });
+    check(dm._next.buffer.byteLength === dmNextBytes,
+        () => 't6 Gate DENSE: mixed _next.buffer grew ' + dmNextBytes + ' -> ' + dm._next.buffer.byteLength);
+    check(dm._store._gen.buffer.byteLength === dmGenBytes,
+        () => 't6 Gate DENSE: mixed _gen.buffer grew ' + dmGenBytes + ' -> ' + dm._store._gen.buffer.byteLength);
+    if (!gdm.report.ok) {
+        const g = gdm.summary.gc;
+        die('t6 Gate DENSE (mixed) ops gate rejected -- verdict=' + gdm.report.verdict +
+            ' source=' + gdm.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gdma = countAllocs(denseMixed, { iterations: 50000, batches: 8 });
+    if (!gdma.ok) {
+        die('t6 Gate DENSE (mixed) retained-alloc gate rejected -- verdict=' + gdma.report.verdict +
+            ' settled=' + gdma.result.settled + ' bytesPerCall=' + gdma.bytesPerCall);
+    }
+
+    // O(1) clear cycle, MEASURED zero-alloc: fill CAP dense keys then clear() (an epoch
+    // bump, no O(U) fill), over and over. The epoch never overflows in this window, so no
+    // reset fill fires -- a genuinely allocation-free clear.
+    const dc = new LiteLru(CAP, { keys: 'dense', maxKey: MASK });
+    const dcGenBytes = dc._store._gen.buffer.byteLength;
+    const denseClear = () => {
+        for (let k = 0; k < CAP; k++) dc.put(k, k);
+        dc.clear();
+    };
+    const gdc = countAllocs(denseClear, { iterations: 200, batches: 8, warmup: 200 });
+    check(dc.size === 0, () => 't6 Gate DENSE: clear cycle left size ' + dc.size);
+    check(dc._store._gen.buffer.byteLength === dcGenBytes,
+        () => 't6 Gate DENSE: clear-cycle _gen.buffer grew ' + dcGenBytes + ' -> ' + dc._store._gen.buffer.byteLength);
+    if (!gdc.ok) {
+        die('t6 Gate DENSE (O(1) clear cycles) retained-alloc gate rejected -- verdict=' + gdc.report.verdict +
+            ' settled=' + gdc.result.settled + ' bytesPerCall=' + gdc.bytesPerCall);
+    }
+
+    // The factory path (decisions/0029): a SECOND member (Sieve) also rides the dense
+    // backing zero-alloc, proving newStore's dense dispatch is not LiteLru-specific.
+    const sdcache = new Sieve(CAP, { keys: 'dense', maxKey: DENSE_MK });
+    const sdNextBytes = sdcache._next.buffer.byteLength;
+    const sdVisBytes = sdcache._vis.buffer.byteLength;
+    const sdIxSlotBytes = sdcache._store._ixSlot.buffer.byteLength;
+    const sdGenBytes = sdcache._store._gen.buffer.byteLength;
+    let sdk = 0;
+    const sieveDenseHot = () => {
+        sdcache.put(sdk, sdk & 0xffff);
+        sdk++;
+    };
+    const gsd = countOps(sieveDenseHot, { ops: OPS, warmup: WARMUP });
+    check(sdcache._next.buffer.byteLength === sdNextBytes,
+        () => 't6 Gate DENSE Sieve: _next.buffer grew ' + sdNextBytes + ' -> ' + sdcache._next.buffer.byteLength);
+    check(sdcache._vis.buffer.byteLength === sdVisBytes,
+        () => 't6 Gate DENSE Sieve: _vis.buffer grew ' + sdVisBytes + ' -> ' + sdcache._vis.buffer.byteLength);
+    check(sdcache._store._ixSlot.buffer.byteLength === sdIxSlotBytes,
+        () => 't6 Gate DENSE Sieve: _ixSlot.buffer grew ' + sdIxSlotBytes + ' -> ' + sdcache._store._ixSlot.buffer.byteLength);
+    check(sdcache._store._gen.buffer.byteLength === sdGenBytes,
+        () => 't6 Gate DENSE Sieve: _gen.buffer grew ' + sdGenBytes + ' -> ' + sdcache._store._gen.buffer.byteLength);
+    check(sdcache.size === CAP, () => 't6 Gate DENSE Sieve: churn did not stay at capacity (size ' + sdcache.size + ')');
+    if (!gsd.report.ok) {
+        const g = gsd.summary.gc;
+        die('t6 Gate DENSE Sieve (dense churn) ops gate rejected -- verdict=' + gsd.report.verdict +
+            ' source=' + gsd.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+    }
+    const gsda = countAllocs(sieveDenseHot, { iterations: 50000, batches: 8 });
+    if (!gsda.ok) {
+        die('t6 Gate DENSE Sieve (dense churn) retained-alloc gate rejected -- verdict=' + gsda.report.verdict +
+            ' settled=' + gsda.result.settled + ' bytesPerCall=' + gsda.bytesPerCall);
+    }
+
+    process.stderr.write('t6 Gate DENSE: ' + gda.bytesPerCall.toFixed(5) +
+        ' B/op dense churn (insert+evict, direct-map k->slot, NO hash/probe), ' +
+        gdma.bytesPerCall.toFixed(5) + ' B/op mixed get/put/delete/has/peek, ' +
+        gdc.bytesPerCall.toFixed(5) + ' B/op O(1) clear cycle, ' +
+        gsda.bytesPerCall.toFixed(5) + ' B/op Sieve churn (factory path); index buffers fixed ' +
+        '(capacity ' + CAP + ')\n');
+
     // --- Gate 3: writes-per-hit, MEASURED (DEBATE item 2) ------------------------
     // A CountedLru (Proxy-counted link columns) is used ONLY here, never on a
     // measured zero-alloc path. It pins classic LRU's relink cost so a refactor

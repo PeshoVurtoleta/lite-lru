@@ -36,7 +36,7 @@ function queueSum(c) {
 }
 
 test('Mq: VERSION is the current, un-bumped value (moves only at /release)', () => {
-    assert.equal(VERSION, '1.16.1');
+    assert.equal(VERSION, '1.17.0');
 });
 
 test('Mq: fail-closed capacity -- non-integer / < 1 throws RangeError', () => {

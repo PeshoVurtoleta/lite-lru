@@ -57,9 +57,12 @@ export interface CacheSnapshot {
   f: "litelru/1";
   m: string;
   cap: number;
-  keys: "int" | null;
+  keys: "int" | "dense" | null;
   ttl: boolean;
   t: number;
+  /** Present ONLY on a `keys: "dense"` snapshot (decisions/0029): the dense domain
+   *  upper bound `maxKey`, so `restore()` rebuilds the `[0, mk]` index at the right size. */
+  mk?: number;
   [field: string]: unknown;
 }
 
@@ -211,8 +214,22 @@ export interface LiteCacheOptions<K, V> {
    *     ([-2147483648, 2147483647]); a non-integer or out-of-range key throws a
    *     `[lite-lru]`-tagged `TypeError` (fail-closed; decisions/0011). Values
    *     remain arbitrary.
+   *   - `"dense"`: a DIRECT-MAPPED, generation-stamped typed-array index for STRICT
+   *     zero-alloc over a SMALL, DENSE integer key domain (decisions/0029). The hot
+   *     body is a single array read (no hash, no probe): `_gen[k] === _epoch`. Keys
+   *     MUST be integers in `[0, maxKey]`; out-of-range/non-integer keys throw a
+   *     `[lite-lru]`-tagged `TypeError` (fail-closed). Space is O(maxKey), NOT
+   *     O(entries) -- the honest co-headline; `clear()` is O(1) via an epoch bump.
+   *     REQUIRES `maxKey`. Use `"int"` for large/sparse integer domains instead.
    */
-  keys?: "int";
+  keys?: "int" | "dense";
+  /**
+   * REQUIRED with `keys: "dense"` (decisions/0029): the inclusive upper bound of the
+   * dense integer key domain `[0, maxKey]`. Must be an integer in `[0, 2147483647]`;
+   * an absent/out-of-range value throws a `[lite-lru]`-tagged `TypeError` (fail-closed).
+   * Ignored by the `Map` and `"int"` backings.
+   */
+  maxKey?: number;
   /**
    * Opt-in TTL default in ms (decisions/0017, D17). PAY-FOR-WHAT-YOU-USE: supplying
    * `ttl` allocates one fixed `Float64Array` expiry column (8 bytes/slot); omitting it
@@ -963,6 +980,32 @@ export class Car<K = unknown, V = unknown> implements LiteCache<K, V> {
   [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
+}
+
+/**
+ * DirectLru -- `LiteLru` pinned to the DIRECT-MAPPED dense backing (decisions/0029). A
+ * thin convenience subclass that fixes `keys: "dense"` and forwards `maxKey`, so it is
+ * byte-for-byte equivalent to `new LiteLru(cap, { keys: "dense", maxKey })` with ZERO
+ * policy duplication -- every hot path, the DLL and dump/restore are inherited verbatim.
+ *
+ * Reach for it when the key domain is a small, dense integer range `[0, maxKey]`: the
+ * hot body is a single array read (no hash, no probe) and `clear()` is O(1). The cost is
+ * O(maxKey) space (two `Int32Array`s), NOT O(entries) -- the honest trade vs the default
+ * `Map` (arbitrary keys, amortized) and `keys: "int"` (large/sparse integer domains).
+ *
+ * @typeParam K key type (a dense integer in `[0, maxKey]`)
+ * @typeParam V value type
+ */
+export class DirectLru<K = number, V = unknown> extends LiteLru<K, V> {
+  /**
+   * @param capacity max entries; must be an integer >= 1 (else throws RangeError).
+   * @param options  MUST include `maxKey` (the dense domain `[0, maxKey]`); a
+   *                 conflicting `keys` value other than `"dense"` throws (fail-closed).
+   */
+  constructor(capacity: number, options: LiteCacheOptions<K, V> & { maxKey: number });
+  /** Reconstruct a dense cache from a `dump()` snapshot (decisions/0021 + 0029); the
+   *  snapshot carries `keys: "dense"` + `mk`. Delegates to `LiteLru.restore`. */
+  static restore<K = number, V = unknown>(snap: CacheSnapshot, opts?: LiteCacheOptions<K, V>): LiteLru<K, V>;
 }
 
 /** The package version (kept in lock-step with package.json + Lru.js). */

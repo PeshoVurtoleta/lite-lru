@@ -7,6 +7,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.17.0] - 2026-09-20
+
+### Added
+
+- A THIRD keyed-index backing, `keys: 'dense'` (decisions/0029): a DIRECT-MAPPED,
+  generation-stamped typed-array index for a SMALL, DENSE integer key domain
+  `[0, maxKey]`. The hot body is a single array read --
+  `_gen[k] === _epoch ? _ixSlot[k] : NIL` -- with NO hash, NO probe, and NO per-op
+  init. STRICT zero-alloc on every hot path (get/put/delete/has/peek, measured
+  0.00000 B/op), and `clear()` is genuinely O(1) via an epoch bump (only a disclosed-
+  amortized O(U) reset when the epoch would overflow `INT_MAX`). The no-init trick
+  borrows the sparse-set discipline: `_gen` is a zero-initialized `Int32Array` and
+  `_epoch` starts at 1, so a never-written key reads absent with no O(U) pre-fill and
+  `0` is a legal key. Requires `maxKey` (an integer in `[0, 2147483647]`); a key
+  outside `[0, maxKey]`, a non-integer key, or a missing/bad `maxKey` fails closed with
+  a `[lite-lru]`-tagged `TypeError` (typeof guard first). The honest co-headline is
+  SPACE: O(maxKey), NOT O(entries) -- two `[0, maxKey]` `Int32Array`s. Use `keys: 'int'`
+  for large/sparse integer domains instead.
+- `DirectLru` -- a thin `LiteLru` subclass pinned to the dense backing.
+  `new DirectLru(cap, { maxKey })` is byte-identical to
+  `new LiteLru(cap, { keys: 'dense', maxKey })` with ZERO policy duplication (every hot
+  path, the DLL, and dump/restore are inherited).
+- `benchmark/Bench.mjs` gains an exported `backingCompare()` lane (+ CLI print)
+  measuring the SAME LRU policy over its three index backings on an integer,
+  dense-domain zipf workload (identical hit ratio; only ns/op + space/allocation
+  posture differ). Representative capacity-256 numbers: `keys:'dense'` ~40 ns/op,
+  `keys:'int'` ~50 ns/op, default `Map` ~64 ns/op.
+- `test/Direct.test.js` (oracle-vs-Map eviction-order identity, dump/restore incl.
+  `maxKey`, `DirectLru` == `LiteLru` + `{ keys:'dense', maxKey }`, no-init safety, O(1)
+  clear correctness, the fail-closed doors); dense door cases across all thirteen
+  members in `test/Options.test.js`; a t6 dense 0-B/op lane (incl. O(1) clear cycles)
+  and Sieve dense factory-path lane; two dense perf-gate scenarios. Test count
+  1754 -> 1886.
+
+### Changed
+
+- `snapBase` now reads an explicit `_store._kind` tag (`'map'|'int'|'dense'`) instead
+  of duck-typing on `checkStable` (which the dense store ALSO has), so a dense cache
+  dumps as `keys:'dense'` + `mk` (maxKey) and restores exactly. The snapshot tag,
+  `restore()` validation, and the `.d.ts` `CacheSnapshot` gain `'dense'` + the optional
+  `mk` field. All thirteen members thread `maxKey` through store construction; the
+  default `Map` and `keys:'int'` hot paths are byte-unchanged.
+
 ## [1.16.1] - 2026-09-15
 
 ### Changed

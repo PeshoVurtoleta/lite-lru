@@ -60,6 +60,23 @@ move on. `Car` is the write-cheap counterpart to `Arc`: the SAME adaptive
 recency/frequency policy, but a 0-link-write reference-bit hit instead of ARC's
 move-to-T2-MRU relink.
 
+### The keyed-index backing axis (orthogonal to policy)
+
+The policy choice above is INDEPENDENT of the keyed-index backing. Every member
+takes a `keys` option (chosen once at construction); the hit ratio and eviction
+order are identical across all three, only speed and space/allocation differ:
+
+| backing | keys | pick when |
+| --- | --- | --- |
+| default `Map` | arbitrary (objects/strings/...) | the general case; keys are not integers |
+| `keys: 'int'` | 32-bit signed int, sparse ok | a large or sparse integer domain; strict zero-alloc |
+| `keys: 'dense'` (or `DirectLru`) | int `[0, maxKey]`, dense | a small, dense integer domain -- fastest (one array read, no hash/probe), O(1) `clear()`, strict zero-alloc; costs O(maxKey) space |
+
+Rule of thumb: integer keys in a small contiguous range (entity ids, frame/slot
+indices, tile coords) -> `keys: 'dense'`; large or sparse integers -> `keys: 'int'`;
+anything else -> the default `Map`. `DirectLru(cap, { maxKey })` is exactly
+`LiteLru` with `keys: 'dense'` (decisions/0029).
+
 ---
 
 ## 2. A decision flowchart

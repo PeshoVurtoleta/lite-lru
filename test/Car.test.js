@@ -28,7 +28,7 @@ const isRef = (c, k) => (stOf(c, k) & REF) !== 0;
 const inT2 = (c, k) => (stOf(c, k) & T2) !== 0;
 
 test('Car: VERSION is the current, un-bumped value (moves only at /release)', () => {
-    assert.equal(VERSION, '1.16.1');
+    assert.equal(VERSION, '1.17.0');
 });
 
 test('Car: fail-closed capacity -- non-integer / < 1 throws RangeError', () => {
