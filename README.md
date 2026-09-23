@@ -56,7 +56,7 @@ Then measure, do not guess:
 npm run bench     # per-policy hit ratio + % of Belady OPT + writes/hit on seeded traces
 ```
 
-One `LiteCache<K,V>` surface, `get`/`put`/`has`/`peek`/`delete`/`clear`, all O(1), zero allocation on every hot path after construction. `import { Sieve }` alone drops `LiteLru`'s body from your bundle (`sideEffects: false`). Integer keys opt into a strict-zero-alloc typed-array backing.
+One `LiteCache<K,V>` surface, `get`/`put`/`has`/`peek`/`delete` all O(1) and `clear` O(size) (it walks only the residents, never the capacity), zero allocation on every hot path after construction. `import { Sieve }` alone drops `LiteLru`'s body from your bundle (`sideEffects: false`). Integer keys opt into a strict-zero-alloc typed-array backing.
 
 ---
 
@@ -116,8 +116,8 @@ The honest competitive read: `lru-cache` is already typed-array-backed and featu
 - **One `LiteCache<K,V>` surface** -- all thirteen members expose exactly `get` / `put` / `has` / `peek` / `delete` / `clear`, plus `size` and `capacity`. The recency/lazy-promotion/admission/adaptive/frequency difference is INTERNAL. Types ship in [`Lru.d.ts`](./Lru.d.ts); the interface is the type-checked contract that makes the one-line swap safe.
 - **`Bench.mjs`** -- a runnable ESM tool AND an importable module: `runBench(opts)` and `beladyOpt(trace, capacity)`. Feed it a trace, get per-policy hit ratio, writes-per-hit, machine-local ns/op, and percentage of Belady OPT.
 - **A `keys: 'int'` backing** -- opt in and the keyed index becomes an open-addressed typed-array table for STRICT zero allocation (even the index never allocates), with a fail-closed door for 32-bit signed integer keys.
-- **A `keys: 'dense'` backing (+ `DirectLru`)** -- for a SMALL, DENSE integer key domain `[0, maxKey]`, opt in and the keyed index becomes a **direct map** (`k -> slot`): the hot body is a single array read, **no hash, no probe, no per-op init**, and `clear()` is **O(1)**. STRICT zero allocation; the honest cost is **O(maxKey) space**, not O(entries). `DirectLru` is the one-line convenience wrapper (`new DirectLru(cap, { maxKey })`).
-- **A zero-GC `onEvict` hook** -- fired once per eviction with the evicted `(key, value)`, e.g. to return the value to a pool.
+- **A `keys: 'dense'` backing (+ `DirectLru`)** -- for a SMALL, DENSE integer key domain `[0, maxKey]`, opt in and the keyed index becomes a **direct map** (`k -> slot`): the hot body is a single array read, **no hash, no probe, no per-op init**, and its index `clear` is an **O(1) epoch bump** (`clear()` overall is **O(size)** -- it frees only the residents). STRICT zero allocation; the honest cost is **O(maxKey) space**, not O(entries). `DirectLru` is the one-line convenience wrapper (`new DirectLru(cap, { maxKey })`).
+- **A zero-GC `onEvict` hook** -- fired once per eviction (capacity eviction or TTL reap **only** -- not on `delete`/`clear`/overwrite) with the evicted `(key, value)`, e.g. to return the value to a pool; release residents yourself at teardown.
 
 ---
 
@@ -201,10 +201,10 @@ new Car<K, V>(capacity: number, options?: LiteCacheOptions<K, V>)
 
 cache.get(key: K): V | undefined            // returns the value AND applies the member's hit policy
 cache.put(key: K, value: V, ttlMs?): void   // insert/update (+ optional per-entry TTL); evicts the victim at capacity
-cache.has(key: K): boolean                  // presence test; NEVER changes recency / visited state
-cache.peek(key: K): V | undefined           // read without applying the hit policy
+cache.has(key: K): boolean                  // presence test; never changes recency / visited state (but under TTL a stale hit is reaped)
+cache.peek(key: K): V | undefined           // read without applying the hit policy (but under TTL a stale hit is reaped)
 cache.delete(key: K): boolean               // remove; true if it was present
-cache.clear(): void                         // empty the cache; allocates nothing
+cache.clear(): void                         // empty the cache; O(size) (walks only residents); the cold roster may allocate
 cache.purgeStale(): number                  // evict every currently-expired entry now; returns the count (TTL)
 cache.stats(): CacheStats                   // live counters {hits,misses,evictions,puts}; requires { stats: true }
 cache.resetStats(): void                    // zero the four counters in place; requires { stats: true }
@@ -216,7 +216,7 @@ cache.capacity: number                      // fixed maximum, set at constructio
 
 - **`capacity`** -- must be an integer `>= 1`. Anything else throws a `[lite-lru]`-tagged `RangeError` at the door (fail-closed -- `null` is not zero).
 - **The undefined-value contract (D7).** `get` and `peek` return `V | undefined`, where `undefined` means EITHER "absent" OR "the stored value is literally `undefined`". These are indistinguishable through the return value alone. To disambiguate, call `has(key)`. `null` is a normal, distinguishable value; only `undefined` collides with the miss sentinel.
-- **`get` vs `has`/`peek`.** `get` applies the member's hit policy (`LiteLru`: promote to MRU; `Sieve`: set the visited bit). `has` and `peek` never do -- they are the sanctioned way to inspect without perturbing eviction order.
+- **`get` vs `has`/`peek`.** `get` applies the member's hit policy (`LiteLru`: promote to MRU; `Sieve`: set the visited bit). `has` and `peek` never do -- they are the sanctioned way to inspect without perturbing eviction order. **TTL caveat:** they are recency-neutral, not side-effect-free -- on a cache built with `{ ttl }`, a `has`/`peek` that lands on an EXPIRED entry reaps it in place (a structural mutation that fires `onEvict` and invalidates any open iterator), because a stale entry is a MISS (decisions/0017). Without TTL they mutate nothing.
 
 ### Construction options
 
@@ -226,21 +226,22 @@ interface LiteCacheOptions<K, V> {
   keys?: "int" | "dense";
   maxKey?: number;         // REQUIRED with keys: "dense" -- the dense domain [0, maxKey]
   ttl?: number;            // opt-in TTL default in ms (Infinity = never); see below
-  clock?: () => number;    // injectable clock, defaults to Date.now
+  clock?: () => number;    // injectable clock; default performance.timeOrigin + performance.now() (epoch-anchored, monotonic, zero-alloc). Inject Date.now for wall-clock
   stats?: true;            // opt into runtime counters; see Stats below
 }
 ```
 
 - **`onEvict(key, value)`** -- called once per eviction with the evicted pair (e.g. to return a value to a pool). Zero-GC: pass a hoisted function, not a fresh closure per construction.
+  - **Eviction-only (S17 S2) -- read this before you pool.** `onEvict` fires on exactly two events: a **capacity eviction** (a `put` at capacity drops the victim) and a **TTL reap** (a stale entry dropped by a `get`/`has`/`peek`/`purgeStale`). It does **NOT** fire on `delete`, on `clear`, or on an **overwrite** (a `put` that updates an existing key -- the old value is replaced silently). So a pool that only releases in `onEvict` will **leak** every value you `delete`, `clear`, or overwrite, plus every resident value still in the cache at teardown. To release **all** of them, release the residents yourself before you drop the cache -- iterate `cache.values()` and release each, then `clear()` (see the pool example under [Composability](#composability)). A future `onRemove(key, value, reason)` covering all removal paths is on the roadmap (deferred here so `onEvict`'s meaning never changes).
   - **Reentrancy contract (fires LAST, fail-closed).** `onEvict` fires AFTER the cache is fully consistent -- the newcomer already inserted, the victim already gone. It MUST NOT call `put`/`get`/`delete`/`clear` on the same instance; doing so throws a `[lite-lru]`-tagged `Error` rather than corrupting the intrusive lists mid-eviction. `has` and `peek` ARE allowed from within the callback (they cannot mutate) -- use them to inspect. An expiry reap fires `onEvict` under the same contract.
 - **`keys: "int"`** -- opt into the open-addressed typed-array keyed index for STRICT zero allocation (even the index never allocates -- no pre-fill caveat). Keys MUST be 32-bit signed integers in `[-2147483648, 2147483647]`; a non-integer or out-of-range key throws a `[lite-lru]`-tagged `TypeError` (fail-closed). Values remain arbitrary. Omitted, the default is a JS `Map`: arbitrary keys, honestly AMORTIZED (its internal resize can allocate), byte-identical to the pre-`keys` behavior. An unknown `keys` value throws with a did-you-mean hint (naming both `'int'` and `'dense'`).
-- **`keys: "dense"` + `maxKey`** -- opt into the **direct-mapped, generation-stamped** typed-array index for a SMALL, DENSE integer key domain `[0, maxKey]`. The hot body is a single array read (`_gen[k] === _epoch ? _ixSlot[k] : NIL`) -- **no hash, no probe, no per-op init** -- and `clear()` is **O(1)** (an epoch bump; a disclosed-amortized O(U) reset only on epoch overflow). STRICT zero allocation. `maxKey` is **REQUIRED** (an integer in `[0, 2147483647]`, else a `[lite-lru]` `TypeError`); a key outside `[0, maxKey]` or non-integer throws (typeof guard first -- `0` is a legal key, never a miss sentinel). The honest cost is **O(maxKey) space** (two `[0, maxKey]` `Int32Array`s), NOT O(entries) -- reach for it when the domain is small and dense; use `keys: "int"` for large/sparse integer domains. `DirectLru` (below) is the convenience wrapper.
+- **`keys: "dense"` + `maxKey`** -- opt into the **direct-mapped, generation-stamped** typed-array index for a SMALL, DENSE integer key domain `[0, maxKey]`. The hot body is a single array read (`_gen[k] === _epoch ? _ixSlot[k] : NIL`) -- **no hash, no probe, no per-op init** -- and its index `clear` is an **O(1) epoch bump** (a disclosed-amortized O(U) reset only on epoch overflow); `clear()` overall is **O(size)** (S17 F7: it walks only the residents, never the `maxKey` domain). STRICT zero allocation. `maxKey` is **REQUIRED** (an integer in `[0, 2147483647]`, else a `[lite-lru]` `TypeError`); a key outside `[0, maxKey]` or non-integer throws (typeof guard first -- `0` is a legal key, never a miss sentinel). The honest cost is **O(maxKey) space** (two `[0, maxKey]` `Int32Array`s), NOT O(entries) -- reach for it when the domain is small and dense; use `keys: "int"` for large/sparse integer domains. `DirectLru` (below) is the convenience wrapper.
 - **`ttl` / `clock`** -- opt into time-to-live (see [TTL](#ttl----opt-in-lazy-expiry) below). Both are validated fail-closed at the door.
 - **`stats: true`** -- opt into runtime counters (see [Stats](#stats----opt-in-runtime-counters) below). Any value other than `true` (or omitted) throws a `[lite-lru]`-tagged `TypeError` with a did-you-mean hint.
 
 ### `DirectLru` -- the dense-backing wrapper
 
-`DirectLru` is `LiteLru` pinned to the `keys: 'dense'` backing. `new DirectLru(cap, { maxKey })` is **byte-identical** to `new LiteLru(cap, { keys: 'dense', maxKey })` -- zero policy duplication, every hot path and `dump()`/`restore()` inherited:
+`DirectLru` is `LiteLru` pinned to the `keys: 'dense'` backing. `new DirectLru(cap, { maxKey })` is **byte-identical** to `new LiteLru(cap, { keys: 'dense', maxKey })` -- zero policy duplication, every hot path and `dump()`/`restore()` inherited. **`DirectLru.restore(snap, opts?)` returns a plain `LiteLru`** (S17 S5), not a `DirectLru` -- the two are behaviourally identical (the snapshot already carries `keys: 'dense'` + `maxKey`), so the restored instance is a full dense-backed `LiteLru`; this is reflected in the `.d.ts`:
 
 ```ts
 import { DirectLru } from '@zakkster/lite-lru';
@@ -248,7 +249,7 @@ import { DirectLru } from '@zakkster/lite-lru';
 const frames = new DirectLru<number, Frame>(1024, { maxKey: 65535 }); // ids 0..65535
 frames.put(42, frame);
 frames.get(42);   // direct map: one array read, no hash, no probe
-frames.clear();   // O(1): an epoch bump, not an O(entries) walk
+frames.clear();   // O(size): frees the residents; the dense index reset is an O(1) epoch bump
 ```
 
 **When to reach for which backing** -- same LRU policy, same hit ratio; only speed and space/allocation posture differ:
@@ -257,7 +258,7 @@ frames.clear();   // O(1): an epoch bump, not an O(entries) walk
 |------------------------------|-------------------------------|-----------------------|------------------------|--------------|----------|
 | default `Map`                | arbitrary (objects/strings/...) | `Map.get` + relink    | **amortized** (resize) | O(entries)   | arbitrary keys; the general case |
 | `keys: 'int'`                | 32-bit signed int, sparse ok  | hash + probe + relink | **strict zero**        | O(capacity)  | large / sparse integer domains |
-| `keys: 'dense'` / `DirectLru`| int `[0, maxKey]`, dense       | **one array read** (no hash/probe) + relink | **strict zero**, **O(1) `clear()`** | **O(maxKey)** | small, dense integer domains |
+| `keys: 'dense'` / `DirectLru`| int `[0, maxKey]`, dense       | **one array read** (no hash/probe) + relink | **strict zero**, **O(1) index `clear`** | **O(maxKey)** | small, dense integer domains |
 
 Machine-local bench (same policy, integer dense-domain zipf, `capacity=256`, identical **57.4%** hit ratio -- reproduce on your own hardware with `npm run bench`):
 
@@ -286,8 +287,9 @@ cache.purgeStale(); // OPTIONAL: evict every currently-expired entry now, return
 ```
 
 - **Per-instance default + per-entry override.** `{ ttl }` sets the default in ms; the positional `put(key, value, ttlMs)` overrides it for one entry. `Infinity` means never-expire (`NEVER 0`). Omit `ttlMs` to use the default.
+- **`purgeStale()` on a TTL-off cache returns `0`, it does not throw** (S17 S3). It reports a *count* of what it evicted, and a cache with no expiry column simply has nothing stale -- so `0` is the honest answer. This differs from `stats()`, which throws on a non-stats instance because it returns a *state* holder that does not exist. `purgeStale()` is cold, O(size), and fires `onEvict` per victim.
 - **Fail-closed.** `ttl`/`ttlMs` must be positive-finite-or-`Infinity` -- `<= 0`, `NaN`, and non-numbers throw a `[lite-lru]` `RangeError`. Passing a `ttlMs` to a cache built **without** a `ttl` option throws a `[lite-lru]` `Error` (there is no expiry column to stamp -- a caller bug, not a silent no-op).
-- **Deterministic + testable.** Inject a `clock: () => number` (defaults to `Date.now`) to drive expiry from your own time source; the torture differential runs the whole feature against a brute oracle on a virtual clock.
+- **The clock contract.** The default clock is `performance.timeOrigin + performance.now()` -- **epoch-anchored, monotonic, and zero-alloc** (a wall-clock-comparable ms number that never jumps backward, so snapshots stay epoch-comparable across a `dump`/`restore`). It is **not** `Date.now`, whose boxed double return allocated on every TTL touch (S17 A1/A2). Inject `clock: Date.now` explicitly if you want true wall-clock time, or any zero-arg `() => number` (a logical counter, a fractional or epoch-sized source) to drive expiry from your own source; **the library boxes nothing on the TTL path for any number clock** -- proven by the N1 perf lanes, not asserted in prose. Fail-closed: a non-function `clock` throws a `[lite-lru]` `TypeError` at the door, and a clock that returns a non-number (e.g. a BigInt) or `NaN` fails closed too -- a tagged throw on `put`, and a read (`get`/`has`/`peek`) treats the entry as stale (a miss), never "never expires". The torture differential runs the whole feature against a brute oracle on a virtual clock.
 - **Zero-GC on both paths.** The expiry column is one fixed `Float64Array` (8 bytes/slot), allocated only when `ttl` is set, never grown. Stamping on `put` and reaping on a stale touch are strictly zero-allocation; a freed slot's timestamp is dropped so no value is pinned.
 - **`purgeStale(): number`** -- the explicit, cold reclamation path (walks the index once, reaps every expired resident, returns the count). Lazy expiry already reclaims on touch; call this when you want eager reclamation. Returns `0` on a cache with no `ttl`.
 
@@ -401,7 +403,7 @@ Run directly, it prints a table; imported, it returns structured results and pri
 
 | Constant  | Value     | Meaning                                                       |
 | --------- | --------- | ------------------------------------------------------------ |
-| `VERSION` | `'1.18.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
+| `VERSION` | `'1.19.0'` | Package version string (in lock-step with `package.json` and `llms.txt`). |
 
 All thirteen members and `VERSION` are named exports; `LiteLru` is also the default export.
 
@@ -435,7 +437,7 @@ const Policy = result.workloads[0].members
 
 const cache = new Policy(1024, {
   keys: 'int',                                   // integer keys -> strict zero-alloc backing
-  onEvict: (k, v) => pool.release(v),            // hoisted, zero-GC, fires fail-closed
+  onEvict: (k, v) => pool.release(v),            // hoisted, zero-GC, fires fail-closed -- on EVICTION only
 });
 
 // 4. Steady state: O(1), zero allocation on every hot path.
@@ -444,6 +446,11 @@ for (const key of liveRequests) {
   if (v === undefined) { v = load(key); cache.put(key, v); }
   use(v);
 }
+
+// 5. Teardown: onEvict does NOT fire on clear (S17 S2), so release the residents
+//    yourself first, then clear. This is what makes a pool balance to 0 leaks.
+for (const v of cache.values()) pool.release(v);
+cache.clear();
 ```
 
 The measurement pass and the deployed cache read the same policies from the same file: the number the bench reports is the behavior you ship, by construction.
@@ -461,7 +468,7 @@ An LRU has a hard capacity ceiling by definition, so all `capacity` slots are pr
 | ---------------------------------- | ------------------------ |
 | `get` / `put` / `delete` / `has` / `peek` (slot + list layer) | **0** |
 | keyed index, `keys: 'int'`         | **0** (open-addressed typed arrays, fixed at construction) |
-| keyed index, `keys: 'dense'`       | **0** (direct-mapped `_ixSlot` + `_gen` typed arrays, fixed at construction; `clear()` is O(1)) |
+| keyed index, `keys: 'dense'`       | **0** (direct-mapped `_ixSlot` + `_gen` typed arrays, fixed at construction; index `clear` is an O(1) epoch bump, `clear()` overall O(size)) |
 | keyed index, default `Map`         | amortized (the Map's internal resize can allocate) |
 | construction                       | once (all slots + columns, then reused) |
 
@@ -539,10 +546,10 @@ Hit % and % of OPT are deterministic (seeded trace, deterministic policies); `ns
 
 ## Testing
 
-**1754 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
+**2359 deterministic tests, all pass**, plus a torture gate that proves both leak-freedom and the zero-GC quality numbers, and a shipped bench.
 
 ```bash
-npm test               # 1754 node:test cases (all members, laws, TTL, iteration, stats, snapshot round-trip, boundary, dts drift)
+npm test               # 2359 node:test cases (all members, laws, TTL, iteration, stats, snapshot round-trip, boundary, dts drift)
 npm run test:types     # tsc: the LiteCache<K,V> surface + one-line-swap type-check
 npm run torture        # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + gated numbers
 npm run torture:controls  # the deliberately-broken variants -- every gate must fail

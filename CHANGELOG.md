@@ -7,6 +7,65 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The `VERSION` constant, `package.json` `version`, and `llms.txt` are bumped
 together (three-place version sync) at release.
 
+## [1.19.0] - 2026-09-23
+
+H1 hardening from the audit of 1.18.0 (ROADMAP S17; RESEARCH.md section 9). Test count
+1918 -> 2359 (node:test); `test:perf` 31 -> 74 lanes.
+
+### Added
+
+- Config getters on every member and on `LiteCache` in the `.d.ts` (N2): `keysBacking`
+  (`'map'` / `'int'` / `'dense'`), `maxKey` (`null` unless dense), `ttlEnabled`,
+  `statsEnabled`. Read-only, cold, never throw.
+- TTL-on zero-alloc lanes in `test:perf` and torture t6 (N1): 13 members x epoch /
+  fractional / default clock x get-hit / put-churn / stale-reap / iteration, each after a
+  TTL-off warm-up, plus a W-TinyLFU keys `< -2^30` lane. Yardstick: minor GCs at N=200000
+  and 8N under `--max-semi-space-size=4`, must be 0. A boxing-expiry control must fail
+  (measured 36 scavenges at 8N when the old return path is reinstated).
+- `dts-drift` covers all 14 classes + statics + the N2 getters (was 9 classes), with Car
+  mutation controls (N3).
+
+### Changed
+
+- **Behaviour change: the default clock is `performance.timeOrigin + performance.now()`**
+  (was `Date.now`). `Date.now` returned a boxed double on every TTL touch (15.7-31.5 B/op
+  on get / has / put / iteration). The new default is epoch-anchored and monotonic;
+  measured drift vs `Date.now()` under 1 ms at startup. A 1.18.0 TTL snapshot restores
+  with the same keys, values and remaining TTLs (measured 0.0 ms difference). Pass
+  `clock: Date.now` for wall-clock time.
+- `clear()` is O(size) instead of O(capacity): it frees only resident slots onto the
+  existing free stack. cap 1M vs cap 16 with <= 8 residents: 1.03x (was 644 us vs
+  0.8 us). Bounded per-member metadata (ghosts, count-min sketch, history) still resets in
+  O(its fixed capacity); documented. "O(1) clear" wording corrected in README, llms.txt,
+  `.d.ts` and JSDoc.
+- W-TinyLFU sketch hash folds bits 30-31 into the low 30 (`(h ^ (h >>> 30)) &
+  0x3fffffff`) so it is always a Smi. Keys in `[0, 2^30)` hash as before; for negative
+  keys or keys with bits 30-31 set, sketch counts restored from a 1.18.0 snapshot land in
+  different cells and age out through the sketch reset.
+- Docs: `onEvict` is eviction-only (capacity eviction and TTL reap; not delete / clear /
+  overwrite); the README pool example releases 7 of 7 objects (now a test). With TTL on,
+  `has` / `peek` reap stale entries and invalidate open iterators. `purgeStale()` returns
+  0 on a TTL-off cache. `DirectLru.restore` returns a plain `LiteLru`.
+
+### Fixed
+
+- TTL `put` boxed the computed expiry (12 scavenges at 8N, ~31.5 B/op, all 13 members)
+  once V8 stopped inlining the helper that returned it. The expiry is now validated and
+  computed at the top of `put` into a per-instance `Float64Array(1)`; 0 scavenges at N
+  and 8N on every lane.
+- W-TinyLFU int keys below `-2^30` allocated on churn (12 scavenges at 8N): the unsigned
+  hash left Smi range on the call into the sketch. Now 0.
+- New `[lite-lru]` errors where 1.18.0 silently accepted bad input (may break callers that
+  relied on it):
+  - `restore()` rejects duplicate keys (1.18.0 restored `k=[1,1]` as size 2).
+  - `DirectLru` rejects unknown options with a did-you-mean hint (`{ maxKey: 9, ttll: 5 }`
+    used to build a cache with no TTL).
+  - `restore()` rejects a per-entry expiry that is not a number or is NaN, including
+    `null` (JSON turns `Infinity` into `null`; use `structuredClone`).
+  - A clock returning NaN throws on `put` before any mutation, and NaN expiries read as
+    stale; a BigInt clock throws a tagged `TypeError` (was untagged).
+  - Capacity above `2^31 - 1` is rejected in all constructors and in `restore()`.
+
 ## [1.18.0] - 2026-09-20
 
 ### Added
@@ -46,8 +105,9 @@ together (three-place version sync) at release.
   `[0, maxKey]`. The hot body is a single array read --
   `_gen[k] === _epoch ? _ixSlot[k] : NIL` -- with NO hash, NO probe, and NO per-op
   init. STRICT zero-alloc on every hot path (get/put/delete/has/peek, measured
-  0.00000 B/op), and `clear()` is genuinely O(1) via an epoch bump (only a disclosed-
-  amortized O(U) reset when the epoch would overflow `INT_MAX`). The no-init trick
+  0.00000 B/op), and the dense INDEX clear is O(1) via an epoch bump (only a disclosed-
+  amortized O(U) reset when the epoch would overflow `INT_MAX`; the whole `clear()` was
+  made O(size) in 1.19.0 -- S17 F7). The no-init trick
   borrows the sparse-set discipline: `_gen` is a zero-initialized `Int32Array` and
   `_epoch` starts at 1, so a never-written key reads absent with no O(U) pre-fill and
   `0` is a legal key. Requires `maxKey` (an integer in `[0, 2147483647]`); a key
@@ -65,9 +125,9 @@ together (three-place version sync) at release.
   posture differ). Representative capacity-256 numbers: `keys:'dense'` ~40 ns/op,
   `keys:'int'` ~50 ns/op, default `Map` ~64 ns/op.
 - `test/Direct.test.js` (oracle-vs-Map eviction-order identity, dump/restore incl.
-  `maxKey`, `DirectLru` == `LiteLru` + `{ keys:'dense', maxKey }`, no-init safety, O(1)
-  clear correctness, the fail-closed doors); dense door cases across all thirteen
-  members in `test/Options.test.js`; a t6 dense 0-B/op lane (incl. O(1) clear cycles)
+  `maxKey`, `DirectLru` == `LiteLru` + `{ keys:'dense', maxKey }`, no-init safety, dense
+  index-clear correctness, the fail-closed doors); dense door cases across all thirteen
+  members in `test/Options.test.js`; a t6 dense 0-B/op lane (incl. epoch-bump clear cycles)
   and Sieve dense factory-path lane; two dense perf-gate scenarios. Test count
   1754 -> 1886.
 
@@ -997,7 +1057,8 @@ in version strings and documentation. The demo is a dev artifact excluded from t
 - **`LiteLru`** -- the classic Least-Recently-Used reference member: a `Map` fused
   with an intrusive, preallocated doubly-linked list over structure-of-arrays slot
   columns (`_keys` / `_vals` object columns, `Int32Array` `_next` / `_prev` link
-  columns). O(1) `get` / `put` / `has` / `peek` / `delete` / `clear`; eviction
+  columns). O(1) `get` / `put` / `has` / `peek` / `delete` (`clear` was O(capacity) here,
+  made O(size) in 1.19.0 -- S17 F7); eviction
   reuses the LRU tail slot in place. Fail-closed `capacity` (integer `>= 1`, else a
   `[lite-lru]`-tagged `RangeError`).
 - **`onEvict(key, value)`** -- optional zero-GC eviction hook. Fires LAST, after the

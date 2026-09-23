@@ -6,6 +6,12 @@ briefs anchored to a decision (not a finding -- there is no legacy code to
 reproduce bugs in), a torture-suite spec, and one conservation invariant that
 catches most structural bugs at once.
 
+> **S17 DONE (2026-09-23), 1.19.0 version-synced, not yet published -- H1 hardening** (see the S17 brief in
+> section 6 and RESEARCH.md section 9). The 1.18.0 audit found 4 High findings the
+> release gates could not see: TTL `put` and the default clock allocate on the
+> hot path, and `restore()` / `DirectLru` fail open. Every gate lane used a
+> small-integer clock and small non-negative keys.
+
 ---
 
 ## 0. Why this roadmap changed (read this first)
@@ -1371,6 +1377,104 @@ DONE WHEN
   the differential oracle + scan-resistance + snapshot round-trip green, joined to TTL /
   iteration / stats / snapshot / bench / demo / d.ts, and the other seven members unchanged.
 
+
+# S17 -- v1.19.0 -- H1 hardening: hot-path boxing + fail-open restore (audit 2026-09-23)  [DONE -- 1.19.0 version-synced 2026-09-23, not yet published]
+
+status: implemented -- gated green (npm test + test:types + test:perf + torture ok +
+torture:controls); F1/F2/F8 zero-alloc fixes, F3-F6/F11 fail-closed doors, F7 O(size)
+clear, F9/F10 + S1-S6 docs, N2 getters, N3 dts-drift, N1/N4 clock lanes. Awaiting
+/release 1.19.0.
+
+Source: the adversarial audit of 1.18.0 (`f88bce5`), recorded in RESEARCH.md
+section 9. Baseline at audit: `npm test` 1918/1918, `test:perf` 31/31, torture `ok`
+exit 0. The torture has no single GATE line; tier work units were t0 4000, t1 15,
+t2 19, t5 483, t6 63, t7 20481, t8 52, t9 52.
+All four H findings passed those gates, because every TTL lane uses a clock
+counting up from 0, and every key lane uses small non-negative ints. Both are
+Smi-only inputs, so V8 never boxes. Yardstick for this session: count minor GCs
+(scavenges) at N and 8N under `node --expose-gc --max-semi-space-size=4`, with the
+feature ON and after a feature-OFF warm-up in the same process. ON must equal OFF.
+A heap-delta / measureAllocs gate cannot see a transient box.
+
+**Fixes (F)**
+
+| id | finding | task | falsifiable gate |
+| --- | --- | --- | --- |
+| F1 | A1 (H) `expiryFor` (Lru.js:247) returns a double from a call. It boxes in all 13 `put`s once V8 stops inlining it, which happens after a TTL-off instance of the same class ran. Measured ~31.5 B/op, 12 scavenges at 8N. | Replace it with a void `checkTtl(ms)` + `clock() + d` computed inside each `put`. The audit prototype of this measured 0/0. | Per member, `put` + `put`-churn with an epoch clock (1.7e12) and with `performance.now`, after a TTL-off warm-up: 0 scavenges at N and 8N. |
+| F2 | A2 (H) the default clock `Date.now` (Lru.js:218) allocates on every TTL touch: 15.7-31.5 B/op on get / has / put / iteration. The README (291) says "strictly zero-allocation". | Settle S1. Either change the default (lean) or disclose it in the README + llms.txt as an allocating default. | Default-clock get / put / has / iteration on all 13 members: 0 at 8N (if the default changes). Otherwise the README no longer claims zero-alloc for the default clock. |
+| F3 | A3 (H) `restore()` checks for duplicate slots but not duplicate keys (Lru.js:1022, 1002). `k=[1,1]` restores as size 2, `keys()` gives `[1,1]`, and after `delete(1)` size is 1 and `has(1)` is false. | Detect a duplicate key while writing the list and throw a `[lite-lru]` error. | `k=[1,1]` throws on the Map, int and dense backings for all 13 members. The existing snapshot round-trips still pass. |
+| F4 | A4 (H) `DirectLru` (`denseOptions`, Lru.js:1431) rebuilds the options object and drops unknown keys. `{maxKey:9, ttll:5}` is accepted and gives a cache with no TTL. | Run the same unknown-option door (with its did-you-mean hint) before rebuilding. | `new DirectLru(8,{maxKey:9,ttll:5})` throws `unknown option ttll (did you mean ttl?)`. Add a DirectLru row to Options.test.js. |
+| F5 | A5 (M) restore never validates the per-entry expiry values (Lru.js:961). `NaN`, `undefined`, `{}` or `"abc"` gives an entry that never expires. `null` coerces to 0, so the entry expires at once. JSON turns `Infinity` into `null`, so it is silently lost. | Validate each expiry: a non-NaN number, `Infinity` allowed. Reject `null` (settle S4). | `NaN`, `undefined`, `{}`, `"abc"` and `null` throw. A `structuredClone` round-trip with `Infinity` passes. |
+| F6 | A6 (M) the `clock()` return is never checked (stale checks at Lru.js:770, 1193, 1270, 1282). A clock returning `undefined`, `NaN` or `{}` makes entries never expire. A BigInt clock throws an untagged TypeError. | Write the stale test as `!(now < exp[s])`, so NaN counts as stale at no extra instruction cost. NaN-check the computed expiry in `put`. Tag the BigInt path. | The A6 cases throw a tagged error or read as a miss, never "never expires". BigInt gives a `[lite-lru]` error. |
+| F7 | A7 (M) dense `clear()` is O(capacity) (`SlotStore.reset`, Lru.js:423). Only the index part is O(1). Measured 0.8 us at cap 16 vs 644 us at cap 1M with 8 or fewer residents. The O(1) claim appears at README 119/237/251/260/464, in the CHANGELOG and in llms.txt. | Either reset only occupied slots (O(size)), or correct the wording to "index O(1), slot store O(capacity)". | If the claim is kept: clear-time ratio (cap 1M vs 16, 8 residents) under 4x. Otherwise grep for the O(1) clear claim returns 0. |
+| F8 | A8 (M) W-TinyLFU with int keys below -2^30 allocates on churn: 15.7 B/op, 6 scavenges at 8N, stable over 3 runs. Suspected cause, not verified: the unsigned hash leaves Smi range on its way into the non-inlined `_sketchInc`. | Keep the hash in Smi range (e.g. `h & 0x3fffffff`) or inline `_sketchInc`. Confirm the cause first. | W-TinyLFU churn with keys below -2^30: 0 at 8N. Hit ratio on the bench traces unchanged within noise. |
+| F9 | A11 (L) stale facts. The test count says 1754 (actual 1918). The lockfile `version` is 1.11.0. README 542/545 says has/peek "cannot mutate", but with TTL they reap stale entries and invalidate open iterators. | Fix the counts, the lockfile and the has/peek wording. | Grep: no stale count. `npm i --package-lock-only` produces no diff. |
+| F10 | A10 (L) `onEvict` does not fire on delete / clear / overwrite. The README pool example (120, 234, 438) leaks 6 of 7 objects. | Settle S2: document it now and fix the example. | The README example, run as a test, releases 7 of 7. |
+| F11 | A13 (L) capacity has no upper bound. At 2^32 or above it throws a raw RangeError, and between 2^31 and 2^32 the Int32 links would wrap (read-only analysis). | Reject capacity > 2^31-1 at the constructor with a tagged error. | 2^31 throws `[lite-lru]`. 2^31-1 is not attempted (memory). |
+
+**New (N)**
+
+| id | task | falsifiable gate |
+| --- | --- | --- |
+| N1 | Fractional / large-number perf lane (A9). Add TTL-on scenarios to test/perf for all 13 members: get-hit, put-churn, stale reap and iteration. Clocks: epoch-sized, fractional and default, after a TTL-off warm-up. Plus a keys < -2^30 lane. Add a matching torture tier. | Every lane has 0 scavenges at N and 8N. A control with `expiryFor` reverted must FAIL. |
+| N2 | Config getters (A14): `keysBacking` ('map' / 'int' / 'dense'), `maxKey` (null unless dense), `ttlEnabled`, `statsEnabled`, on LiteCache and in the d.ts. Lets a caller verify the configuration without a try/catch around `stats()`. | dts-drift + tsc pass. The getters never throw and are cold (not on a hot path). |
+| N3 | dts-drift covers all 14 classes + statics (A12). Today it covers 9 and skips ClockPro, LruK, Mq, Car and DirectLru. | A mutation control on Car's d.ts fails the test. |
+| N4 | After F1 + F2 + N1: state the clock contract in README + llms.txt as "any number; the library boxes nothing on the TTL path". | Backed by the N1 lane, not by prose. |
+
+**Settle calls (maintainer)**, lean in brackets:
+- S1 default clock: `Date.now` allocates; `timeOrigin + performance.now()`
+  measured 0 but drifts from wall time. [Switch; document the monotonic meaning;
+  inject `Date.now` for wall time. This changes behaviour, so call it out in the
+  CHANGELOG.]
+- S2 onEvict on delete / clear / overwrite. [Document now; a separate
+  `onRemove(key, value, reason)` later. Never change what onEvict means.]
+- S3 `purgeStale()` on a TTL-off cache returns 0, while `stats()` on a stats-off
+  cache throws. [Keep 0: it is a count, not a state. Document it.]
+- S4 `Infinity` through JSON becomes `null`. [Reject `null` (fail closed, as LruK
+  already does); do not invent an encoding.]
+- S5 `DirectLru.restore` returns a plain LiteLru (already in the d.ts). [Accept.]
+- S6 untracked `BRIEF.md` (2026-09-18 bench review): items 1-4 shipped in 1.18.0,
+  items 5-7 were declined. [Move it to `decisions/` as the bench record; the open
+  hit-ratio-vs-capacity sweep becomes a roadmap item.]
+
+**Checked clean (no task):**
+- onEvict reentrancy fuzz: 13 members x 300 trials, 60k steps each, 0 `validate()`
+  failures, no untagged errors.
+- Key edges on int / dense (19 values incl. -0, 1.5, +-2^31, 2^32+1, NaN, +-Infinity,
+  strings, BigInt): all tagged rejections, no int32 fold. -0 is treated as 0,
+  matching Map.
+- Counters and logical clocks seeded above 2^30 / 2^32: 0 scavenges.
+- TTL-off hot paths and string keys on Map: 0.
+- ARC/CAR `p` and LruK/Mq ticks are validated on restore.
+- Exports match between Lru.js and Lru.d.ts.
+- ASCII, license and `sideEffects` all correct.
+
+**Rejection ledger (rejected during the S17 cycle):**
+- Stamping the expiry at the store site with the NaN/BigInt throw there (batch 2,
+  reviewer REJECTED): the throw ran after slot acquisition / eviction, leaking a slot on
+  all 13 members and desyncing index vs size on S3Fifo/Slru/TwoQ/Arc/Car. Replaced by
+  validate-and-compute at the top of `put` into a per-instance `Float64Array(1)`.
+- Computing the expiry into a plain local at the top of `put`: boxed on members whose
+  large `put` de-inlines `clock()` (fractional return). Replaced by the scratch cell.
+- Plain `& 0x3fffffff` mask on the W-TinyLFU hash: aliased keys differing only in bits
+  30-31 in every sketch row. Replaced by the fold `(h ^ (h >>> 30)) & 0x3fffffff`.
+
+**Exit:** all F gates + N1-N3 green, and the N1 control fails when the fix is
+reverted. `node --expose-gc test/torture.mjs` stays `ok`.
+
+**Future / follow-ups (deferred out of S17):**
+- **Hit-ratio-vs-capacity sweep (curve) in the bench** (from decisions/0030, S6). The
+  single most standard plot in the caching literature -- hit ratio as a function of
+  capacity for one named trace -- and honest (per-trace, no cross-lib claim). A
+  candidate follow-up now that the alpha sweep (0030 item 1) has landed; keep
+  `beladyOpt`'s Int32Array(n)+Map scale ceiling in mind before advertising it.
+- **`onRemove(key, value, reason)`** (deferred per S2/F10). A superset hook that fires
+  on EVERY removal path -- capacity eviction, TTL reap, `delete`, `clear`, and overwrite
+  -- with a `reason` tag, so a pool can release without a manual teardown drain. Kept
+  SEPARATE from `onEvict` deliberately: `onEvict` stays eviction-only and its meaning
+  never changes (S2). Design the `reason` enum + the zero-GC firing discipline before
+  building.
+
 ---
 
 ## 7. Decision-record index (decisions/)
@@ -1392,6 +1496,7 @@ DONE WHEN
 | D21 | snapshot / restore (cold dump()/static restore(); slot-verbatim serial form; fail-closed tag; TTL captured verbatim + capture-time stamp) | 0021 (S14) |
 | D22 | animated policy-visualization demo (medium; dump() IS the visualization model; demo-only introspection hook REJECTED; never shipped; occupancy-only, dump() omits fixed geometry) | 0022 (S13) |
 | D23 | LIRS (list-based; recency-of-recency; bounded non-resident history generalizing the ArcGhost pattern; fixed-capacity honesty; bounded O(L_hir) stack pruning) | 0023 (S16) |
+| (record) | bench review (2026-09-18): the honesty-constrained bench harness; DO items 1-4 shipped in 1.18.0, DECLINE items 5-7; hit-ratio-vs-capacity sweep left as a roadmap follow-up | 0030 (S17) |
 | (law) | bit-packing (if any) INLINED, never a `lite-fastbit32`/package runtime dep (item 15) | 0012 (S4) |
 
 Deferred / out-of-core (get a decision record only if `DEBATE.md` promotes them):

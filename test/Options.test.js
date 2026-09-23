@@ -17,6 +17,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car,
+    DirectLru,
 } from '../Lru.js';
 
 /** All 13 family members, in the same order `runBench` reports them (Bench.test.js). */
@@ -333,4 +334,122 @@ for (const [name, Cls] of MEMBERS) {
             return true;
         });
     });
+}
+
+/* ============================================================================ *
+ * TASK 6 (S17 F11) -- capacity has an UPPER bound. A capacity above 2^31-1 is
+ * rejected with a tagged RangeError at EVERY constructor door (the typed-array /
+ * dense-index domain is 32-bit signed). We probe 2^31 (one past the max); we do
+ * NOT attempt to allocate 2^31-1.
+ * ============================================================================ */
+
+for (const [name, Cls] of MEMBERS) {
+    test(name + ': a capacity above 2^31-1 is rejected with a tagged RangeError (S17 F11)', () => {
+        assert.throws(() => new Cls(2 ** 31), (err) => {
+            assert.ok(err instanceof RangeError, name + ': not a RangeError');
+            assert.match(err.message, /\[lite-lru\]/);
+            assert.match(err.message, /exceed/);
+            return true;
+        });
+    });
+}
+
+test('DirectLru: a capacity above 2^31-1 is rejected with a tagged RangeError (S17 F11)', () => {
+    assert.throws(() => new DirectLru(2 ** 31, { maxKey: 4 }), (err) => {
+        assert.ok(err instanceof RangeError);
+        assert.match(err.message, /\[lite-lru\]/);
+        assert.match(err.message, /exceed/);
+        return true;
+    });
+});
+
+/* ============================================================================ *
+ * TASK 7 (S17 F4) -- DirectLru rebuilds its options object; it must run the SAME
+ * unknown-option door (did-you-mean) BEFORE the rebuild, so a typo is NOT silently
+ * dropped. A DirectLru "row" of the unknown-option law (KNOWN_OPTS minus keys,
+ * which DirectLru fixes to 'dense').
+ * ============================================================================ */
+
+test("DirectLru: unknown option 'ttll' throws [lite-lru] unknown option ttll (did you mean ttl?) (S17 F4)", () => {
+    assert.throws(() => new DirectLru(8, { maxKey: 9, ttll: 5 }), (err) => {
+        assert.ok(err instanceof TypeError);
+        assert.equal(err.message, '[lite-lru] unknown option ttll (did you mean ttl?)');
+        return true;
+    });
+});
+
+test("DirectLru: unknown option 'onEvcit' (near-miss) is not silently dropped (S17 F4)", () => {
+    assert.throws(() => new DirectLru(8, { maxKey: 9, onEvcit: () => {} }), (err) => {
+        assert.ok(err instanceof TypeError);
+        assert.match(err.message, /\[lite-lru\] unknown option onEvcit \(did you mean onEvict\?\)/);
+        return true;
+    });
+});
+
+test('DirectLru: a clean options bag still constructs (non-vacuity for the F4 door)', () => {
+    const c = new DirectLru(8, { maxKey: 9, ttl: 5 });
+    c.put(0, 'a');
+    assert.equal(c.get(0), 'a');
+});
+
+/* ============================================================================ *
+ * TASK 8 (S17 N2) -- cold read-only configuration getters: keysBacking ('map' |
+ * 'int' | 'dense'), maxKey (number for dense, else null), ttlEnabled, statsEnabled.
+ * They let a caller verify the configuration without a try/catch around stats().
+ * Verified for every one of the 13 members x 3 backings x ttl on/off x stats
+ * on/off, and preserved verbatim across dump()/restore(). Each getter must never
+ * throw and read a stored primitive/interned string (cold, no hot-path cost).
+ * ============================================================================ */
+
+// [reported backing, `keys` option (undefined = default Map), maxKey for dense]
+const N2_BACKINGS = [
+    ['map', undefined, null],
+    ['int', 'int', null],
+    ['dense', 'dense', 15],
+];
+
+for (const [name, Cls] of MEMBERS) {
+    for (const [backing, keys, mk] of N2_BACKINGS) {
+        for (const ttl of [false, true]) {
+            for (const stats of [false, true]) {
+                test(name + ' [' + backing + ', ttl=' + ttl + ', stats=' + stats +
+                    ']: config getters read the stored configuration (S17 N2)', () => {
+                    const opts = {};
+                    if (keys !== undefined) opts.keys = keys;
+                    if (mk !== null) opts.maxKey = mk;
+                    if (ttl) opts.ttl = 1000;
+                    if (stats) opts.stats = true;
+                    const c = new Cls(8, opts);
+                    assert.equal(c.keysBacking, backing);
+                    assert.equal(c.maxKey, backing === 'dense' ? mk : null);
+                    assert.equal(c.ttlEnabled, ttl);
+                    assert.equal(c.statsEnabled, stats);
+                    // Never throws, even read repeatedly (the cold-getter contract).
+                    assert.doesNotThrow(() => {
+                        void c.keysBacking; void c.maxKey; void c.ttlEnabled; void c.statsEnabled;
+                    });
+                });
+            }
+        }
+    }
+}
+
+for (const [name, Cls] of MEMBERS) {
+    for (const [backing, keys, mk] of N2_BACKINGS) {
+        test(name + ' [' + backing + ']: config getters survive dump()/restore() (S17 N2)', () => {
+            const opts = { ttl: 1000 };
+            if (keys !== undefined) opts.keys = keys;
+            if (mk !== null) opts.maxKey = mk;
+            const c = new Cls(8, opts);
+            c.put(backing === 'dense' ? 0 : 1, 'a');
+            // A ttl snapshot REQUIRES the future default be re-supplied at restore.
+            const r = Cls.restore(c.dump(), { ttl: 1000 });
+            assert.equal(r.keysBacking, backing);
+            assert.equal(r.maxKey, backing === 'dense' ? mk : null);
+            assert.equal(r.ttlEnabled, true);
+            // Stats are runtime, not part of the snapshot: a restore without { stats:true }
+            // reports off (fail-closed default), proving the getter reads the rebuilt state.
+            assert.equal(r.statsEnabled, false);
+        });
+    }
 }

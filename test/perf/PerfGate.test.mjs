@@ -29,7 +29,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { zgcSuite } from '@zakkster/lite-perf-gate';
 import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car } from '../../Lru.js';
+import { validate } from '../validate.mjs';
 import {
+    spawnTtlConfig, parseTtlResult, TTL_MEMBER_NAMES, TTL_CLOCKS, TTL_N,
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
     CountedSieve, SIEVE_WRITES_HIT_LINKS, SIEVE_WRITES_HIT_VIS,
     CountedS3Fifo, S3FIFO_WRITES_HIT_LINKS, S3FIFO_WRITES_HIT_VIS,
@@ -214,6 +216,125 @@ zgcSuite({
     counters: { grows: 0 },
     scenarios,
     mustFail: [mustFailAlloc],
+});
+
+/**
+ * TTL zero-alloc lanes (ROADMAP S17 N1 / A1 / A2). The transient boxing on the TTL
+ * path (an expiry double crossing a non-inlined return, or a boxed clock() result)
+ * is invisible to a heap-delta gate and only shows up after a TTL-OFF warm-up of the
+ * same class de-inlines the expiry maths -- and only when epoch/frac/default clocks
+ * do NOT share a process (the clock() call site otherwise goes polymorphic). So each
+ * (member, clock) config runs in its OWN child launched with the small semi-space,
+ * measuring get-hit / iteration / put-churn / stale-reap at N and 8N. Every lane must
+ * be 0 scavenges; the boxing-expiry control in t9 proves the instrument has teeth.
+ */
+for (let mi = 0; mi < TTL_MEMBER_NAMES.length; mi++) {
+    for (let ci = 0; ci < TTL_CLOCKS.length; ci++) {
+        const member = TTL_MEMBER_NAMES[mi];
+        const clock = TTL_CLOCKS[ci];
+        test('zero-GC TTL: ' + member + ' (' + clock + ' clock)', () => {
+            const parsed = parseTtlResult(spawnTtlConfig(member, clock, false));
+            assert.ok(parsed.ok, 'TTL child failed: ' + parsed.error);
+            for (const shape in parsed.result) {
+                const [nLo, nHi] = parsed.result[shape];
+                assert.equal(nHi, 0,
+                    member + ' ' + shape + ' (' + clock + '): ' + nHi + ' scavenges at 8N=' +
+                    (8 * TTL_N) + ' (transient TTL-path boxing)');
+                assert.equal(nLo, 0,
+                    member + ' ' + shape + ' (' + clock + '): ' + nLo + ' scavenges at N=' + TTL_N);
+            }
+        });
+    }
+}
+
+test('zero-GC TTL: W-TinyLFU int keys below -2^30 (A8)', () => {
+    const parsed = parseTtlResult(spawnTtlConfig('wtlfu-neg', '', false));
+    assert.ok(parsed.ok, 'wtlfu-neg child failed: ' + parsed.error);
+    const [nLo, nHi] = parsed.result['wtlfu-neg'];
+    assert.equal(nHi, 0, 'W-TinyLFU neg-key churn: ' + nHi + ' scavenges at 8N (hash left Smi range)');
+    assert.equal(nLo, 0, 'W-TinyLFU neg-key churn: ' + nLo + ' scavenges at N');
+});
+
+test('perf-gate MUST CATCH: boxing-expiry control trips the TTL scavenge lane', () => {
+    const parsed = parseTtlResult(spawnTtlConfig('LiteLru', 'epoch', true));
+    assert.ok(parsed.ok, 'broken TTL child failed: ' + parsed.error);
+    const [, nHi] = parsed.result['putchurn-broken'];
+    assert.ok(nHi > 0,
+        'the boxing-expiry control produced ' + nHi + ' scavenges at 8N -- the TTL lane has no teeth');
+});
+
+/**
+ * F7 (ROADMAP S17 A7): clear() is O(size), NOT O(capacity). Before the fix, clear()
+ * swept the whole slot store (SlotStore.reset), so emptying a nearly-empty cache cost
+ * time proportional to its CAPACITY -- 0.8 us at cap 16 vs 644 us at cap 1M with <= 8
+ * residents (the audit measurement). The fix walks only the resident roster and frees
+ * those slots, so clear time now tracks residents, not geometry.
+ *
+ * The gate: with the SAME tiny residency (8 keys), clearing a cap-1M cache must not be
+ * more than 4x the time of clearing a cap-16 cache. It is measured on the DENSE backing
+ * (index clear is an O(1) epoch bump, so the slot reclamation is isolated) as the median
+ * of several runs -- a timing test is noisy, so a single sample is not trusted, and the
+ * threshold (4x) is far above measurement jitter yet far below the ~40000x an O(capacity)
+ * clear would show. NOT a zero-GC scenario: clear is a cold path and its roster array
+ * may allocate; this asserts the ASYMPTOTE, not the byte budget.
+ */
+test('F7: clear() is O(size) -- cap 1M vs cap 16 clear time (<= 8 residents) stays under 4x', () => {
+    const RESIDENTS = 8;
+    const CYCLES = 200;   // put 8 + clear, timed as one batch (matches the 200-cycle conservation gate)
+    const RUNS = 11;      // odd count -> a clean median, robust to a stray slow sample
+
+    function timedClearer(cap) {
+        const c = new LiteLru(cap, { keys: 'dense', maxKey: cap - 1 });
+        for (let w = 0; w < 100; w++) { for (let i = 0; i < RESIDENTS; i++) c.put(i, i); c.clear(); } // JIT warm-up
+        return () => {
+            const t0 = performance.now();
+            for (let r = 0; r < CYCLES; r++) {
+                for (let i = 0; i < RESIDENTS; i++) c.put(i, i);
+                c.clear();
+            }
+            return performance.now() - t0;
+        };
+    }
+
+    const timeBig = timedClearer(1000000);
+    const timeSmall = timedClearer(16);
+    const bigs = [], smalls = [];
+    for (let r = 0; r < RUNS; r++) { bigs.push(timeBig()); smalls.push(timeSmall()); }
+    bigs.sort((a, b) => a - b);
+    smalls.sort((a, b) => a - b);
+    const mid = (RUNS - 1) >> 1;
+    const bigMed = bigs[mid], smallMed = smalls[mid];
+    const ratio = bigMed / smallMed;
+    assert.ok(ratio < 4,
+        'clear O(size): cap 1M / cap 16 median ratio ' + ratio.toFixed(2) +
+        ' (big ' + bigMed.toFixed(3) + 'ms, small ' + smallMed.toFixed(3) + 'ms per ' + CYCLES + ' cycles)');
+});
+
+/**
+ * F7 conservation: 200 clear cycles keep validate() OK and size + freeListLength ==
+ * capacity on every backing. The O(size) clear pushes freed slots onto the EXISTING
+ * free stack rather than rebuilding it, so this proves the conservation invariant
+ * (no slot lost or duplicated) survives the new path across all 13 members.
+ */
+test('F7: 200 clear cycles keep validate() OK and size + freeListLength == capacity (all members, all backings)', () => {
+    const MEMBERS_ALL = [LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car];
+    const cap = 64;
+    const backings = [{}, { keys: 'int' }, { keys: 'dense', maxKey: 255 }];
+    for (const Ctor of MEMBERS_ALL) {
+        for (const opts of backings) {
+            const c = new Ctor(cap, opts);
+            for (let cyc = 0; cyc < 200; cyc++) {
+                // Partially fill (below and at capacity across cycles), then clear.
+                const fill = (cyc % 3 === 0) ? 8 : (cyc % 3 === 1) ? cap : cap + 40; // overfill -> eviction churn too
+                for (let i = 0; i < fill; i++) c.put(i & 255, i & 0xffff);
+                c.clear();
+                assert.equal(c.size, 0, Ctor.name + ' size after clear');
+                assert.equal(c.size + c._store.freeListLength(), c._capacity,
+                    Ctor.name + ' conservation after clear (cycle ' + cyc + ')');
+                validate(c); // throws on the first invariant violation (uses activeListsOf internally)
+            }
+        }
+    }
 });
 
 /**

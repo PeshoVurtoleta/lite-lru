@@ -547,5 +547,66 @@ These are intentional simplifications for a userspace, fixed-capacity experiment
 
 ---
 
+## 9. Allocation and fail-closed audit of 1.18.0 (2026-09-23)
+
+The audit record behind ROADMAP S17. It was a read-only audit: probes ran outside
+the repo, and patched copies of Lru.js were used only to confirm the fixes.
+Method: count minor GCs (scavenges) at N=200k and 8N under
+`node --expose-gc --max-semi-space-size=4`, one config per process, with the
+feature ON scaling compared against feature OFF. The same method is applied
+across the suite (lite-hud M2, lite-sketch, lite-filter).
+
+### 9.1 Why the gates passed
+
+V8 boxes a fractional or large double (a ~16 B HeapNumber) when it is passed to,
+or returned from, a call that V8 did not inline. Small integers (Smis) never box.
+Every lite-lru gate lane fed Smis:
+- the torture TTL clock counts up from 0 with ttl 8 (test/torture/t6-alloc.mjs:1089)
+- the perf gate has no TTL or stats lane at all
+- keys are always small and non-negative
+
+A heap-delta gate cannot see transient allocation anyway. So a real clock
+(an epoch-ms value like 1.7e12, or `performance.now()`) was never measured.
+
+### 9.2 Measured findings
+
+| id | owner | finding | numbers |
+| --- | --- | --- | --- |
+| A1 | library | `expiryFor` returns the expiry double from a call. V8 stops inlining it once a TTL-off instance of the same class ran in the process (the call site goes polymorphic), and from then on it boxes. | All 13 members' `put`: 0 scavenges at N, 12 at 8N (~31.5 B/op) with an epoch-sized or `performance.now` clock. 0 in a fresh process, 0 with a small-int clock, and 0/0 with the expiry maths inlined into `put`. |
+| A2 | library (default) | `Date.now` as the default clock: a native call that returns a boxed double on every TTL touch. | get / has / put / iteration: 15.7-31.5 B/op on all 13 members, and it persists after the A1 fix. `timeOrigin + performance.now()` measured 0/0. |
+| A8 | library | W-TinyLFU int keys below -2^30. Suspected cause (not verified): the unsigned 32-bit hash is passed into a non-inlined `_sketchInc`. | 6 scavenges at 8N (15.7 B/op), stable over 3 runs. Same keys on Sieve / S3Fifo / Arc / LiteLru: 0. Keys at or above 2^30, or near -1000: 0. |
+| A7 | doc | Dense `clear()` is O(1) only for the index. `SlotStore.reset` is O(capacity). | 0.8 us (cap 16), 4.0 us (cap 4096), 644 us (cap 1M), each with 8 or fewer residents. |
+
+Fail-open findings (A3 duplicate keys in restore, A4 DirectLru dropping unknown
+options, A5 unvalidated restore expiry values, A6 unchecked clock return) are
+reproduced exactly in ROADMAP S17 F3-F6. A3 and A4 were re-run independently
+and reproduced.
+
+### 9.3 Lessons (apply suite-wide)
+
+1. **Never return a computed double from a helper on a hot path.** Compute it
+   inline, or write it into a typed-array slot. "V8 will inline it" holds only
+   while the call site stays monomorphic. One other instance of the same class
+   with the feature OFF is enough to break it.
+2. **A default argument is part of the hot path.** `Date.now` is a boxing source,
+   so any zero-alloc claim has to be measured with the DEFAULT clock, not only
+   with an injected one.
+3. **Gate with realistic magnitudes:** epoch-ms clocks, fractional clocks, keys
+   below -2^30. Warm up with the feature OFF in the same process before the ON
+   lane.
+4. **restore() is an input door.** Validate every field as strictly as the
+   constructor does: unique keys, typed expiry values, unknown options. A wrapper
+   that rebuilds an options object must run the same door first.
+
+### 9.4 Checked clean
+
+- onEvict reentrancy fuzz: 13 members x 300 trials, 60k steps each, 0 validate()
+  failures.
+- 19 key edge values on int / dense: all tagged rejections, no int32 fold.
+- Counters and logical clocks above 2^30 / 2^32: 0 scavenges.
+- TTL-off hot paths and string keys on Map: 0 scavenges.
+
+---
+
 *This document consolidates design discussion, theoretical grounding, and experimental code for the lite-lru project. It
 is intended as an internal research reference.*

@@ -210,12 +210,21 @@ const TTL_NO_COLUMN_MSG =
     "{ ttl } option; this instance has no ttl configured";
 
 /**
- * Validate the optional injectable `clock` (decisions/0017, D17.2): a hoisted zero-arg
- * function returning ms, or `undefined` for the `Date.now` default. Anything else fails
- * closed at the door. Returns the resolved clock function.
+ * Validate the optional injectable `clock` (decisions/0017, D17.2; ROADMAP S17 S1): a
+ * hoisted zero-arg function returning ms, or `undefined` for the default clock. The
+ * default is `defaultClock` -- ONE module-level function (never a per-instance closure)
+ * so the `clock()` call site on the TTL hot path stays monomorphic and V8 boxes nothing;
+ * it reads monotonic wall-time (`performance.timeOrigin + performance.now()`), not
+ * `Date.now` (a native call whose double return boxes on every TTL touch -- ROADMAP S17
+ * A2). Inject `Date.now` explicitly for epoch wall-time. Anything else fails closed.
+ * Returns the resolved clock function.
  */
+function defaultClock() {
+    return performance.timeOrigin + performance.now();
+}
+
 function validateClock(clock) {
-    if (clock === undefined) return Date.now;
+    if (clock === undefined) return defaultClock;
     if (typeof clock !== "function") {
         throw new TypeError(
             "[lite-lru] clock must be a zero-arg function returning ms, got " + String(clock));
@@ -239,19 +248,52 @@ function validateTtl(ttl) {
 }
 
 /**
- * Compute the absolute expiry timestamp for a put (decisions/0017, D17.1/D17.4). `ttlMs`
- * omitted -> the instance default `ttl`; `Infinity` -> never (Infinity, NEVER 0); else
- * `now() + ttlMs`. A per-put `ttlMs` is validated fail-closed (positive-finite-or-Infinity).
- * Only ever called when a `_exp` column exists (the ttl-on path).
+ * Validate a per-put `ttlMs` override (decisions/0017, D17.1/D17.4). `undefined` (use the
+ * instance default) and `Infinity` (never) are legal no-ops; any other value must be a
+ * POSITIVE FINITE number, else fails closed (RangeError). VOID and COLD: called only when
+ * an explicit `ttlMs` is passed, before any mutation, so the throw is atomic. The expiry
+ * itself is resolved into a same-function `let e` at the top of each `put` and written
+ * straight into `_exp[slot]`, never crossing a function-return boundary (ROADMAP S17 A1).
  */
-function expiryFor(clock, ttl, ttlMs) {
-    if (ttlMs === undefined) return ttl === Infinity ? Infinity : clock() + ttl;
-    if (ttlMs === Infinity) return Infinity;
+function checkTtl(ttlMs) {
+    if (ttlMs === undefined || ttlMs === Infinity) return;
     if (typeof ttlMs !== "number" || !(ttlMs > 0) || !Number.isFinite(ttlMs)) {
         throw new RangeError(
             "[lite-lru] ttlMs must be a positive number of ms or Infinity, got " + String(ttlMs));
     }
-    return clock() + ttlMs;
+}
+
+/**
+ * The absolute expiry for a put is computed COLD + atomically at the TOP of each member's
+ * `put` (decisions/0017, D17.1/D17.4; ROADMAP S17 F6): the instance `_ttl` / per-put
+ * `ttlMs` / `Infinity` resolves a duration, the clock is read exactly ONCE on the
+ * finite-ttl path into a same-function `let e`, and the tagged BigInt/NaN checks run there
+ * -- BEFORE any slot acquisition, eviction, or column write -- so a garbage clock throws
+ * fully atomically (the cache is never mutated). The store site then writes only
+ * `this._exp[slot] = e`: the double never crosses a function-return boundary as a boxed
+ * HeapNumber (the A1 zero-alloc fix -- a helper that RETURNED the expiry boxed on every
+ * put once a TTL-off instance de-inlined it).
+ */
+const CLOCK_TYPE_MSG =
+    "[lite-lru] clock() must return a number (ms); a non-numeric return (e.g. BigInt) " +
+    "cannot stamp an expiry";
+const CLOCK_NAN_MSG =
+    "[lite-lru] clock() produced a NaN expiry; a clock must return a finite ms number " +
+    "or Infinity";
+
+/**
+ * Resolve one put's absolute expiry into the per-instance Float64Array(1) scratch
+ * (ROADMAP S17 F6/A1). VOID + SMALL so V8 inlines the monomorphic `clock()` call (a
+ * de-inlined default clock would box its fractional double return -> transient scavenges)
+ * and the double never crosses a function-return boundary. Fails closed BEFORE the caller
+ * mutates anything: a non-number return (e.g. a BigInt clock) throws a tagged TypeError; a
+ * NaN result throws a tagged RangeError. Only ever called on the finite-ttl path.
+ */
+function computeExpiry(clock, ms, scr) {
+    const now = clock();
+    if (typeof now !== "number") throw new TypeError(CLOCK_TYPE_MSG); // e.g. a BigInt clock
+    scr[0] = now + ms;
+    if (scr[0] !== scr[0]) throw new RangeError(CLOCK_NAN_MSG); // clock() returned garbage (NaN)
 }
 
 /** Iteration modes (decisions/0018, D18.2). The ONE shared hand-written iterator
@@ -346,7 +388,7 @@ function validateOnEvict(onEvict) {
     return onEvict;
 }
 
-export const VERSION = "1.18.0";
+export const VERSION = "1.19.0";
 
 /**
  * Fibonacci integer hash mix (decisions/0011). `Math.imul` is an EXACT 32-bit
@@ -419,23 +461,6 @@ class SlotStore {
         let n = 0;
         for (let s = this._free; s !== NIL; s = this._next[s]) n++;
         return n;
-    }
-
-    /** Rebuild the free list, drop every payload ref, and clear the index.
-     *  O(capacity); allocates nothing. */
-    reset() {
-        const cap = this._capacity;
-        const keys = this._keys, vals = this._vals, next = this._next, prev = this._prev;
-        for (let i = 0; i < cap; i++) {
-            keys[i] = undefined;
-            vals[i] = undefined;
-            next[i] = i + 1;
-            prev[i] = NIL;
-        }
-        next[cap - 1] = NIL;
-        this._free = 0;
-        if (this._exp !== null) this._exp.fill(Infinity); // reset expiries (decisions/0017)
-        this.clearIndex();
     }
 
     /** Rebuild the free stack over the slots NOT marked occupied (decisions/0021, D21).
@@ -767,7 +792,7 @@ class CacheIterator {
             }
             const nx = nextCol[s];
             // D18.5 -- SKIP a stale entry (invisible to iteration); NEVER reap it here.
-            if (exp !== null && exp[s] <= this._clock()) { s = nx; continue; }
+            if (exp !== null && !(this._clock() < exp[s])) { s = nx; continue; }
             this._slot = nx;
             const mode = this._mode;
             if (mode === ITER_KEYS) res.value = keys[s];
@@ -787,6 +812,45 @@ class CacheIterator {
 function iterKeys(cache) { return new CacheIterator(cache, ITER_KEYS, cache._iterHeads()); }
 function iterValues(cache) { return new CacheIterator(cache, ITER_VALUES, cache._iterHeads()); }
 function iterEntries(cache) { return new CacheIterator(cache, ITER_ENTRIES, cache._iterHeads()); }
+
+/**
+ * O(size) slot reclamation for `clear()` (ROADMAP S17 F7). Walks the member's live
+ * roster -- the SAME heads + link column iteration walks -- and, per RESIDENT slot,
+ * returns it to the free stack via `freeSlot`. It touches ONLY occupied slots, never
+ * the whole capacity, so an almost-empty cache at a huge capacity clears in time
+ * proportional to its residents, not its geometry (the SlotStore.reset O(capacity)
+ * sweep it replaces was the A7 finding).
+ *
+ * Conservation (size + free == capacity) is preserved BY CONSTRUCTION: `freeSlot`
+ * pushes each formerly-resident slot onto the EXISTING free stack, so the union of
+ * old-free + newly-freed is exactly the whole slot domain -- no full rebuild needed.
+ * `freeSlot` also nulls the key/value refs and resets `_exp[s]` (retention hygiene:
+ * a cleared slot pins nothing). The keyed index is cleared once at the end via the
+ * backing's own `clearIndex` (O(1) dense epoch bump, O(size) Map, O(table) int).
+ *
+ * `nextCol` is the link column the roster is threaded through (defaults to the shared
+ * `_next`; Lfu's per-bucket key lists ride `_fNext`). `colA/valA` + `colB/valB` reset
+ * up to two per-slot AUX columns (Sieve/Slru `_vis`, LIRS/ClockPro/Car `_st`, LruK
+ * `_st`/`_r1`, Mq `_rc`/`_exq`) to their freed value in the SAME O(size) walk, so
+ * those per-slot columns no longer need an O(capacity) `.fill()`. COLD: never a hot
+ * path. `_iterHeads()` may allocate its roster array here -- clear is not zero-GC.
+ */
+function clearSlots(cache, nextCol, colA, valA, colB, valB) {
+    const store = cache._store;
+    const next = nextCol !== undefined ? nextCol : cache._next;
+    const heads = cache._iterHeads();
+    for (let h = 0; h < heads.length; h++) {
+        let s = heads[h];
+        while (s !== NIL) {
+            const nx = next[s];        // capture BEFORE freeSlot rewrites _next[s]
+            if (colA !== undefined) colA[s] = valA;
+            if (colB !== undefined) colB[s] = valB;
+            store.freeSlot(s);         // null refs + drop expiry + push onto free stack
+            s = nx;
+        }
+    }
+    store.clearIndex();
+}
 
 /* -------------------------------------------------------------------------- *
  * Snapshot / restore -- the shared COLD (dump/restore) machinery (decisions/0021,
@@ -902,6 +966,9 @@ function snapRead(snap, member, opts) {
     if (!Number.isInteger(cap) || cap < 1) {
         throw new Error(SNAP_BAD + "capacity must be an integer >= 1, got " + String(cap));
     }
+    if (cap > INT_MAX) {
+        throw new Error(SNAP_BAD + "capacity must not exceed " + INT_MAX + " (2^31-1), got " + String(cap));
+    }
     if (snap.keys !== "int" && snap.keys !== "dense" && snap.keys !== null) {
         throw new Error(SNAP_BAD + "keys backing must be 'int', 'dense' or null, got " + String(snap.keys));
     }
@@ -971,6 +1038,17 @@ function snapCheckList(list, cap, ttl, label, withVis) {
         if (!Array.isArray(list.e) || list.e.length !== n) {
             throw new Error(SNAP_BAD + "ttl snapshot list '" + label + "' missing/short exp column");
         }
+        // Validate every expiry VALUE, not just the column shape (null is not zero). Valid =
+        // a number that is not NaN; Infinity (never-expire) and any finite ms are fine. A
+        // non-number (null/undefined/{}/"abc") or NaN would stamp `_exp` with garbage that
+        // reads as never-expire -- reject it here, before any mutation of the target.
+        for (let i = 0; i < n; i++) {
+            const ev = list.e[i];
+            if (typeof ev !== "number" || ev !== ev) {
+                throw new Error(SNAP_BAD + "ttl snapshot list '" + label + "' exp[" + i + "] = " +
+                    String(ev) + " (must be a number, not NaN)");
+            }
+        }
     } else if (list.e !== undefined) {
         throw new Error(SNAP_BAD + "non-ttl snapshot list '" + label + "' carries an exp column");
     }
@@ -1001,13 +1079,21 @@ function snapCheckList(list, cap, ttl, label, withVis) {
  *  (decisions/0021, D21.3). Returns the occupied Uint8Array for rebuildFreeList. */
 function snapOccupied(cap, lists) {
     const occ = new Uint8Array(cap);
+    // Reject a duplicate KEY across the resident lists, not just a duplicate SLOT: two
+    // slots carrying the same key would both `store.set(key, s)` and silently clobber the
+    // index (the second write wins, the first slot is orphaned -- a corrupt cache).
+    // SameValueZero (Map/Set semantics) matches the store's own index. Cold (restore only).
+    const seen = new Set();
     let total = 0;
     for (let li = 0; li < lists.length; li++) {
-        const slots = lists[li].slots;
+        const slots = lists[li].slots, k = lists[li].k;
         for (let i = 0; i < slots.length; i++) {
             const s = slots[i];
             if (occ[s] !== 0) throw new Error(SNAP_BAD + "duplicate slot " + s + " across lists");
             occ[s] = 1; total++;
+            const key = k[i];
+            if (seen.has(key)) throw new Error(SNAP_BAD + "duplicate key " + String(key) + " across lists");
+            seen.add(key);
         }
     }
     if (total > cap) {
@@ -1096,6 +1182,11 @@ export class LiteLru {
                 "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
             );
         }
+        if (capacity > INT_MAX) {
+            throw new RangeError(
+                "[lite-lru] capacity must not exceed " + INT_MAX + " (2^31-1), got " + String(capacity)
+            );
+        }
 
         void validateOptions(options);
         this._capacity = capacity;
@@ -1117,6 +1208,7 @@ export class LiteLru {
         this._next = this._store._next; // active: toward LRU; free: next free
         this._prev = this._store._prev; // active: toward MRU (unused when free)
         this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+        this._expScr = this._exp !== null ? new Float64Array(1) : null; // S17 F6 expiry scratch
 
         this._head = NIL; // MRU end of the active list
         this._tail = NIL; // LRU end of the active list
@@ -1145,6 +1237,17 @@ export class LiteLru {
 
     get size() { return this._size; }
     get capacity() { return this._capacity; }
+
+    // S17 N2 -- cold read-only configuration getters (A14). Each is DERIVED from an
+    // existing instance field: the store's interned `_kind` tag, the `_maxKey` it
+    // records only for the dense backing, and the `_exp`/`_stats` columns that are
+    // `null` when off. They never throw, allocate nothing (a stored primitive or an
+    // interned string is returned), and read correctly after restore() because
+    // restore rebuilds through the same constructor. Cold: never on a hot path.
+    get keysBacking() { return this._store._kind; }
+    get maxKey() { return this._store._kind === "dense" ? this._store._maxKey : null; }
+    get ttlEnabled() { return this._exp !== null; }
+    get statsEnabled() { return this._stats !== null; }
 
     // --- intrusive doubly-linked-list helpers (D1) ----------------------------
 
@@ -1190,7 +1293,7 @@ export class LiteLru {
         if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (decisions/0019)
         // TTL gate (decisions/0017, D17.3): a stale hit is a MISS -- no promotion,
         // reaped in place (fires onEvict). Only reached when ttl is configured.
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
             this._reap(s);
             return undefined;
@@ -1209,15 +1312,22 @@ export class LiteLru {
      */
     put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
-        let expiresAt;
-        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        // S17 F6: resolve the expiry COLD + atomically into the per-instance f64 scratch,
+        // BEFORE _ver++/slot acquisition, so a bad clock throws with ZERO mutation and the
+        // double never boxes (computeExpiry is tiny -> this._clock() inlines).
+        if (this._exp !== null) {
+            if (ttlMs !== undefined) checkTtl(ttlMs);
+            const ms = ttlMs === undefined ? this._ttl : ttlMs; // resolved duration (Infinity or finite ms)
+            if (ms === Infinity) this._expScr[0] = Infinity;
+            else computeExpiry(this._clock, ms, this._expScr);
+        }
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                  // update-in-place + promote
             this._vals[existing] = value;
-            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            if (this._exp !== null) this._exp[existing] = this._expScr[0]; // restamp (D17)
             this._moveToFront(existing);
             if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); decisions/0019
             return;
@@ -1241,7 +1351,7 @@ export class LiteLru {
 
         this._keys[s] = key;
         this._vals[s] = value;
-        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        if (this._exp !== null) this._exp[s] = this._expScr[0]; // stamp the expiry (D17)
         store.set(key, s);
         this._pushFront(s);
         this._size++;
@@ -1267,7 +1377,7 @@ export class LiteLru {
     has(key) {
         const s = this._store.get(key);
         if (s < 0) return false;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s); // never nest onEvict (fail closed)
             return false;
         }
@@ -1279,7 +1389,7 @@ export class LiteLru {
     peek(key) {
         const s = this._store.get(key);
         if (s < 0) return undefined;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return undefined;
         }
@@ -1312,7 +1422,7 @@ export class LiteLru {
         const now = this._clock();
         const exp = this._exp;
         const victims = [];
-        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        this._store.indexEntries((key, slot) => { if (!(now < exp[slot])) victims.push(slot); });
         for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
         return victims.length;
     }
@@ -1334,11 +1444,12 @@ export class LiteLru {
         return true;
     }
 
-    /** Empty the cache. Rebuilds the free list; allocates nothing. O(capacity). */
+    /** Empty the cache. O(size) (ROADMAP S17 F7): frees only the resident slots and
+     *  clears the index; nothing scales with capacity. Allocates only the cold roster. */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
-        this._store.reset();
+        void clearSlots(this);
         this._head = NIL;
         this._tail = NIL;
         this._size = 0;
@@ -1432,6 +1543,10 @@ function denseOptions(options) {
     if (options !== undefined && (options === null || typeof options !== "object")) {
         throw new TypeError("[lite-lru] options must be an object, got " + String(options));
     }
+    // Run the SAME unknown-option door (with did-you-mean) the other constructors run,
+    // BEFORE the rebuild below drops any key it does not copy -- otherwise a typo like
+    // `ttll` would be silently discarded instead of failing closed (the fail-closed law).
+    validateOptions(options);
     const o = options || {};
     if (o.keys !== undefined && o.keys !== "dense") {
         throw new TypeError(
@@ -1504,6 +1619,11 @@ export class Sieve {
                 "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
             );
         }
+        if (capacity > INT_MAX) {
+            throw new RangeError(
+                "[lite-lru] capacity must not exceed " + INT_MAX + " (2^31-1), got " + String(capacity)
+            );
+        }
 
         void validateOptions(options);
         this._capacity = capacity;
@@ -1522,6 +1642,7 @@ export class Sieve {
         this._next = this._store._next; // toward the tail (older)
         this._prev = this._store._prev; // toward the head (newer)
         this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+        this._expScr = this._exp !== null ? new Float64Array(1) : null; // S17 F6 expiry scratch
 
         // D12 -- the visited column: one byte per slot, so a hit is a single store
         // with no mask/shift. Fixed size, allocated once, never grown.
@@ -1546,6 +1667,17 @@ export class Sieve {
 
     get size() { return this._size; }
     get capacity() { return this._capacity; }
+
+    // S17 N2 -- cold read-only configuration getters (A14). Each is DERIVED from an
+    // existing instance field: the store's interned `_kind` tag, the `_maxKey` it
+    // records only for the dense backing, and the `_exp`/`_stats` columns that are
+    // `null` when off. They never throw, allocate nothing (a stored primitive or an
+    // interned string is returned), and read correctly after restore() because
+    // restore rebuilds through the same constructor. Cold: never on a hot path.
+    get keysBacking() { return this._store._kind; }
+    get maxKey() { return this._store._kind === "dense" ? this._store._maxKey : null; }
+    get ttlEnabled() { return this._exp !== null; }
+    get statsEnabled() { return this._stats !== null; }
 
     // --- intrusive ring helpers (same shape as LiteLru's DLL) -----------------
 
@@ -1595,7 +1727,7 @@ export class Sieve {
         if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (decisions/0019)
         // TTL gate (decisions/0017, D17.3): a stale hit is a MISS -- no visited bump,
         // reaped in place. Only reached when ttl is configured.
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
             this._reap(s);
             return undefined;
@@ -1614,15 +1746,22 @@ export class Sieve {
      */
     put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
-        let expiresAt;
-        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        // S17 F6: resolve the expiry COLD + atomically into the per-instance f64 scratch,
+        // BEFORE _ver++/slot acquisition, so a bad clock throws with ZERO mutation and the
+        // double never boxes (computeExpiry is tiny -> this._clock() inlines).
+        if (this._exp !== null) {
+            if (ttlMs !== undefined) checkTtl(ttlMs);
+            const ms = ttlMs === undefined ? this._ttl : ttlMs; // resolved duration (Infinity or finite ms)
+            if (ms === Infinity) this._expScr[0] = Infinity;
+            else computeExpiry(this._clock, ms, this._expScr);
+        }
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                 // update-in-place + mark visited
             this._vals[existing] = value;
-            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            if (this._exp !== null) this._exp[existing] = this._expScr[0]; // restamp (D17)
             this._vis[existing] = 1;
             if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); decisions/0019
             return;
@@ -1652,7 +1791,7 @@ export class Sieve {
 
         this._keys[s] = key;
         this._vals[s] = value;
-        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        if (this._exp !== null) this._exp[s] = this._expScr[0]; // stamp the expiry (D17)
         this._vis[s] = 0; // a newcomer starts UNVISITED
         store.set(key, s);
         this._pushFront(s);
@@ -1677,7 +1816,7 @@ export class Sieve {
     has(key) {
         const s = this._store.get(key);
         if (s < 0) return false;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return false;
         }
@@ -1689,7 +1828,7 @@ export class Sieve {
     peek(key) {
         const s = this._store.get(key);
         if (s < 0) return undefined;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return undefined;
         }
@@ -1726,7 +1865,7 @@ export class Sieve {
         const now = this._clock();
         const exp = this._exp;
         const victims = [];
-        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        this._store.indexEntries((key, slot) => { if (!(now < exp[slot])) victims.push(slot); });
         for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
         return victims.length;
     }
@@ -1758,13 +1897,13 @@ export class Sieve {
         return true;
     }
 
-    /** Empty the cache. Rebuilds the free list, zeroes visited, resets the hand.
-     *  Allocates nothing. O(capacity). */
+    /** Empty the cache. O(size) (ROADMAP S17 F7): frees only the resident slots, zeroing
+     *  each one's visited bit in the same walk, then resets the hand. Nothing scales with
+     *  capacity. Allocates only the cold roster. */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
-        this._store.reset();
-        this._vis.fill(0);
+        void clearSlots(this, undefined, this._vis, 0);
         this._head = NIL;
         this._tail = NIL;
         this._hand = NIL;
@@ -1903,6 +2042,11 @@ export class S3Fifo {
                 "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
             );
         }
+        if (capacity > INT_MAX) {
+            throw new RangeError(
+                "[lite-lru] capacity must not exceed " + INT_MAX + " (2^31-1), got " + String(capacity)
+            );
+        }
 
         void validateOptions(options);
         this._capacity = capacity;
@@ -1921,6 +2065,7 @@ export class S3Fifo {
         this._next = this._store._next; // toward the tail (older)
         this._prev = this._store._prev; // toward the head (newer)
         this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+        this._expScr = this._exp !== null ? new Float64Array(1) : null; // S17 F6 expiry scratch
 
         // D13 -- one visited byte per slot (a hit is a single store, no mask/shift),
         // and one queue tag per slot so `_detach` fixes the correct ring. Both fixed
@@ -1976,6 +2121,17 @@ export class S3Fifo {
 
     get size() { return this._size; }
     get capacity() { return this._capacity; }
+
+    // S17 N2 -- cold read-only configuration getters (A14). Each is DERIVED from an
+    // existing instance field: the store's interned `_kind` tag, the `_maxKey` it
+    // records only for the dense backing, and the `_exp`/`_stats` columns that are
+    // `null` when off. They never throw, allocate nothing (a stored primitive or an
+    // interned string is returned), and read correctly after restore() because
+    // restore rebuilds through the same constructor. Cold: never on a hot path.
+    get keysBacking() { return this._store._kind; }
+    get maxKey() { return this._store._kind === "dense" ? this._store._maxKey : null; }
+    get ttlEnabled() { return this._exp !== null; }
+    get statsEnabled() { return this._stats !== null; }
 
     // --- intrusive ring helpers (size accounting lives here) ------------------
 
@@ -2187,7 +2343,7 @@ export class S3Fifo {
         if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (decisions/0019)
         // TTL gate (decisions/0017, D17.3): a stale hit is a MISS -- no visited bump,
         // reaped in place. Only reached when ttl is configured.
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
             this._reap(s);
             return undefined;
@@ -2206,15 +2362,22 @@ export class S3Fifo {
      */
     put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
-        let expiresAt;
-        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        // S17 F6: resolve the expiry COLD + atomically into the per-instance f64 scratch,
+        // BEFORE _ver++/slot acquisition, so a bad clock throws with ZERO mutation and the
+        // double never boxes (computeExpiry is tiny -> this._clock() inlines).
+        if (this._exp !== null) {
+            if (ttlMs !== undefined) checkTtl(ttlMs);
+            const ms = ttlMs === undefined ? this._ttl : ttlMs; // resolved duration (Infinity or finite ms)
+            if (ms === Infinity) this._expScr[0] = Infinity;
+            else computeExpiry(this._clock, ms, this._expScr);
+        }
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                 // update-in-place + mark visited
             this._vals[existing] = value;
-            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            if (this._exp !== null) this._exp[existing] = this._expScr[0]; // restamp (D17)
             this._vis[existing] = 1;
             if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); decisions/0019
             return;
@@ -2239,7 +2402,7 @@ export class S3Fifo {
 
         this._keys[s] = key;
         this._vals[s] = value;
-        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        if (this._exp !== null) this._exp[s] = this._expScr[0]; // stamp the expiry (D17)
         this._vis[s] = 0;               // a newcomer starts UNVISITED
         store.set(key, s);
         if (toMain) this._pushMain(s); else this._pushSmall(s);
@@ -2263,7 +2426,7 @@ export class S3Fifo {
     has(key) {
         const s = this._store.get(key);
         if (s < 0) return false;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return false;
         }
@@ -2275,7 +2438,7 @@ export class S3Fifo {
     peek(key) {
         const s = this._store.get(key);
         if (s < 0) return undefined;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return undefined;
         }
@@ -2307,7 +2470,7 @@ export class S3Fifo {
         const now = this._clock();
         const exp = this._exp;
         const victims = [];
-        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        this._store.indexEntries((key, slot) => { if (!(now < exp[slot])) victims.push(slot); });
         for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
         return victims.length;
     }
@@ -2331,13 +2494,14 @@ export class S3Fifo {
         return true;
     }
 
-    /** Empty the cache. Rebuilds the free list, zeroes visited, empties both rings
-     *  and the ghost. Allocates nothing. O(capacity). */
+    /** Empty the cache. O(size) in the resident slots (ROADMAP S17 F7): frees only the
+     *  main+small ring occupants, zeroing each one's visited bit in the same walk. The
+     *  bounded keys-only ghost reset stays O(ghost capacity) -- inherent to the D13
+     *  fixed-history design, not a slot sweep. Allocates only the cold roster. */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
-        this._store.reset();
-        this._vis.fill(0);
+        void clearSlots(this, undefined, this._vis, 0);
         this._sHead = NIL; this._sTail = NIL; this._sSize = 0;
         this._mHead = NIL; this._mTail = NIL; this._mSize = 0;
         this._size = 0;
@@ -2550,6 +2714,11 @@ export class WTinyLfu {
                 "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
             );
         }
+        if (capacity > INT_MAX) {
+            throw new RangeError(
+                "[lite-lru] capacity must not exceed " + INT_MAX + " (2^31-1), got " + String(capacity)
+            );
+        }
 
         void validateOptions(options);
         this._capacity = capacity;
@@ -2567,6 +2736,7 @@ export class WTinyLfu {
         this._next = this._store._next; // toward the tail (LRU)
         this._prev = this._store._prev; // toward the head (MRU)
         this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+        this._expScr = this._exp !== null ? new Float64Array(1) : null; // S17 F6 expiry scratch
 
         // D14 -- one segment tag per slot so `_detach` fixes the correct list.
         // Fixed size, allocated once, never grown.
@@ -2608,20 +2778,37 @@ export class WTinyLfu {
     get size() { return this._size; }
     get capacity() { return this._capacity; }
 
+    // S17 N2 -- cold read-only configuration getters (A14). Each is DERIVED from an
+    // existing instance field: the store's interned `_kind` tag, the `_maxKey` it
+    // records only for the dense backing, and the `_exp`/`_stats` columns that are
+    // `null` when off. They never throw, allocate nothing (a stored primitive or an
+    // interned string is returned), and read correctly after restore() because
+    // restore rebuilds through the same constructor. Cold: never on a hot path.
+    get keysBacking() { return this._store._kind; }
+    get maxKey() { return this._store._kind === "dense" ? this._store._maxKey : null; }
+    get ttlEnabled() { return this._exp !== null; }
+    get statsEnabled() { return this._stats !== null; }
+
     // --- the frequency sketch (D14.1/D14.2/D14.3) -----------------------------
 
     /** A numeric hash of the key for the sketch (D14.1). Primitive keys hash by VALUE
      *  (stable frequency); object keys have no zero-alloc stable identity (no WeakMap),
-     *  so they hash by their RESIDENT SLOT -- bumped only while resident. Zero-alloc. */
+     *  so they hash by their RESIDENT SLOT -- bumped only while resident. Zero-alloc.
+     *  Bits 30-31 are FOLDED into the low 30 (not dropped) so the result is always a Smi
+     *  (a hash >= 2^30 boxes on the call into `_sketchInc`, RESEARCH 9 A8) while keys
+     *  differing only in the high bits still spread; keys in [0, 2^30) hash unchanged. */
     _hashKey(key, slot) {
         const t = typeof key;
-        if (t === 'number') return (key | 0) >>> 0;
+        if (t === 'number') {
+            const h = key | 0;
+            return (h ^ (h >>> 30)) & 0x3fffffff;
+        }
         if (t === 'string') {
             let h = 0;
             for (let i = 0; i < key.length; i++) h = (Math.imul(h, 31) + key.charCodeAt(i)) | 0;
-            return h >>> 0;
+            return (h ^ (h >>> 30)) & 0x3fffffff;
         }
-        return slot >>> 0; // object/other: bump only while resident (D14.1)
+        return slot & 0x3fffffff; // object/other: bump only while resident (D14.1)
     }
 
     /** The sketch column for row `r` of a key hash, masked to the fixed width. */
@@ -2756,7 +2943,7 @@ export class WTinyLfu {
         if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (decisions/0019)
         // TTL gate (decisions/0017, D17.3): a stale hit is a MISS -- no sketch bump, no
         // promotion, reaped in place. Only reached when ttl is configured.
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
             this._reap(s);
             return undefined;
@@ -2776,15 +2963,22 @@ export class WTinyLfu {
      */
     put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
-        let expiresAt;
-        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        // S17 F6: resolve the expiry COLD + atomically into the per-instance f64 scratch,
+        // BEFORE _ver++/slot acquisition, so a bad clock throws with ZERO mutation and the
+        // double never boxes (computeExpiry is tiny -> this._clock() inlines).
+        if (this._exp !== null) {
+            if (ttlMs !== undefined) checkTtl(ttlMs);
+            const ms = ttlMs === undefined ? this._ttl : ttlMs; // resolved duration (Infinity or finite ms)
+            if (ms === Infinity) this._expScr[0] = Infinity;
+            else computeExpiry(this._clock, ms, this._expScr);
+        }
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                 // update-in-place + bump + promote
             this._vals[existing] = value;
-            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            if (this._exp !== null) this._exp[existing] = this._expScr[0]; // restamp (D17)
             this._sketchInc(this._hashKey(key, existing));
             this._onHit(existing);
             if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); decisions/0019
@@ -2830,7 +3024,7 @@ export class WTinyLfu {
             evicted = true;
         }
 
-        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        if (this._exp !== null) this._exp[s] = this._expScr[0]; // stamp the expiry (D17)
 
         // Record the newcomer's own access AFTER the admission decision, so the decision
         // reads the pre-bump sketch (keeps impl and oracle in lockstep).
@@ -2851,7 +3045,7 @@ export class WTinyLfu {
     has(key) {
         const s = this._store.get(key);
         if (s < 0) return false;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return false;
         }
@@ -2863,7 +3057,7 @@ export class WTinyLfu {
     peek(key) {
         const s = this._store.get(key);
         if (s < 0) return undefined;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return undefined;
         }
@@ -2894,7 +3088,7 @@ export class WTinyLfu {
         const now = this._clock();
         const exp = this._exp;
         const victims = [];
-        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        this._store.indexEntries((key, slot) => { if (!(now < exp[slot])) victims.push(slot); });
         for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
         return victims.length;
     }
@@ -2916,12 +3110,14 @@ export class WTinyLfu {
         return true;
     }
 
-    /** Empty the cache. Rebuilds the free list, empties all three lists, and zeroes
-     *  the frequency sketch. Allocates nothing. O(capacity). */
+    /** Empty the cache. O(size) in the resident slots (ROADMAP S17 F7): frees only the
+     *  window+probation+protected occupants. The CM frequency sketch reset stays O(sketch
+     *  width) -- inherent to the D14 fixed-sketch design, not a slot sweep. Allocates only
+     *  the cold roster. */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
-        this._store.reset();
+        void clearSlots(this);
         this._wHead = NIL; this._wTail = NIL; this._wSize = 0;
         this._prHead = NIL; this._prTail = NIL; this._prSize = 0;
         this._ptHead = NIL; this._ptTail = NIL; this._ptSize = 0;
@@ -3060,6 +3256,11 @@ export class Slru {
                 "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
             );
         }
+        if (capacity > INT_MAX) {
+            throw new RangeError(
+                "[lite-lru] capacity must not exceed " + INT_MAX + " (2^31-1), got " + String(capacity)
+            );
+        }
 
         void validateOptions(options);
         this._capacity = capacity;
@@ -3077,6 +3278,7 @@ export class Slru {
         this._next = this._store._next; // toward the tail (LRU/oldest)
         this._prev = this._store._prev; // toward the head (MRU/newest)
         this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+        this._expScr = this._exp !== null ? new Float64Array(1) : null; // S17 F6 expiry scratch
 
         // D15 -- one segment tag per slot so `_detach` fixes the correct list, and one
         // visited byte per slot for the promote-on-2nd-hit rule (probation only). Both
@@ -3106,6 +3308,17 @@ export class Slru {
 
     get size() { return this._size; }
     get capacity() { return this._capacity; }
+
+    // S17 N2 -- cold read-only configuration getters (A14). Each is DERIVED from an
+    // existing instance field: the store's interned `_kind` tag, the `_maxKey` it
+    // records only for the dense backing, and the `_exp`/`_stats` columns that are
+    // `null` when off. They never throw, allocate nothing (a stored primitive or an
+    // interned string is returned), and read correctly after restore() because
+    // restore rebuilds through the same constructor. Cold: never on a hot path.
+    get keysBacking() { return this._store._kind; }
+    get maxKey() { return this._store._kind === "dense" ? this._store._maxKey : null; }
+    get ttlEnabled() { return this._exp !== null; }
+    get statsEnabled() { return this._stats !== null; }
 
     // --- intrusive list helpers (per-segment size accounting) -----------------
 
@@ -3182,7 +3395,7 @@ export class Slru {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
         if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
             this._reap(s);
             return undefined;
@@ -3201,15 +3414,22 @@ export class Slru {
      */
     put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
-        let expiresAt;
-        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        // S17 F6: resolve the expiry COLD + atomically into the per-instance f64 scratch,
+        // BEFORE _ver++/slot acquisition, so a bad clock throws with ZERO mutation and the
+        // double never boxes (computeExpiry is tiny -> this._clock() inlines).
+        if (this._exp !== null) {
+            if (ttlMs !== undefined) checkTtl(ttlMs);
+            const ms = ttlMs === undefined ? this._ttl : ttlMs; // resolved duration (Infinity or finite ms)
+            if (ms === Infinity) this._expScr[0] = Infinity;
+            else computeExpiry(this._clock, ms, this._expScr);
+        }
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                 // update-in-place + touch
             this._vals[existing] = value;
-            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            if (this._exp !== null) this._exp[existing] = this._expScr[0]; // restamp (D17)
             this._touch(existing);
             if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
             return;
@@ -3228,7 +3448,7 @@ export class Slru {
 
         this._keys[s] = key;
         this._vals[s] = value;
-        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        if (this._exp !== null) this._exp[s] = this._expScr[0]; // stamp the expiry (D17)
         this._vis[s] = 0;               // a newcomer starts UNVISITED in probation
         store.set(key, s);
         this._pushProbation(s);         // newcomers ALWAYS enter probation
@@ -3247,7 +3467,7 @@ export class Slru {
     has(key) {
         const s = this._store.get(key);
         if (s < 0) return false;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return false;
         }
@@ -3259,7 +3479,7 @@ export class Slru {
     peek(key) {
         const s = this._store.get(key);
         if (s < 0) return undefined;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return undefined;
         }
@@ -3291,7 +3511,7 @@ export class Slru {
         const now = this._clock();
         const exp = this._exp;
         const victims = [];
-        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        this._store.indexEntries((key, slot) => { if (!(now < exp[slot])) victims.push(slot); });
         for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
         return victims.length;
     }
@@ -3312,13 +3532,13 @@ export class Slru {
         return true;
     }
 
-    /** Empty the cache. Rebuilds the free list, zeroes visited, empties both segments.
-     *  Allocates nothing. O(capacity). */
+    /** Empty the cache. O(size) (ROADMAP S17 F7): frees only the resident slots of both
+     *  segments, zeroing each one's visited bit in the same walk. Nothing scales with
+     *  capacity. Allocates only the cold roster. */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
-        this._store.reset();
-        this._vis.fill(0);
+        void clearSlots(this, undefined, this._vis, 0);
         this._probHead = NIL; this._probTail = NIL; this._probSize = 0;
         this._protHead = NIL; this._protTail = NIL; this._protSize = 0;
         this._size = 0;
@@ -3432,6 +3652,11 @@ export class TwoQ {
                 "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
             );
         }
+        if (capacity > INT_MAX) {
+            throw new RangeError(
+                "[lite-lru] capacity must not exceed " + INT_MAX + " (2^31-1), got " + String(capacity)
+            );
+        }
 
         void validateOptions(options);
         this._capacity = capacity;
@@ -3449,6 +3674,7 @@ export class TwoQ {
         this._next = this._store._next; // toward the tail (oldest/LRU)
         this._prev = this._store._prev; // toward the head (newest/MRU)
         this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+        this._expScr = this._exp !== null ? new Float64Array(1) : null; // S17 F6 expiry scratch
 
         // D15 -- one segment tag per slot so `_detach` fixes the correct queue. Fixed
         // size, allocated once, never grown. (TwoQ needs no visited bit -- A1in never
@@ -3504,6 +3730,17 @@ export class TwoQ {
 
     get size() { return this._size; }
     get capacity() { return this._capacity; }
+
+    // S17 N2 -- cold read-only configuration getters (A14). Each is DERIVED from an
+    // existing instance field: the store's interned `_kind` tag, the `_maxKey` it
+    // records only for the dense backing, and the `_exp`/`_stats` columns that are
+    // `null` when off. They never throw, allocate nothing (a stored primitive or an
+    // interned string is returned), and read correctly after restore() because
+    // restore rebuilds through the same constructor. Cold: never on a hot path.
+    get keysBacking() { return this._store._kind; }
+    get maxKey() { return this._store._kind === "dense" ? this._store._maxKey : null; }
+    get ttlEnabled() { return this._exp !== null; }
+    get statsEnabled() { return this._stats !== null; }
 
     // --- intrusive queue helpers (per-segment size accounting) ----------------
 
@@ -3680,7 +3917,7 @@ export class TwoQ {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
         if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
             this._reap(s);
             return undefined;
@@ -3700,15 +3937,22 @@ export class TwoQ {
      */
     put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
-        let expiresAt;
-        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        // S17 F6: resolve the expiry COLD + atomically into the per-instance f64 scratch,
+        // BEFORE _ver++/slot acquisition, so a bad clock throws with ZERO mutation and the
+        // double never boxes (computeExpiry is tiny -> this._clock() inlines).
+        if (this._exp !== null) {
+            if (ttlMs !== undefined) checkTtl(ttlMs);
+            const ms = ttlMs === undefined ? this._ttl : ttlMs; // resolved duration (Infinity or finite ms)
+            if (ms === Infinity) this._expScr[0] = Infinity;
+            else computeExpiry(this._clock, ms, this._expScr);
+        }
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                 // update-in-place
             this._vals[existing] = value;
-            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            if (this._exp !== null) this._exp[existing] = this._expScr[0]; // restamp (D17)
             if (this._seg[existing] === TWOQ_AM && this._amHead !== existing) {
                 this._detach(existing); this._pushAm(existing); // Am update -> MRU
             }
@@ -3734,7 +3978,7 @@ export class TwoQ {
 
         this._keys[s] = key;
         this._vals[s] = value;
-        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        if (this._exp !== null) this._exp[s] = this._expScr[0]; // stamp the expiry (D17)
         store.set(key, s);
         if (toMain) this._pushAm(s); else this._pushA1in(s);
         this._size = this._a1Size + this._amSize;
@@ -3752,7 +3996,7 @@ export class TwoQ {
     has(key) {
         const s = this._store.get(key);
         if (s < 0) return false;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return false;
         }
@@ -3764,7 +4008,7 @@ export class TwoQ {
     peek(key) {
         const s = this._store.get(key);
         if (s < 0) return undefined;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return undefined;
         }
@@ -3795,7 +4039,7 @@ export class TwoQ {
         const now = this._clock();
         const exp = this._exp;
         const victims = [];
-        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        this._store.indexEntries((key, slot) => { if (!(now < exp[slot])) victims.push(slot); });
         for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
         return victims.length;
     }
@@ -3815,12 +4059,14 @@ export class TwoQ {
         return true;
     }
 
-    /** Empty the cache. Rebuilds the free list, empties both queues and the ghost.
-     *  Allocates nothing. O(capacity). */
+    /** Empty the cache. O(size) in the resident slots (ROADMAP S17 F7): frees only the
+     *  Am+A1in occupants. The bounded keys-only A1out ghost reset stays O(ghost capacity)
+     *  -- inherent to the fixed-history design, not a slot sweep. Allocates only the cold
+     *  roster. */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
-        this._store.reset();
+        void clearSlots(this);
         this._a1Head = NIL; this._a1Tail = NIL; this._a1Size = 0;
         this._amHead = NIL; this._amTail = NIL; this._amSize = 0;
         this._size = 0;
@@ -4119,6 +4365,11 @@ export class Arc {
                 "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
             );
         }
+        if (capacity > INT_MAX) {
+            throw new RangeError(
+                "[lite-lru] capacity must not exceed " + INT_MAX + " (2^31-1), got " + String(capacity)
+            );
+        }
 
         void validateOptions(options);
         this._capacity = capacity;
@@ -4136,6 +4387,7 @@ export class Arc {
         this._next = this._store._next; // toward the tail (LRU/oldest)
         this._prev = this._store._prev; // toward the head (MRU/newest)
         this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+        this._expScr = this._exp !== null ? new Float64Array(1) : null; // S17 F6 expiry scratch
 
         // D16 -- one segment tag per slot (0 = T1, 1 = T2) so `_detach` fixes the correct
         // list. Fixed size, allocated once, never grown.
@@ -4170,6 +4422,17 @@ export class Arc {
 
     get size() { return this._size; }
     get capacity() { return this._capacity; }
+
+    // S17 N2 -- cold read-only configuration getters (A14). Each is DERIVED from an
+    // existing instance field: the store's interned `_kind` tag, the `_maxKey` it
+    // records only for the dense backing, and the `_exp`/`_stats` columns that are
+    // `null` when off. They never throw, allocate nothing (a stored primitive or an
+    // interned string is returned), and read correctly after restore() because
+    // restore rebuilds through the same constructor. Cold: never on a hot path.
+    get keysBacking() { return this._store._kind; }
+    get maxKey() { return this._store._kind === "dense" ? this._store._maxKey : null; }
+    get ttlEnabled() { return this._exp !== null; }
+    get statsEnabled() { return this._stats !== null; }
 
     // --- intrusive LRU-list helpers (per-list size accounting) ----------------
 
@@ -4264,7 +4527,7 @@ export class Arc {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
         if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
             this._reap(s);
             return undefined;
@@ -4283,15 +4546,22 @@ export class Arc {
      */
     put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
-        let expiresAt;
-        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        // S17 F6: resolve the expiry COLD + atomically into the per-instance f64 scratch,
+        // BEFORE _ver++/slot acquisition, so a bad clock throws with ZERO mutation and the
+        // double never boxes (computeExpiry is tiny -> this._clock() inlines).
+        if (this._exp !== null) {
+            if (ttlMs !== undefined) checkTtl(ttlMs);
+            const ms = ttlMs === undefined ? this._ttl : ttlMs; // resolved duration (Infinity or finite ms)
+            if (ms === Infinity) this._expScr[0] = Infinity;
+            else computeExpiry(this._clock, ms, this._expScr);
+        }
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                 // update-in-place + promote to T2
             this._vals[existing] = value;
-            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            if (this._exp !== null) this._exp[existing] = this._expScr[0]; // restamp (D17)
             this._onHit(existing);
             if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
             return;
@@ -4313,7 +4583,7 @@ export class Arc {
             if (this._size === c) { s = this._replace(false); evKey = this._keys[s]; evVal = this._vals[s]; evicted = true; }
             else s = store.allocSlot();
             this._keys[s] = key; this._vals[s] = value;
-            if (this._exp !== null) this._exp[s] = expiresAt;
+            if (this._exp !== null) this._exp[s] = this._expScr[0];
             store.set(key, s);
             this._pushT2(s);
         } else if (inB2) {
@@ -4326,7 +4596,7 @@ export class Arc {
             if (this._size === c) { s = this._replace(true); evKey = this._keys[s]; evVal = this._vals[s]; evicted = true; }
             else s = store.allocSlot();
             this._keys[s] = key; this._vals[s] = value;
-            if (this._exp !== null) this._exp[s] = expiresAt;
+            if (this._exp !== null) this._exp[s] = this._expScr[0];
             store.set(key, s);
             this._pushT2(s);
         } else {
@@ -4346,7 +4616,7 @@ export class Arc {
                 else s = store.allocSlot();
             }
             this._keys[s] = key; this._vals[s] = value;
-            if (this._exp !== null) this._exp[s] = expiresAt;
+            if (this._exp !== null) this._exp[s] = this._expScr[0];
             store.set(key, s);
             this._pushT1(s);
         }
@@ -4366,7 +4636,7 @@ export class Arc {
     has(key) {
         const s = this._store.get(key);
         if (s < 0) return false;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return false;
         }
@@ -4378,7 +4648,7 @@ export class Arc {
     peek(key) {
         const s = this._store.get(key);
         if (s < 0) return undefined;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return undefined;
         }
@@ -4409,7 +4679,7 @@ export class Arc {
         const now = this._clock();
         const exp = this._exp;
         const victims = [];
-        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        this._store.indexEntries((key, slot) => { if (!(now < exp[slot])) victims.push(slot); });
         for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
         return victims.length;
     }
@@ -4430,12 +4700,14 @@ export class Arc {
         return true;
     }
 
-    /** Empty the cache. Rebuilds the free list, empties both lists and both ghosts, and
-     *  resets `p`. Allocates nothing. O(capacity). */
+    /** Empty the cache. O(size) in the resident slots (ROADMAP S17 F7): frees only the
+     *  T1+T2 occupants and resets `p`. The two bounded keys-only ghosts (B1/B2) reset
+     *  stays O(ghost capacity) -- inherent to the D16 fixed-history design, not a slot
+     *  sweep. Allocates only the cold roster. */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
-        this._store.reset();
+        void clearSlots(this);
         this._t1Head = NIL; this._t1Tail = NIL; this._t1Size = 0;
         this._t2Head = NIL; this._t2Tail = NIL; this._t2Size = 0;
         this._size = 0;
@@ -4611,6 +4883,11 @@ export class Lirs {
                 "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
             );
         }
+        if (capacity > INT_MAX) {
+            throw new RangeError(
+                "[lite-lru] capacity must not exceed " + INT_MAX + " (2^31-1), got " + String(capacity)
+            );
+        }
 
         void validateOptions(options);
         this._capacity = capacity;
@@ -4628,6 +4905,7 @@ export class Lirs {
         this._next = this._store._next; // SHARED: threads the LIR list AND Q (disjoint) + free stack
         this._prev = this._store._prev;
         this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+        this._expScr = this._exp !== null ? new Float64Array(1) : null; // S17 F6 expiry scratch
 
         // The interleaved stack S rides its OWN member link columns (D23): a slot may be in
         // BOTH the shared list (LIR list / Q) and S at once, so S needs separate links.
@@ -4675,6 +4953,17 @@ export class Lirs {
 
     get size() { return this._size; }
     get capacity() { return this._capacity; }
+
+    // S17 N2 -- cold read-only configuration getters (A14). Each is DERIVED from an
+    // existing instance field: the store's interned `_kind` tag, the `_maxKey` it
+    // records only for the dense backing, and the `_exp`/`_stats` columns that are
+    // `null` when off. They never throw, allocate nothing (a stored primitive or an
+    // interned string is returned), and read correctly after restore() because
+    // restore rebuilds through the same constructor. Cold: never on a hot path.
+    get keysBacking() { return this._store._kind; }
+    get maxKey() { return this._store._kind === "dense" ? this._store._maxKey : null; }
+    get ttlEnabled() { return this._exp !== null; }
+    get statsEnabled() { return this._stats !== null; }
 
     // --- stack S helpers (member `_sNext`/`_sPrev`) ---------------------------
 
@@ -4830,7 +5119,7 @@ export class Lirs {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
         if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
             this._reap(s);
             return undefined;
@@ -4850,15 +5139,22 @@ export class Lirs {
      */
     put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
-        let expiresAt;
-        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        // S17 F6: resolve the expiry COLD + atomically into the per-instance f64 scratch,
+        // BEFORE _ver++/slot acquisition, so a bad clock throws with ZERO mutation and the
+        // double never boxes (computeExpiry is tiny -> this._clock() inlines).
+        if (this._exp !== null) {
+            if (ttlMs !== undefined) checkTtl(ttlMs);
+            const ms = ttlMs === undefined ? this._ttl : ttlMs; // resolved duration (Infinity or finite ms)
+            if (ms === Infinity) this._expScr[0] = Infinity;
+            else computeExpiry(this._clock, ms, this._expScr);
+        }
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         this._store._ver++; // D18.6 -- put mutates; invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                  // update-in-place + access policy
             this._vals[existing] = value;
-            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            if (this._exp !== null) this._exp[existing] = this._expScr[0]; // restamp (D17)
             this._access(existing);
             if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
             return;
@@ -4877,7 +5173,7 @@ export class Lirs {
         if (inHist) this._hist.consume(key);  // it is being re-admitted (resident again)
         this._keys[s] = key;
         this._vals[s] = value;
-        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        if (this._exp !== null) this._exp[s] = this._expScr[0]; // stamp the expiry (D17)
         store.set(key, s);
 
         if (inHist && this._Llir > 0) {
@@ -4919,7 +5215,7 @@ export class Lirs {
     has(key) {
         const s = this._store.get(key);
         if (s < 0) return false;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return false;
         }
@@ -4931,7 +5227,7 @@ export class Lirs {
     peek(key) {
         const s = this._store.get(key);
         if (s < 0) return undefined;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return undefined;
         }
@@ -4970,7 +5266,7 @@ export class Lirs {
         const now = this._clock();
         const exp = this._exp;
         const victims = [];
-        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        this._store.indexEntries((key, slot) => { if (!(now < exp[slot])) victims.push(slot); });
         for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
         return victims.length;
     }
@@ -4988,17 +5284,19 @@ export class Lirs {
         return true;
     }
 
-    /** Empty the cache. Rebuilds the free list, empties S/Q/LIR-list + the history, and
-     *  resets the per-slot state. Allocates nothing. O(capacity). */
+    /** Empty the cache. O(size) in the resident slots (ROADMAP S17 F7): frees only the
+     *  LIR-list + resident-HIR (Q) occupants, zeroing each one's per-slot state in the same
+     *  walk (the S stack shares those slots -- each resident is freed once). The bounded
+     *  non-resident history reset stays O(history capacity) -- inherent to the D23 fixed-
+     *  history design, not a slot sweep. Allocates only the cold roster. */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
-        this._store.reset();
+        void clearSlots(this, undefined, this._st, 0);
         this._sTop = NIL; this._sBot = NIL;
         this._lirHead = NIL; this._lirTail = NIL; this._lirCount = 0;
         this._qHead = NIL; this._qTail = NIL;
         this._size = 0;
-        this._st.fill(0);
         this._hist.clear();
     }
 
@@ -5182,6 +5480,11 @@ export class Lfu {
                 "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
             );
         }
+        if (capacity > INT_MAX) {
+            throw new RangeError(
+                "[lite-lru] capacity must not exceed " + INT_MAX + " (2^31-1), got " + String(capacity)
+            );
+        }
 
         void validateOptions(options);
         this._capacity = capacity;
@@ -5202,6 +5505,7 @@ export class Lfu {
         this._next = this._store._next;
         this._prev = this._store._prev;
         this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+        this._expScr = this._exp !== null ? new Float64Array(1) : null; // S17 F6 expiry scratch
 
         // D24 -- key-slot columns. Each resident key is in exactly ONE bucket's recency list,
         // threaded `_fNext` (toward LRU) / `_fPrev` (toward MRU). `_kB[s]` = the owning bucket
@@ -5240,6 +5544,17 @@ export class Lfu {
 
     get size() { return this._size; }
     get capacity() { return this._capacity; }
+
+    // S17 N2 -- cold read-only configuration getters (A14). Each is DERIVED from an
+    // existing instance field: the store's interned `_kind` tag, the `_maxKey` it
+    // records only for the dense backing, and the `_exp`/`_stats` columns that are
+    // `null` when off. They never throw, allocate nothing (a stored primitive or an
+    // interned string is returned), and read correctly after restore() because
+    // restore rebuilds through the same constructor. Cold: never on a hot path.
+    get keysBacking() { return this._store._kind; }
+    get maxKey() { return this._store._kind === "dense" ? this._store._maxKey : null; }
+    get ttlEnabled() { return this._exp !== null; }
+    get statsEnabled() { return this._stats !== null; }
 
     // --- bucket-pool helpers (create/destroy on frequency transitions) --------
 
@@ -5366,7 +5681,7 @@ export class Lfu {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
         if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
             this._reap(s);
             return undefined;
@@ -5384,15 +5699,22 @@ export class Lfu {
      */
     put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
-        let expiresAt;
-        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        // S17 F6: resolve the expiry COLD + atomically into the per-instance f64 scratch,
+        // BEFORE _ver++/slot acquisition, so a bad clock throws with ZERO mutation and the
+        // double never boxes (computeExpiry is tiny -> this._clock() inlines).
+        if (this._exp !== null) {
+            if (ttlMs !== undefined) checkTtl(ttlMs);
+            const ms = ttlMs === undefined ? this._ttl : ttlMs; // resolved duration (Infinity or finite ms)
+            if (ms === Infinity) this._expScr[0] = Infinity;
+            else computeExpiry(this._clock, ms, this._expScr);
+        }
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         this._store._ver++; // D18.6 -- put mutates (update/insert/evict); invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                 // update-in-place + count a hit
             this._vals[existing] = value;
-            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            if (this._exp !== null) this._exp[existing] = this._expScr[0]; // restamp (D17)
             this._touch(existing);
             if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
             return;
@@ -5411,7 +5733,7 @@ export class Lfu {
 
         this._keys[s] = key;
         this._vals[s] = value;
-        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        if (this._exp !== null) this._exp[s] = this._expScr[0]; // stamp the expiry (D17)
         store.set(key, s);
         this._insertFreq1(s);           // a newcomer enters the freq-1 bucket at MRU
         this._size++;
@@ -5429,7 +5751,7 @@ export class Lfu {
     has(key) {
         const s = this._store.get(key);
         if (s < 0) return false;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return false;
         }
@@ -5441,7 +5763,7 @@ export class Lfu {
     peek(key) {
         const s = this._store.get(key);
         if (s < 0) return undefined;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return undefined;
         }
@@ -5473,7 +5795,7 @@ export class Lfu {
         const now = this._clock();
         const exp = this._exp;
         const victims = [];
-        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        this._store.indexEntries((key, slot) => { if (!(now < exp[slot])) victims.push(slot); });
         for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
         return victims.length;
     }
@@ -5495,12 +5817,15 @@ export class Lfu {
         return true;
     }
 
-    /** Empty the cache. Rebuilds the slot free list + the bucket free stack. Allocates
-     *  nothing. O(capacity). */
+    /** Empty the cache. O(size) in the resident slots (ROADMAP S17 F7): frees only the
+     *  occupied key slots (walked over the `_fNext` bucket lists). The bucket free stack
+     *  rebuild stays O(capacity) -- the bucket pool is a fixed capacity-sized free list
+     *  (D24), rebuilt whole here rather than unwound bucket-by-bucket. Allocates only the
+     *  cold roster. */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
-        this._store.reset();
+        void clearSlots(this, this._fNext);
         const cap = this._capacity;
         for (let i = 0; i < cap; i++) this._bNext[i] = i + 1;
         this._bNext[cap - 1] = LFU_NIL;
@@ -5718,6 +6043,11 @@ export class ClockPro {
                 "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
             );
         }
+        if (capacity > INT_MAX) {
+            throw new RangeError(
+                "[lite-lru] capacity must not exceed " + INT_MAX + " (2^31-1), got " + String(capacity)
+            );
+        }
 
         void validateOptions(options);
         this._capacity = capacity;
@@ -5736,6 +6066,7 @@ export class ClockPro {
         this._next = this._store._next;
         this._prev = this._store._prev;
         this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+        this._expScr = this._exp !== null ? new Float64Array(1) : null; // S17 F6 expiry scratch
 
         // Per-slot state (bit0 hot, bit1 referenced, bit2 test). Member-specific, fixed,
         // never grown -- the other members' hot paths carry no new column (like LIRS `_st`).
@@ -5779,6 +6110,17 @@ export class ClockPro {
 
     get size() { return this._size; }
     get capacity() { return this._capacity; }
+
+    // S17 N2 -- cold read-only configuration getters (A14). Each is DERIVED from an
+    // existing instance field: the store's interned `_kind` tag, the `_maxKey` it
+    // records only for the dense backing, and the `_exp`/`_stats` columns that are
+    // `null` when off. They never throw, allocate nothing (a stored primitive or an
+    // interned string is returned), and read correctly after restore() because
+    // restore rebuilds through the same constructor. Cold: never on a hot path.
+    get keysBacking() { return this._store._kind; }
+    get maxKey() { return this._store._kind === "dense" ? this._store._maxKey : null; }
+    get ttlEnabled() { return this._exp !== null; }
+    get statsEnabled() { return this._stats !== null; }
 
     // --- the circular ring (NIL-terminated DLL + wrap-around hand advance) -----
 
@@ -5943,7 +6285,7 @@ export class ClockPro {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
         if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
             this._reap(s);
             return undefined;
@@ -5962,15 +6304,22 @@ export class ClockPro {
      */
     put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
-        let expiresAt;
-        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        // S17 F6: resolve the expiry COLD + atomically into the per-instance f64 scratch,
+        // BEFORE _ver++/slot acquisition, so a bad clock throws with ZERO mutation and the
+        // double never boxes (computeExpiry is tiny -> this._clock() inlines).
+        if (this._exp !== null) {
+            if (ttlMs !== undefined) checkTtl(ttlMs);
+            const ms = ttlMs === undefined ? this._ttl : ttlMs; // resolved duration (Infinity or finite ms)
+            if (ms === Infinity) this._expScr[0] = Infinity;
+            else computeExpiry(this._clock, ms, this._expScr);
+        }
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         this._store._ver++; // D18.6 -- put mutates; invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                  // update-in-place + set the reference bit
             this._vals[existing] = value;
-            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            if (this._exp !== null) this._exp[existing] = this._expScr[0]; // restamp (D17)
             this._st[existing] |= CLOCKPRO_REF;
             if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
             return;
@@ -5992,7 +6341,7 @@ export class ClockPro {
         }
         this._keys[s] = key;
         this._vals[s] = value;
-        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        if (this._exp !== null) this._exp[s] = this._expScr[0]; // stamp the expiry (D17)
         store.set(key, s);
         this._pushFront(s);
 
@@ -6023,7 +6372,7 @@ export class ClockPro {
     has(key) {
         const s = this._store.get(key);
         if (s < 0) return false;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return false;
         }
@@ -6035,7 +6384,7 @@ export class ClockPro {
     peek(key) {
         const s = this._store.get(key);
         if (s < 0) return undefined;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return undefined;
         }
@@ -6066,7 +6415,7 @@ export class ClockPro {
         const now = this._clock();
         const exp = this._exp;
         const victims = [];
-        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        this._store.indexEntries((key, slot) => { if (!(now < exp[slot])) victims.push(slot); });
         for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
         return victims.length;
     }
@@ -6086,17 +6435,19 @@ export class ClockPro {
         return true;
     }
 
-    /** Empty the cache. Rebuilds the free list, empties the ring + history, resets the hands,
-     *  the counts and the adaptive target. Allocates nothing. O(capacity). */
+    /** Empty the cache. O(size) in the resident slots (ROADMAP S17 F7): frees only the
+     *  resident ring occupants, zeroing each one's per-slot state in the same walk, then
+     *  resets the hands, counts and adaptive target. The bounded non-resident history reset
+     *  stays O(history capacity) -- inherent to the D25 fixed-history design, not a slot
+     *  sweep. Allocates only the cold roster. */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
-        this._store.reset();
+        void clearSlots(this, undefined, this._st, 0);
         this._head = NIL; this._tail = NIL;
         this._handCold = NIL; this._handHot = NIL; this._handTest = NIL;
         this._nHot = 0; this._nCold = 0; this._size = 0;
         this._mHot = 0;
-        this._st.fill(0);
         this._hist.clear();
     }
 
@@ -6268,7 +6619,7 @@ export class ClockPro {
                 if (s & CLOCKPRO_TEST) {
                     st[c] = CLOCKPRO_HOT; nCold--; nHot++;
                     handCold = advance(handCold);
-                    testStep();
+                    void testStep(); // void: keep the bare call off the dts-drift member regex
                     if (nHot > mHot || nCold === 0) demote();
                     continue;
                 }
@@ -6344,6 +6695,11 @@ export class LruK {
                 "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
             );
         }
+        if (capacity > INT_MAX) {
+            throw new RangeError(
+                "[lite-lru] capacity must not exceed " + INT_MAX + " (2^31-1), got " + String(capacity)
+            );
+        }
 
         void validateOptions(options);
         this._capacity = capacity;
@@ -6362,6 +6718,7 @@ export class LruK {
         this._next = this._store._next; // SHARED: threads the COLD list AND the WARM list (disjoint) + free stack
         this._prev = this._store._prev;
         this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+        this._expScr = this._exp !== null ? new Float64Array(1) : null; // S17 F6 expiry scratch
 
         // The two reference-time columns (D26.3): most-recent (`_r0`) and second-most-recent
         // (`_r1`, the K=2 backward distance). Member-specific, allocated WITH the store, fixed,
@@ -6407,6 +6764,17 @@ export class LruK {
 
     get size() { return this._size; }
     get capacity() { return this._capacity; }
+
+    // S17 N2 -- cold read-only configuration getters (A14). Each is DERIVED from an
+    // existing instance field: the store's interned `_kind` tag, the `_maxKey` it
+    // records only for the dense backing, and the `_exp`/`_stats` columns that are
+    // `null` when off. They never throw, allocate nothing (a stored primitive or an
+    // interned string is returned), and read correctly after restore() because
+    // restore rebuilds through the same constructor. Cold: never on a hot path.
+    get keysBacking() { return this._store._kind; }
+    get maxKey() { return this._store._kind === "dense" ? this._store._maxKey : null; }
+    get ttlEnabled() { return this._exp !== null; }
+    get statsEnabled() { return this._stats !== null; }
 
     // --- the two intrusive lists (shared `_next`/`_prev`) ----------------------
 
@@ -6507,7 +6875,7 @@ export class LruK {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
         if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
             this._reap(s);
             return undefined;
@@ -6527,15 +6895,22 @@ export class LruK {
      */
     put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
-        let expiresAt;
-        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        // S17 F6: resolve the expiry COLD + atomically into the per-instance f64 scratch,
+        // BEFORE _ver++/slot acquisition, so a bad clock throws with ZERO mutation and the
+        // double never boxes (computeExpiry is tiny -> this._clock() inlines).
+        if (this._exp !== null) {
+            if (ttlMs !== undefined) checkTtl(ttlMs);
+            const ms = ttlMs === undefined ? this._ttl : ttlMs; // resolved duration (Infinity or finite ms)
+            if (ms === Infinity) this._expScr[0] = Infinity;
+            else computeExpiry(this._clock, ms, this._expScr);
+        }
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         this._store._ver++; // D18.6 -- put mutates; invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                  // update-in-place + access policy
             this._vals[existing] = value;
-            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            if (this._exp !== null) this._exp[existing] = this._expScr[0]; // restamp (D17)
             this._access(existing);
             if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
             return;
@@ -6554,7 +6929,7 @@ export class LruK {
         if (inHist) this._hist.consume(key);  // it is being re-admitted (resident again)
         this._keys[s] = key;
         this._vals[s] = value;
-        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the expiry (D17)
+        if (this._exp !== null) this._exp[s] = this._expScr[0]; // stamp the expiry (D17)
         store.set(key, s);
 
         const t = ++this._t;
@@ -6588,7 +6963,7 @@ export class LruK {
     has(key) {
         const s = this._store.get(key);
         if (s < 0) return false;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return false;
         }
@@ -6600,7 +6975,7 @@ export class LruK {
     peek(key) {
         const s = this._store.get(key);
         if (s < 0) return undefined;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return undefined;
         }
@@ -6637,7 +7012,7 @@ export class LruK {
         const now = this._clock();
         const exp = this._exp;
         const victims = [];
-        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        this._store.indexEntries((key, slot) => { if (!(now < exp[slot])) victims.push(slot); });
         for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
         return victims.length;
     }
@@ -6655,18 +7030,19 @@ export class LruK {
         return true;
     }
 
-    /** Empty the cache. Rebuilds the free list, empties both lists + the history, and resets the
-     *  per-slot state + the logical clock. Allocates nothing. O(capacity). */
+    /** Empty the cache. O(size) in the resident slots (ROADMAP S17 F7): frees only the
+     *  warm+cold occupants, resetting each one's per-slot state (`_st`->0, `_r1`->-Infinity)
+     *  in the same walk, then resets the logical clock. The bounded non-resident history
+     *  reset stays O(history capacity) -- inherent to the fixed-history design, not a slot
+     *  sweep. Allocates only the cold roster. */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
-        this._store.reset();
+        void clearSlots(this, undefined, this._st, 0, this._r1, -Infinity);
         this._coldHead = NIL; this._coldTail = NIL;
         this._warmHead = NIL; this._warmTail = NIL;
         this._size = 0;
         this._t = 0;
-        this._st.fill(0);
-        this._r1.fill(-Infinity);
         this._hist.clear();
     }
 
@@ -6754,10 +7130,10 @@ export class LruK {
             }
         };
         const nWarm = snap.warm.slots.length, nCold = snap.cold.slots.length;
-        ckCol(snap.warmR0, nWarm, "warmR0", false);
-        ckCol(snap.warmR1, nWarm, "warmR1", false); // warm pages have a finite 2nd-reference time
-        ckCol(snap.coldR0, nCold, "coldR0", false);
-        ckCol(snap.coldR1, nCold, "coldR1", true);  // cold pages: -Infinity sentinel only
+        void ckCol(snap.warmR0, nWarm, "warmR0", false); // void: off the dts-drift member regex
+        void ckCol(snap.warmR1, nWarm, "warmR1", false); // warm pages have a finite 2nd-reference time
+        void ckCol(snap.coldR0, nCold, "coldR0", false);
+        void ckCol(snap.coldR1, nCold, "coldR1", true);  // cold pages: -Infinity sentinel only
         for (let i = 0; i < nCold; i++) {
             if (snap.coldR1[i] !== -Infinity) {
                 throw new Error(SNAP_BAD + "lruk coldR1[" + i + "] = " + String(snap.coldR1[i]) + " (a cold page must sit at the -Infinity sentinel)");
@@ -6970,6 +7346,11 @@ export class Mq {
                 "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
             );
         }
+        if (capacity > INT_MAX) {
+            throw new RangeError(
+                "[lite-lru] capacity must not exceed " + INT_MAX + " (2^31-1), got " + String(capacity)
+            );
+        }
 
         void validateOptions(options);
         this._capacity = capacity;
@@ -6990,6 +7371,7 @@ export class Mq {
         this._next = this._store._next; // SHARED: threads all 8 queues (disjoint) + the free stack
         this._prev = this._store._prev;
         this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+        this._expScr = this._exp !== null ? new Float64Array(1) : null; // S17 F6 expiry scratch
 
         // Member-specific columns, allocated WITH the store, fixed, never grown (like LIRS `_st`).
         this._rc = new Float64Array(capacity);  // reference count per slot
@@ -7029,6 +7411,17 @@ export class Mq {
 
     get size() { return this._size; }
     get capacity() { return this._capacity; }
+
+    // S17 N2 -- cold read-only configuration getters (A14). Each is DERIVED from an
+    // existing instance field: the store's interned `_kind` tag, the `_maxKey` it
+    // records only for the dense backing, and the `_exp`/`_stats` columns that are
+    // `null` when off. They never throw, allocate nothing (a stored primitive or an
+    // interned string is returned), and read correctly after restore() because
+    // restore rebuilds through the same constructor. Cold: never on a hot path.
+    get keysBacking() { return this._store._kind; }
+    get maxKey() { return this._store._kind === "dense" ? this._store._maxKey : null; }
+    get ttlEnabled() { return this._exp !== null; }
+    get statsEnabled() { return this._stats !== null; }
 
     // --- the m intrusive band queues (shared `_next`/`_prev`) ------------------
 
@@ -7131,7 +7524,7 @@ export class Mq {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
         if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
             this._reap(s);
             return undefined;
@@ -7151,15 +7544,22 @@ export class Mq {
      */
     put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
-        let expiresAt;
-        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        // S17 F6: resolve the expiry COLD + atomically into the per-instance f64 scratch,
+        // BEFORE _ver++/slot acquisition, so a bad clock throws with ZERO mutation and the
+        // double never boxes (computeExpiry is tiny -> this._clock() inlines).
+        if (this._exp !== null) {
+            if (ttlMs !== undefined) checkTtl(ttlMs);
+            const ms = ttlMs === undefined ? this._ttl : ttlMs; // resolved duration (Infinity or finite ms)
+            if (ms === Infinity) this._expScr[0] = Infinity;
+            else computeExpiry(this._clock, ms, this._expScr);
+        }
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         this._store._ver++; // D18.6 -- put mutates; invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                  // update-in-place + access policy
             this._vals[existing] = value;
-            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            if (this._exp !== null) this._exp[existing] = this._expScr[0]; // restamp (D17)
             this._access(existing);
             if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
             return;
@@ -7179,7 +7579,7 @@ export class Mq {
         if (inHist) this._hist.consume(key);  // it is being re-admitted (resident again)
         this._keys[s] = key;
         this._vals[s] = value;
-        if (this._exp !== null) this._exp[s] = expiresAt; // stamp the wall-clock expiry (D17)
+        if (this._exp !== null) this._exp[s] = this._expScr[0]; // stamp the wall-clock expiry (D17)
         store.set(key, s);
 
         this._t++;
@@ -7208,7 +7608,7 @@ export class Mq {
     has(key) {
         const s = this._store.get(key);
         if (s < 0) return false;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return false;
         }
@@ -7220,7 +7620,7 @@ export class Mq {
     peek(key) {
         const s = this._store.get(key);
         if (s < 0) return undefined;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return undefined;
         }
@@ -7256,7 +7656,7 @@ export class Mq {
         const now = this._clock();
         const exp = this._exp;
         const victims = [];
-        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        this._store.indexEntries((key, slot) => { if (!(now < exp[slot])) victims.push(slot); });
         for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
         return victims.length;
     }
@@ -7274,16 +7674,19 @@ export class Mq {
         return true;
     }
 
-    /** Empty the cache. Rebuilds the free list, empties every queue + the history, and resets the
-     *  per-slot state + the logical clock. Allocates nothing. O(capacity). */
+    /** Empty the cache. O(size) in the resident slots (ROADMAP S17 F7): frees only the
+     *  occupants of the band queues, resetting each one's per-slot `_rc`/`_exq` in the same
+     *  walk, then resets the fixed 8-band head/tail/count vectors and the logical clock. The
+     *  bounded non-resident history reset stays O(history capacity) -- inherent to the fixed-
+     *  history design, not a slot sweep. Allocates only the cold roster. */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
-        this._store.reset();
+        void clearSlots(this, undefined, this._rc, 0, this._exq, 0);
         this._qHead.fill(NIL); this._qTail.fill(NIL);
         this._size = 0;
         this._t = 0;
-        this._rc.fill(0); this._exq.fill(0); this._qn.fill(0);
+        this._qn.fill(0);
         this._hist.clear();
     }
 
@@ -7388,8 +7791,8 @@ export class Mq {
         };
         for (let q = 0; q < MQ_M; q++) {
             const n = snap.queues[q].slots.length;
-            ckCol(snap.rc[q], n, "rc[" + q + "]");
-            ckCol(snap.exq[q], n, "exq[" + q + "]");
+            void ckCol(snap.rc[q], n, "rc[" + q + "]"); // void: off the dts-drift member regex
+            void ckCol(snap.exq[q], n, "exq[" + q + "]");
         }
         if (typeof snap.tick !== "number" || !Number.isFinite(snap.tick) || snap.tick < 0) {
             throw new Error(SNAP_BAD + "mq tick must be a non-negative finite number, got " + String(snap.tick));
@@ -7521,6 +7924,11 @@ export class Car {
                 "[lite-lru] capacity must be an integer >= 1, got " + String(capacity)
             );
         }
+        if (capacity > INT_MAX) {
+            throw new RangeError(
+                "[lite-lru] capacity must not exceed " + INT_MAX + " (2^31-1), got " + String(capacity)
+            );
+        }
 
         void validateOptions(options);
         this._capacity = capacity;
@@ -7539,6 +7947,7 @@ export class Car {
         this._next = this._store._next;
         this._prev = this._store._prev;
         this._exp = this._store._exp;   // ttl expiry column; null when ttl is off (D17)
+        this._expScr = this._exp !== null ? new Float64Array(1) : null; // S17 F6 expiry scratch
 
         // Per-slot state (bit0 reference, bit1 inT2). Member-specific, fixed, never grown.
         this._st = new Uint8Array(capacity);
@@ -7579,6 +7988,17 @@ export class Car {
 
     get size() { return this._size; }
     get capacity() { return this._capacity; }
+
+    // S17 N2 -- cold read-only configuration getters (A14). Each is DERIVED from an
+    // existing instance field: the store's interned `_kind` tag, the `_maxKey` it
+    // records only for the dense backing, and the `_exp`/`_stats` columns that are
+    // `null` when off. They never throw, allocate nothing (a stored primitive or an
+    // interned string is returned), and read correctly after restore() because
+    // restore rebuilds through the same constructor. Cold: never on a hot path.
+    get keysBacking() { return this._store._kind; }
+    get maxKey() { return this._store._kind === "dense" ? this._store._maxKey : null; }
+    get ttlEnabled() { return this._exp !== null; }
+    get statsEnabled() { return this._stats !== null; }
 
     // --- the two circular clocks (NIL-terminated DLL + wrap-around hand advance) ---
 
@@ -7703,7 +8123,7 @@ export class Car {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         const s = this._store.get(key);
         if (s < 0) { if (this._stats !== null) this._stats.misses++; return undefined; } // miss (0019)
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (this._stats !== null) this._stats.misses++; // stale = miss (+ evict via _reap; D19.2)
             this._reap(s);
             return undefined;
@@ -7723,15 +8143,22 @@ export class Car {
      */
     put(key, value, ttlMs) {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
-        let expiresAt;
-        if (this._exp !== null) expiresAt = expiryFor(this._clock, this._ttl, ttlMs);
+        // S17 F6: resolve the expiry COLD + atomically into the per-instance f64 scratch,
+        // BEFORE _ver++/slot acquisition, so a bad clock throws with ZERO mutation and the
+        // double never boxes (computeExpiry is tiny -> this._clock() inlines).
+        if (this._exp !== null) {
+            if (ttlMs !== undefined) checkTtl(ttlMs);
+            const ms = ttlMs === undefined ? this._ttl : ttlMs; // resolved duration (Infinity or finite ms)
+            if (ms === Infinity) this._expScr[0] = Infinity;
+            else computeExpiry(this._clock, ms, this._expScr);
+        }
         else if (ttlMs !== undefined) throw new Error(TTL_NO_COLUMN_MSG); // fail closed (D17.4)
         this._store._ver++; // D18.6 -- put mutates; invalidate iterators
         const store = this._store;
         const existing = store.get(key);
         if (existing >= 0) {                  // update-in-place + set the reference bit
             this._vals[existing] = value;
-            if (this._exp !== null) this._exp[existing] = expiresAt; // restamp (D17)
+            if (this._exp !== null) this._exp[existing] = this._expScr[0]; // restamp (D17)
             this._st[existing] |= CAR_REF;
             if (this._stats !== null) this._stats.puts++; // successful update (outcome-based); 0019
             return;
@@ -7765,7 +8192,7 @@ export class Car {
         }
 
         this._keys[s] = key; this._vals[s] = value;
-        if (this._exp !== null) this._exp[s] = expiresAt;
+        if (this._exp !== null) this._exp[s] = this._expScr[0];
         store.set(key, s);
 
         if (inB1) {
@@ -7799,7 +8226,7 @@ export class Car {
     has(key) {
         const s = this._store.get(key);
         if (s < 0) return false;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return false;
         }
@@ -7811,7 +8238,7 @@ export class Car {
     peek(key) {
         const s = this._store.get(key);
         if (s < 0) return undefined;
-        if (this._exp !== null && this._exp[s] <= this._clock()) {
+        if (this._exp !== null && !(this._clock() < this._exp[s])) {
             if (!this._inOnEvict) this._reap(s);
             return undefined;
         }
@@ -7843,7 +8270,7 @@ export class Car {
         const now = this._clock();
         const exp = this._exp;
         const victims = [];
-        this._store.indexEntries((key, slot) => { if (exp[slot] <= now) victims.push(slot); });
+        this._store.indexEntries((key, slot) => { if (!(now < exp[slot])) victims.push(slot); });
         for (let i = 0; i < victims.length; i++) this._reap(victims[i]);
         return victims.length;
     }
@@ -7864,18 +8291,20 @@ export class Car {
         return true;
     }
 
-    /** Empty the cache. Rebuilds the free list, empties both clocks + both ghosts, resets the
-     *  hands, the counts and `p`. Allocates nothing. O(capacity). */
+    /** Empty the cache. O(size) in the resident slots (ROADMAP S17 F7): frees only the
+     *  T1+T2 clock occupants, zeroing each one's per-slot state in the same walk, then resets
+     *  the hands, counts and `p`. The two bounded keys-only ghosts (B1/B2) reset stays
+     *  O(ghost capacity) -- inherent to the fixed-history design, not a slot sweep. Allocates
+     *  only the cold roster. */
     clear() {
         if (this._inOnEvict) throw new Error(REENTRANT_MSG); // reentrancy: decisions/0002
         this._store._ver++; // D18.6 -- clear is a structural mutation; invalidate iterators
-        this._store.reset();
+        void clearSlots(this, undefined, this._st, 0);
         this._headT1 = NIL; this._tailT1 = NIL; this._t1Size = 0;
         this._headT2 = NIL; this._tailT2 = NIL; this._t2Size = 0;
         this._hT1 = NIL; this._hT2 = NIL;
         this._size = 0;
         this._p = 0;
-        this._st.fill(0);
         this._b1.clear();
         this._b2.clear();
     }

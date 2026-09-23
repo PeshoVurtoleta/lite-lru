@@ -17,7 +17,7 @@ function victim(c) {
 }
 
 test('exports: VERSION and both named + default export are LiteLru', async () => {
-    assert.equal(VERSION, '1.18.0');
+    assert.equal(VERSION, '1.19.0');
     const mod = await import('../Lru.js');
     assert.equal(mod.LiteLru, LiteLru);
     assert.equal(mod.default, LiteLru);
@@ -701,4 +701,50 @@ test('int backing adversarial: backward-shift deletion across a WRAPPED cluster 
     assert.equal(c.get(keys[1]), keys[1] * 10);
     assert.equal(c.get(keys[2]), keys[2] * 10);
     validate(c);
+});
+
+// --- S17 F10 / S2: onEvict is eviction-only; the pool balances to 0 leaks -----
+
+test('S17 F10: onEvict fires ONLY on capacity eviction + TTL reap, never delete/clear/overwrite', () => {
+    const released = [];
+    const c = new LiteLru(2, { onEvict: (k, v) => released.push(v) });
+
+    c.put('a', 'A');
+    c.put('b', 'B');
+    c.put('a', 'A2'); // OVERWRITE: replaces 'A' in place -- onEvict must NOT fire
+    assert.deepEqual(released, [], 'overwrite does not fire onEvict');
+
+    c.put('c', 'C'); // at capacity (a=A2, b=B) -> evicts LRU 'b' -> onEvict('b','B')
+    assert.deepEqual(released, ['B'], 'capacity eviction fires onEvict exactly once');
+
+    assert.equal(c.delete('a'), true); // DELETE: must NOT fire
+    assert.deepEqual(released, ['B'], 'delete does not fire onEvict');
+
+    c.put('d', 'D');
+    c.clear(); // CLEAR: must NOT fire for the residents (c=C, d=D)
+    assert.deepEqual(released, ['B'], 'clear does not fire onEvict');
+});
+
+test('S17 F10: the README pool pattern releases 7 of 7 objects (eviction + teardown drain)', () => {
+    // A tiny object pool: acquire() hands out a live buffer, release() returns it.
+    const live = new Set();
+    const pool = {
+        acquire(id) { const o = { id }; live.add(o); return o; },
+        release(o) { live.delete(o); },
+    };
+
+    const cache = new LiteLru(4, { onEvict: (k, v) => pool.release(v) }); // capacity 4 < 7
+
+    // Insert 7 distinct pooled values. Three overflow capacity 4 -> onEvict releases them.
+    for (let i = 0; i < 7; i++) cache.put(i, pool.acquire(i));
+    assert.equal(cache.size, 4, 'four residents remain at capacity');
+    assert.equal(live.size, 4, 'three overflow values released via onEvict; four still live');
+
+    // Teardown: onEvict does NOT fire on clear (S17 S2). Drain residents, then clear.
+    for (const v of cache.values()) pool.release(v);
+    cache.clear();
+
+    assert.equal(live.size, 0, 'all 7 of 7 pooled objects released (3 by onEvict + 4 by teardown drain)');
+    assert.equal(cache.size, 0, 'cache empty after clear');
+    validate(cache);
 });

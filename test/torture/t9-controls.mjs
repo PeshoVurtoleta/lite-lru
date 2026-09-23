@@ -25,7 +25,7 @@ import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro,
 import {
     runOpsGate, runAllocsGate, runDifferential, wrapLru, wrapSieve, wrapS3Fifo, wrapWTinyLfu,
     wrapSlru, wrapTwoQ, wrapArc, wrapLirs, wrapLfu, wrapClockPro, wrapLruK, wrapMq, wrapCar, validate, runRoundTrip,
-    lruPolicy, check, die, makePrng,
+    lruPolicy, check, die, makePrng, spawnTtlConfig, parseTtlResult,
 } from './harness.mjs';
 import { makeCarOracle } from './oracles/car.mjs';
 import { makeMqOracle } from './oracles/mq.mjs';
@@ -1088,6 +1088,22 @@ export function run() {
                     'from the twin (the round-trip differential is toothless)');
             }
         }
+    }
+
+    // C-ttl-boxing: the TTL zero-alloc lane must be able to FAIL. Reintroduce the A1
+    // boxing (a helper that RETURNS the expiry double across a call boundary, parked in
+    // a local before the typed-array store) in a child under --max-semi-space-size=4,
+    // after a TTL-off warm-up. The scavenge lane MUST report > 0 at 8N; a lane that
+    // stays 0 on genuinely-boxing code is decorative. (Lru.js is never modified: the
+    // boxing lives in the harness's BoxingExpiryLru subclass.)
+    {
+        const parsed = parseTtlResult(spawnTtlConfig('LiteLru', 'epoch', true));
+        check(parsed.ok, () => 't9 C-ttl-boxing: control child failed -- ' + parsed.error);
+        const nHi = parsed.result['putchurn-broken'][1];
+        check(nHi > 0,
+            () => 't9 C-ttl-boxing: the boxing-expiry helper scavenged ' + nHi +
+                ' at 8N (expected > 0 -- the TTL scavenge lane is toothless)');
+        units++;
     }
 
     return units;

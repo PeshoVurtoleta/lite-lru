@@ -25,6 +25,9 @@
  */
 
 import { measureOps, checkNoGc, measureAllocs, checkAllocs } from '@zakkster/lite-gc-profiler';
+import { PerformanceObserver, constants } from 'node:perf_hooks';
+import { spawnSync } from 'node:child_process';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car } from '../../Lru.js';
 import { makeLruOracle, svz } from './oracles/lru.mjs';
 import { makeLirsOracle } from './oracles/lirs.mjs';
@@ -125,6 +128,266 @@ export function runAllocsGate(fn, opts) {
     const report = checkAllocs(result, ALLOC_RULES);
     const ok = report.verdict === 'pass' && result.settled === true;
     return { report, result, bytesPerCall: result.bytesPerCall, ok };
+}
+
+/* -------------------------------------------------------------------------- *
+ * TTL zero-alloc scavenge lanes (ROADMAP S17 N1 / A1 / A2 / A8).
+ *
+ * The A1/A2 boxing is a TRANSIENT HeapNumber (a ~16 B double crossing a
+ * non-inlined call return, or a boxed clock() result). Neither runOpsGate
+ * (maxMajor:0) nor runAllocsGate (retained bytes) can see it -- a transient box
+ * is collected before either reads. The ONLY instrument that catches it is the
+ * MINOR-GC (scavenge) count under a small semi-space. So these lanes:
+ *   - run in a CHILD process launched with --expose-gc --max-semi-space-size=4
+ *     (spawnTtlConfig), because the torture entry itself has a large semi-space;
+ *   - measure ONE (member, clock) config per process, because the clock() call
+ *     site goes polymorphic across the three clock closures and boxes on every
+ *     TTL touch regardless of the fix if epoch/frac/default share a process;
+ *   - warm up a TTL-OFF instance of the same class first (that is what stops V8
+ *     inlining the expiry maths on the subsequent TTL-on run -- A1);
+ *   - count scavenges at N and 8N: both must be 0.
+ * A boxing-expiry control (LLRU_BROKEN) reintroduces A1 and MUST report > 0.
+ * -------------------------------------------------------------------------- */
+
+const TTL_CTORS = { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car };
+/** The 13 shipped members, canonical order (mirrors PerfGate + t6). */
+export const TTL_MEMBER_NAMES = Object.keys(TTL_CTORS);
+/** The four TTL-on hot shapes each member is measured on. */
+export const TTL_SHAPES = ['gethit', 'iter', 'putchurn', 'stale'];
+/** The three clocks: an epoch-sized counter, a fractional counter, the default. */
+export const TTL_CLOCKS = ['epoch', 'frac', 'default'];
+/** N (low) iteration count; 8N is the high window. Matches the audit yardstick. */
+export const TTL_N = 200000;
+const TTL_CAP = 4096;
+const TTL_MASK = TTL_CAP - 1;
+const TTL_WARM = 300000; // TTL-off warm-up size: enough to optimize put around _exp===null
+
+const HARNESS_PATH = fileURLToPath(import.meta.url);
+
+/** A clock closure for `kind`. epoch/frac return realistic (boxing-prone) doubles;
+ *  `default` returns undefined so the cache uses Lru.js's module-level defaultClock.
+ *  ONE closure per process keeps the clock() call site monomorphic (S1). */
+function ttlClockFor(kind) {
+    if (kind === 'epoch') { let c = 0; return () => 1.7e12 + (c++); }
+    if (kind === 'frac') { let c = 0; return () => c++ * 0.37 + 1.7e12; }
+    return undefined;
+}
+
+let _ttlMinor = 0;
+let _ttlObs = null;
+/** Lazily install a scavenge counter (only in the spawned child). */
+function ttlObserve() {
+    if (_ttlObs !== null) return;
+    const GC_MINOR = constants.NODE_PERFORMANCE_GC_MINOR;
+    _ttlObs = new PerformanceObserver((list) => {
+        const es = list.getEntries();
+        for (let i = 0; i < es.length; i++) {
+            const d = es[i].detail;
+            if (d && d.kind === GC_MINOR) _ttlMinor++;
+        }
+    });
+    _ttlObs.observe({ entryTypes: ['gc'], buffered: false });
+}
+const ttlSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Count scavenges across `ops` calls of `hot(state, i)`. Drains the young generation
+ *  with two forced collections (the second sweeps up what the first promoted/freed) and
+ *  settles between, so nursery residue from setup / warm-up / JIT recompilation is gone
+ *  before the counter resets. Reads after a macrotask (GC entries arrive asynchronously). */
+async function ttlMeasure(hot, state, ops) {
+    globalThis.gc();
+    await ttlSleep(20);
+    globalThis.gc();
+    await ttlSleep(20);
+    _ttlMinor = 0;
+    for (let i = 0; i < ops; i++) hot(state, i);
+    await ttlSleep(45);
+    return _ttlMinor;
+}
+
+let _ttlPrimed = false;
+/** Absorb the process's one-off first-counted-window residue (PerformanceObserver
+ *  first delivery + late tier-up) with a discarded measurement, ONCE per child. Uses a
+ *  TTL-OFF cache so it never touches clock() -- priming must not pollute the clock() call
+ *  site the measured configs depend on staying monomorphic. */
+async function ttlPrime() {
+    if (_ttlPrimed) return;
+    _ttlPrimed = true;
+    const c = new LiteLru(TTL_CAP, { keys: 'int' });
+    for (let i = 0; i < TTL_CAP; i++) c.put(i, i & 0xffff);
+    const st = { c, acc: 0 };
+    const hot = (s, i) => { s.acc = (s.acc + (s.c.get(i & TTL_MASK) | 0)) | 0; };
+    for (let i = 0; i < TTL_N; i++) hot(st, i);
+    await ttlMeasure(hot, st, TTL_N);
+}
+
+/** A TTL-OFF instance churned hard so V8 optimizes `put` with `_exp === null` --
+ *  the precondition that de-inlines the expiry maths on the later TTL-on run (A1). */
+function ttlWarmOff(Ctor) {
+    const w = new Ctor(TTL_CAP, { keys: 'int' });
+    for (let k = 0; k < TTL_WARM; k++) w.put(k, k & 0xffff);
+    return w;
+}
+
+/** Build a fresh at-capacity TTL-ON measured instance + its per-shape state. */
+function ttlBuildState(Ctor, shape, clock) {
+    if (shape === 'gethit' || shape === 'iter') {
+        const c = new Ctor(TTL_CAP, { keys: 'int', ttl: 1e12, clock }); // never stale in-window
+        for (let i = 0; i < TTL_CAP; i++) c.put(i, i & 0xffff);
+        return shape === 'iter' ? { c, it: c.keys(), acc: 0 } : { c, acc: 0 };
+    }
+    if (shape === 'putchurn') {
+        const c = new Ctor(TTL_CAP, { keys: 'int', ttl: 1e9, clock });
+        for (let i = 0; i < TTL_CAP; i++) c.put(i, i & 0xffff);
+        return { c, k: TTL_CAP };
+    }
+    // stale: ttl 1 so a resident entry read a full cycle later is expired -> reap
+    const c = new Ctor(TTL_CAP, { keys: 'int', ttl: 1, clock });
+    for (let i = 0; i < TTL_CAP; i++) c.put(i, i & 0xffff);
+    return { c, k: TTL_CAP };
+}
+
+/** The zero-alloc hot closure for `shape`. SMI values, int32-wrapped accumulator. */
+function ttlHotFor(shape) {
+    if (shape === 'gethit') return (s, i) => { s.acc = (s.acc + (s.c.get(i & TTL_MASK) | 0)) | 0; };
+    if (shape === 'iter') return (s) => {
+        let r = s.it.next();
+        if (r.done) { s.it = s.c.keys(); r = s.it.next(); }
+        s.acc = (s.acc + (r.value | 0)) | 0;
+    };
+    if (shape === 'putchurn') return (s) => { s.c.put(s.k, s.k & 0xffff); s.k = (s.k + 1) | 0; };
+    return (s, i) => { const key = i & TTL_MASK; s.c.get(key); s.c.put(key, key & 0xffff); };
+}
+
+/** Measure one shape at N and 8N (fresh measured instance per window; the TTL-off
+ *  warm-up persists process-wide). Returns [minorN, minor8N]. The low window is the
+ *  STEADY-STATE MIN over two counted passes (mirrors measureAllocs's min-over-batches):
+ *  the very first counted pass of a process can catch a one-off tier-up scavenge for the
+ *  largest member's get under the native default clock -- not per-op allocation (8N stays
+ *  0), and the min sheds it. Per-op allocation cannot hide from the min: it lands in every
+ *  pass and scales into 8N. */
+async function ttlMeasureShape(Ctor, shape, clock) {
+    const hot = ttlHotFor(shape);
+    const a = ttlBuildState(Ctor, shape, clock);
+    for (let i = 0; i < 3 * TTL_N; i++) hot(a, i); // 3N uncounted prewarm: tier up before counting
+    const n1 = await ttlMeasure(hot, a, TTL_N);
+    const n2 = await ttlMeasure(hot, a, TTL_N);
+    const minorN = n1 < n2 ? n1 : n2;
+    const b = ttlBuildState(Ctor, shape, clock);
+    for (let i = 0; i < 3 * TTL_N; i++) hot(b, i);
+    const minor8N = await ttlMeasure(hot, b, 8 * TTL_N);
+    return [minorN, minor8N];
+}
+
+/** Measure every shape for one (member, clock) config. In-process; call ONLY from
+ *  the spawned child (spawnTtlConfig), never in the torture parent. */
+export async function runTtlChildConfig(memberName, clockKind, shapes) {
+    ttlObserve();
+    const Ctor = TTL_CTORS[memberName];
+    if (Ctor === undefined) throw new Error('[lite-lru] TTL lane: unknown member ' + memberName);
+    const clock = ttlClockFor(clockKind);
+    await ttlPrime();
+    ttlWarmOff(Ctor); // one TTL-off warm-up of the class in this process (A1 precondition)
+    const list = shapes || TTL_SHAPES;
+    const out = {};
+    for (let si = 0; si < list.length; si++) out[list[si]] = await ttlMeasureShape(Ctor, list[si], clock);
+    return out;
+}
+
+/** The A8 lane: W-TinyLFU get-churn over int keys below -2^30 (the hash source
+ *  that used to leave Smi range on its way into non-inlined _sketchInc). */
+export async function runTtlWtlfuNegConfig() {
+    ttlObserve();
+    await ttlPrime();
+    const base = -(1 << 30) - 1000;
+    const build = () => {
+        const c = new WTinyLfu(TTL_CAP, { keys: 'int' });
+        for (let i = 0; i < TTL_CAP; i++) c.put(base - i, i & 0xffff);
+        return { c, k: 0 };
+    };
+    const hot = (s) => { s.c.get(base - (s.k & TTL_MASK)); s.k = (s.k + 1) | 0; };
+    const a = build(); for (let i = 0; i < 20000; i++) hot(a, i);
+    const minorN = await ttlMeasure(hot, a, TTL_N);
+    const b = build(); for (let i = 0; i < 20000; i++) hot(b, i);
+    const minor8N = await ttlMeasure(hot, b, 8 * TTL_N);
+    return { 'wtlfu-neg': [minorN, minor8N] };
+}
+
+/** The A1 boxing control: an expiry helper that BOXES the timestamp in a heap wrapper
+ *  and hands it back across a call boundary. The wrapper is parked in an instance field
+ *  so it genuinely escapes (V8 cannot scalar-replace it) -- one allocation per put, the
+ *  same shape A1 produced. A gate that stays 0 on this is decorative. */
+function boxingExpiryFor(clock, ttl, ttlMs) {
+    const at = ttlMs === undefined ? (ttl === Infinity ? Infinity : clock() + ttl)
+        : (ttlMs === Infinity ? Infinity : clock() + ttlMs);
+    return { at };
+}
+class BoxingExpiryLru extends LiteLru {
+    put(key, value, ttlMs) {
+        if (this._exp !== null) {
+            this._boxedExpiry = boxingExpiryFor(this._clock, this._ttl, ttlMs); // escapes -> allocates
+            this._exp[0] = this._boxedExpiry.at; // super re-stamps the real slot correctly
+        }
+        return super.put(key, value, ttlMs);
+    }
+}
+
+/** The control config: put-churn with the boxing helper reintroduced. The lane
+ *  MUST report > 0 scavenges here -- proof the instrument has teeth. */
+export async function runTtlBrokenConfig(clockKind) {
+    ttlObserve();
+    await ttlPrime();
+    const clock = ttlClockFor(clockKind);
+    ttlWarmOff(BoxingExpiryLru);
+    const build = () => {
+        const c = new BoxingExpiryLru(TTL_CAP, { keys: 'int', ttl: 1e9, clock });
+        for (let i = 0; i < TTL_CAP; i++) c.put(i, i & 0xffff);
+        return { c, k: TTL_CAP };
+    };
+    const hot = (s) => { s.c.put(s.k, s.k & 0xffff); s.k = (s.k + 1) | 0; };
+    const a = build(); for (let i = 0; i < 20000; i++) hot(a, i);
+    const minorN = await ttlMeasure(hot, a, TTL_N);
+    const b = build(); for (let i = 0; i < 20000; i++) hot(b, i);
+    const minor8N = await ttlMeasure(hot, b, 8 * TTL_N);
+    return { 'putchurn-broken': [minorN, minor8N] };
+}
+
+/** Child entry: read the config from the environment, measure, print one line
+ *  `TTLRESULT <json>`. Invoked only via spawnTtlConfig's `-e` bootstrap. */
+export async function ttlChildMain() {
+    const member = process.env.LLRU_MEMBER;
+    const clock = process.env.LLRU_CLOCK || undefined;
+    let res;
+    if (member === 'wtlfu-neg') res = await runTtlWtlfuNegConfig();
+    else if (process.env.LLRU_BROKEN === '1') res = await runTtlBrokenConfig(clock);
+    else res = await runTtlChildConfig(member, clock);
+    process.stdout.write('TTLRESULT ' + JSON.stringify(res) + '\n');
+    process.exit(0);
+}
+
+/** Spawn one config in a child with the small semi-space (the yardstick flags).
+ *  Returns the spawnSync result; parse with parseTtlResult. */
+export function spawnTtlConfig(member, clock, broken) {
+    const env = Object.assign({}, process.env, {
+        LLRU_MEMBER: member,
+        LLRU_CLOCK: clock || '',
+        LLRU_HARNESS_URL: pathToFileURL(HARNESS_PATH).href,
+    });
+    if (broken) env.LLRU_BROKEN = '1'; else delete env.LLRU_BROKEN;
+    const code = "import(process.env.LLRU_HARNESS_URL).then(h=>h.ttlChildMain())" +
+        ".catch(e=>{process.stderr.write(String(e&&e.stack||e)+'\\n');process.exit(3)})";
+    return spawnSync(process.execPath,
+        ['--expose-gc', '--max-semi-space-size=4', '-e', code],
+        { env, encoding: 'utf8', maxBuffer: 1 << 20 });
+}
+
+/** Parse a child result. { ok:true, result:{shape:[minorN,minor8N]} } or { ok:false, error }. */
+export function parseTtlResult(res) {
+    if (res.status !== 0) return { ok: false, error: 'child exit ' + res.status + ' ' + (res.stderr || '') };
+    const m = /TTLRESULT (.+)/.exec(res.stdout || '');
+    if (!m) return { ok: false, error: 'no TTLRESULT: ' + (res.stdout || '') + (res.stderr || '') };
+    try { return { ok: true, result: JSON.parse(m[1]) }; }
+    catch (e) { return { ok: false, error: 'bad json: ' + m[1] }; }
 }
 
 /** One-sided reachability census: false only when EVERY sampled ref is still live. */

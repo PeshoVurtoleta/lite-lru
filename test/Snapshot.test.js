@@ -15,7 +15,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car } from '../Lru.js';
 import { validate } from './validate.mjs';
 
 /** Every family member -- each body runs TWELVE TIMES over the same LiteCache surface. */
@@ -633,4 +633,87 @@ test('S3Fifo: hand-traced SMALL/MAIN/ghost/visited-bit structure survives restor
     const s3 = r.dump();
     assert.ok(s3.main.k.includes(5), 'a restored ghost re-sighting did not admit straight to MAIN');
     validate(r);
+});
+
+// --- S17 F3/F5/F11: restore input-door tightening ----------------------------
+// Recursively collect every captured RESIDENT list (an object with parallel
+// slots/k/v arrays). Members nest their lists differently -- LiteLru at
+// snap.list, Lfu under buckets[].list, Mq under queues[] -- so we walk the tree.
+function residentLists(node, out) {
+    if (node === null || typeof node !== 'object') return out;
+    if (Array.isArray(node.slots) && Array.isArray(node.k) && Array.isArray(node.v)) {
+        out.push(node);
+        return out; // a list is a leaf for our purposes
+    }
+    if (Array.isArray(node)) { for (const el of node) residentLists(el, out); }
+    else { for (const key in node) residentLists(node[key], out); }
+    return out;
+}
+
+// F3: a DUPLICATE KEY (two resident slots carrying the same key) is rejected on
+// EVERY backing for EVERY member -- it would clobber the store index (the second
+// store.set wins, the first slot orphans). Validation completes before any mutation.
+const F3_BACKINGS = [
+    ['map', undefined],
+    ['int', { keys: 'int' }],
+    ['dense', { keys: 'dense', maxKey: 100 }],
+];
+// The base MEMBERS roster omits Car (a control member); F3/F5 cover it too (all 13).
+const F3F5_MEMBERS = [...MEMBERS, { name: 'Car', Ctor: Car }];
+for (const { name, Ctor } of F3F5_MEMBERS) {
+    for (const [bname, o] of F3_BACKINGS) {
+        test('[' + name + '] restore rejects a duplicate KEY on the ' + bname + ' backing (S17 F3)', () => {
+            const c = new Ctor(8, o);
+            c.put(10, 'a');
+            c.put(20, 'b');
+            const s = structuredClone(c.dump());
+            const flat = [];
+            for (const L of residentLists(s, [])) {
+                for (let i = 0; i < L.k.length; i++) flat.push({ arr: L.k, idx: i });
+            }
+            assert.ok(flat.length >= 2, name + '/' + bname + ' needs >= 2 resident entries (vacuous)');
+            // Force the second resident key to collide with the first.
+            flat[1].arr[flat[1].idx] = flat[0].arr[flat[0].idx];
+            assert.throws(() => Ctor.restore(s, o), /\[lite-lru\].*duplicate key/,
+                name + '/' + bname + ' a duplicate key was not rejected');
+            // Non-vacuity: the unmutated snapshot restores fine.
+            assert.doesNotThrow(() => Ctor.restore(structuredClone(c.dump()), o),
+                name + '/' + bname + ' a correct snapshot was rejected (vacuous)');
+        });
+    }
+}
+
+// F5: a corrupt per-entry EXPIRY value is rejected. Valid = a number that is not
+// NaN (Infinity + any finite ms are fine); NaN/undefined/{}/"abc"/null all fail
+// closed (null is not zero). An Infinity expiry survives a structuredClone round-trip.
+for (const { name, Ctor } of F3F5_MEMBERS) {
+    test('[' + name + '] restore rejects a corrupt per-entry expiry value (S17 F5)', () => {
+        const c = new Ctor(8, { ttl: 1000 });
+        c.put(10, 'a');
+        c.put(20, 'b');
+        for (const bad of [NaN, undefined, {}, 'abc', null]) {
+            const s = structuredClone(c.dump());
+            let hit = false;
+            for (const L of residentLists(s, [])) {
+                if (Array.isArray(L.e) && L.e.length) { L.e[0] = bad; hit = true; break; }
+            }
+            assert.ok(hit, name + ' no exp column to corrupt (vacuous)');
+            assert.throws(() => Ctor.restore(s, { ttl: 1000 }), /\[lite-lru\]/,
+                name + ' a corrupt expiry ' + String(bad) + ' was not rejected');
+        }
+        // Non-vacuity + Infinity survives structuredClone (unlike JSON).
+        const ic = new Ctor(8, { ttl: 1000 });
+        ic.put(10, 'a', Infinity);
+        ic.put(20, 'b');
+        const r = Ctor.restore(structuredClone(ic.dump()), { ttl: 1000 });
+        assert.equal(r.size, ic.size, name + ' an Infinity-expiry round-trip drifted');
+        assert.equal(r.get(10), 'a', name + ' an Infinity-expiry entry did not survive the round-trip');
+    });
+}
+
+// F11: restore rejects a capacity above 2^31-1 (the 32-bit signed index domain).
+test('restore rejects a capacity above 2^31-1 (S17 F11)', () => {
+    const good = new LiteLru(4).dump();
+    assert.throws(() => LiteLru.restore({ ...structuredClone(good), cap: 2 ** 31 }),
+        /\[lite-lru\].*exceed/, 'an over-2^31 capacity snapshot was not rejected');
 });

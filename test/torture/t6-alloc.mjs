@@ -34,6 +34,7 @@
 import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, Lirs, Lfu, ClockPro, LruK, Mq, Car } from '../../Lru.js';
 import {
     runOpsGate, runAllocsGate, BREAK, check, die, makePrng, validate,
+    spawnTtlConfig, parseTtlResult, TTL_MEMBER_NAMES, TTL_CLOCKS, TTL_N,
     CountedLru, LRU_WRITES_HEAD_REHIT, LRU_WRITES_INTERIOR_REHIT, LRU_WRITES_TAIL_REHIT,
     CountedSieve, SIEVE_WRITES_HIT_LINKS, SIEVE_WRITES_HIT_VIS,
     CountedS3Fifo, S3FIFO_WRITES_HIT_LINKS, S3FIFO_WRITES_HIT_VIS,
@@ -2115,6 +2116,52 @@ export async function run() {
         CAR_WRITES_MISS_EVICT_TRIPWIRE + '); lanes covered: pAdapt=' + covCar._pAdapts +
         ' b1Hit=' + covCar._b1Hits + ' b2Hit=' + covCar._b2Hits + ' evicts=' + covCar._evicts +
         ' migrations=' + covCar._migrations + '\n');
+
+    // --- Gate TTL: the zero-alloc TTL lanes (ROADMAP S17 N1 / A1 / A2 / A8) -------
+    // The TTL-path boxing is a TRANSIENT HeapNumber the ops/allocs gates above cannot
+    // see (collected before either reads). The ONLY instrument is the scavenge count
+    // under a small semi-space, and it only surfaces after a TTL-OFF warm-up de-inlines
+    // the expiry maths -- and only when a clock is NOT shared across configs. So each
+    // (member, clock) config runs in its OWN child (spawnTtlConfig launches it with
+    // --expose-gc --max-semi-space-size=4). Every shape must be 0 scavenges at N and 8N.
+    // BREAK mode never reaches here (Gate 1 dies first), so this runs only on clean runs.
+    for (let mi = 0; mi < TTL_MEMBER_NAMES.length; mi++) {
+        for (let ci = 0; ci < TTL_CLOCKS.length; ci++) {
+            const member = TTL_MEMBER_NAMES[mi], clock = TTL_CLOCKS[ci];
+            const parsed = parseTtlResult(spawnTtlConfig(member, clock, false));
+            check(parsed.ok, () => 't6 Gate TTL: ' + member + ' (' + clock + ') child failed -- ' + parsed.error);
+            for (const shape in parsed.result) {
+                const nLo = parsed.result[shape][0], nHi = parsed.result[shape][1];
+                check(nLo === 0 && nHi === 0,
+                    () => 't6 Gate TTL: ' + member + ' ' + shape + ' (' + clock + ' clock) scavenged ' +
+                        nLo + '/' + nHi + ' at N/8N (transient TTL-path boxing; expected 0/0)');
+                units++;
+            }
+        }
+    }
+    // The A8 lane: W-TinyLFU int keys below -2^30 (the hash left Smi range into _sketchInc).
+    {
+        const parsed = parseTtlResult(spawnTtlConfig('wtlfu-neg', '', false));
+        check(parsed.ok, () => 't6 Gate TTL: wtlfu-neg child failed -- ' + parsed.error);
+        const r = parsed.result['wtlfu-neg'];
+        check(r[0] === 0 && r[1] === 0,
+            () => 't6 Gate TTL: W-TinyLFU neg-key churn scavenged ' + r[0] + '/' + r[1] +
+                ' at N/8N (hash left Smi range; expected 0/0)');
+        units++;
+    }
+    // The control (teeth): the boxing-expiry helper reintroduces A1 and MUST scavenge.
+    {
+        const parsed = parseTtlResult(spawnTtlConfig('LiteLru', 'epoch', true));
+        check(parsed.ok, () => 't6 Gate TTL: boxing-expiry control child failed -- ' + parsed.error);
+        const r = parsed.result['putchurn-broken'];
+        check(r[1] > 0,
+            () => 't6 Gate TTL: the boxing-expiry control scavenged ' + r[1] +
+                ' at 8N (expected > 0 -- the TTL lane lost its teeth)');
+        units++;
+    }
+    process.stderr.write('t6 Gate TTL: ' + (TTL_MEMBER_NAMES.length * TTL_CLOCKS.length) +
+        ' member/clock configs x ' + 4 + ' shapes + wtlfu-neg + boxing control, all 0 scavenges at N=' +
+        TTL_N + ' and 8N (child processes, --max-semi-space-size=4)\n');
 
     return units;
 }

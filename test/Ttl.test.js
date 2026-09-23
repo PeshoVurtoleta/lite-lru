@@ -20,7 +20,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, LruK, Mq } from '../Lru.js';
+import { LiteLru, Sieve, S3Fifo, WTinyLfu, Slru, TwoQ, Arc, LruK, Mq, Lirs, Lfu, ClockPro, Car } from '../Lru.js';
 import { validate } from './validate.mjs';
 
 /** Every family member, so each test body runs SEVEN TIMES over the exact same
@@ -565,3 +565,73 @@ test('WTinyLfu ttl ADVERSARIAL: a stale get() must NOT bump the frequency sketch
     assert.equal(c.has('anchor'), true);
     validate(c);
 });
+
+/* ============================================================================ *
+ * S17 F6 -- the clock() return is now CHECKED, and the check is ATOMIC. The
+ * expiry is computed COLD at the top of every put (into a same-function local),
+ * BEFORE any slot acquisition / eviction / column write, so a BigInt or NaN clock
+ * throws a tagged [lite-lru] error with ZERO mutation: size + free list unchanged,
+ * validate() holds, no onEvict fires, and the cache resumes normally. Verified on
+ * a NON-FULL and a FULL cache, over all 13 members x all 3 backings. Plus: a NaN
+ * already in `_exp` reads STALE (a miss), never never-expire (the `!(now < exp)`
+ * rewrite).
+ * ============================================================================ */
+
+/** All 13 members (Ttl.test.js's base MEMBERS omits Lirs/Lfu/ClockPro/Car). */
+const F6_MEMBERS = [
+    { name: 'LiteLru', Ctor: LiteLru }, { name: 'Sieve', Ctor: Sieve },
+    { name: 'S3Fifo', Ctor: S3Fifo }, { name: 'WTinyLfu', Ctor: WTinyLfu },
+    { name: 'Slru', Ctor: Slru }, { name: 'TwoQ', Ctor: TwoQ },
+    { name: 'Arc', Ctor: Arc }, { name: 'Lirs', Ctor: Lirs },
+    { name: 'Lfu', Ctor: Lfu }, { name: 'ClockPro', Ctor: ClockPro },
+    { name: 'LruK', Ctor: LruK }, { name: 'Mq', Ctor: Mq }, { name: 'Car', Ctor: Car },
+];
+const F6_BACKINGS = [
+    ['map', {}], ['int', { keys: 'int' }], ['dense', { keys: 'dense', maxKey: 1000 }],
+];
+const F6_BAD = [['NaN', NaN], ['BigInt', 10n]];
+
+for (const { name, Ctor } of F6_MEMBERS) {
+    for (const [bname, opt] of F6_BACKINGS) {
+        for (const [cname, bad] of F6_BAD) {
+            for (const full of [false, true]) {
+                const tag = name + '/' + bname + '/' + cname + '/' + (full ? 'full' : 'non-full');
+                test('[' + tag + '] a bad clock fails closed ATOMICALLY -- no mutation, no onEvict, cache survives (S17 F6)', () => {
+                    let base = 1000;
+                    const good = () => base++;
+                    let evictions = 0;
+                    const c = new Ctor(4, { ttl: 100000, clock: good, onEvict: () => { evictions++; }, ...opt });
+                    if (full) for (let i = 0; i < 4; i++) c.put(i, 'v' + i);
+                    const sizeBefore = c.size;
+                    evictions = 0; // ignore any fill-time bookkeeping
+                    // A clock that returns the bad value exactly ONCE, then recovers.
+                    let fired = false;
+                    c._clock = () => { if (!fired) { fired = true; return bad; } return base++; };
+                    assert.throws(() => c.put(999, 'overflow'), /\[lite-lru\]/, tag + ' a bad clock did not fail closed');
+                    c._clock = good; // restore for the resume
+                    // ATOMICITY: nothing changed on the target instance.
+                    assert.equal(c.size, sizeBefore, tag + ' size drifted after an atomic throw');
+                    assert.equal(c.size + c._store.freeListLength(), c._capacity, tag + ' size + free != capacity (leaked/lost slot)');
+                    assert.equal(evictions, 0, tag + ' onEvict fired on an atomic throw');
+                    assert.doesNotThrow(() => validate(c), tag + ' validate() failed after an atomic throw');
+                    // The cache still works for a following normal put/get.
+                    c.put(500, 'x');
+                    assert.equal(c.get(500), 'x', tag + ' the cache was broken after an atomic throw');
+                    assert.doesNotThrow(() => validate(c), tag + ' validate() failed after the resume put');
+                });
+            }
+        }
+    }
+
+    test('[' + name + '] a NaN expiry reads STALE (a miss) on get/has/peek, never never-expire (S17 F6)', () => {
+        for (const probe of ['get', 'has', 'peek']) {
+            const c = new Ctor(4, { ttl: 100000 });
+            c.put(1, 'a');
+            const s = c._store.get(1);
+            assert.ok(s >= 0, name + ' the entry was not resident');
+            c._exp[s] = NaN; // a garbage expiry (never produced by a clean put)
+            if (probe === 'has') assert.equal(c.has(1), false, name + ' a NaN expiry was not a miss on has');
+            else assert.equal(c[probe](1), undefined, name + ' a NaN expiry was not a miss on ' + probe);
+        }
+    });
+}

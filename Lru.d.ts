@@ -183,6 +183,31 @@ export interface LiteCache<K, V> extends Iterable<[K, V]> {
   readonly size: number;
   /** Fixed maximum entry count, set at construction. */
   readonly capacity: number;
+  /**
+   * Which keyed-index backing this instance was built with (decisions/0011 + 0029):
+   * `'map'` (default, arbitrary keys), `'int'` (open-addressed int32 keys) or
+   * `'dense'` (direct-mapped [0, maxKey] domain). Cold read-only getter (S17 N2):
+   * never throws, allocates nothing. Lets a caller verify the configuration without
+   * a try/catch around `stats()`.
+   */
+  readonly keysBacking: 'map' | 'int' | 'dense';
+  /**
+   * The dense key-domain upper bound `maxKey` when `keysBacking === 'dense'`,
+   * otherwise `null` (`null` is not zero -- the map/int backings have no maxKey).
+   * Cold read-only getter (S17 N2): never throws, allocates nothing.
+   */
+  readonly maxKey: number | null;
+  /**
+   * Whether a TTL column is configured on this instance (decisions/0017). Cold
+   * read-only getter (S17 N2): never throws, allocates nothing.
+   */
+  readonly ttlEnabled: boolean;
+  /**
+   * Whether runtime stats are enabled on this instance (decisions/0019); when
+   * `false`, `stats()` throws. Cold read-only getter (S17 N2): never throws,
+   * allocates nothing.
+   */
+  readonly statsEnabled: boolean;
 }
 
 /**
@@ -243,7 +268,9 @@ export interface LiteCacheOptions<K, V> {
   ttl?: number;
   /**
    * Injectable clock (decisions/0017, D17.2): a hoisted zero-arg function returning the
-   * current time in ms. Defaults to `Date.now`. Only meaningful alongside `ttl`; a
+   * current time in ms. Defaults to `performance.timeOrigin + performance.now()`
+   * (epoch-anchored, monotonic, zero-alloc); inject `Date.now` for wall-clock time.
+   * Only meaningful alongside `ttl`; a
    * non-function value throws a `[lite-lru]` TypeError (fail-closed). Keep it a hoisted
    * function, not a per-call closure (zero-GC).
    */
@@ -311,6 +338,14 @@ export class LiteLru<K = unknown, V = unknown> implements LiteCache<K, V> {
   [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
+  /** Keyed-index backing (S17 N2): `'map'` | `'int'` | `'dense'`. Cold, never throws. */
+  get keysBacking(): 'map' | 'int' | 'dense';
+  /** Dense key-domain bound when `keysBacking === 'dense'`, else `null` (S17 N2). Cold. */
+  get maxKey(): number | null;
+  /** Whether a TTL column is configured (S17 N2). Cold, never throws. */
+  get ttlEnabled(): boolean;
+  /** Whether runtime stats are enabled (S17 N2); when false, `stats()` throws. Cold. */
+  get statsEnabled(): boolean;
 }
 
 /**
@@ -368,6 +403,14 @@ export class Sieve<K = unknown, V = unknown> implements LiteCache<K, V> {
   [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
+  /** Keyed-index backing (S17 N2): `'map'` | `'int'` | `'dense'`. Cold, never throws. */
+  get keysBacking(): 'map' | 'int' | 'dense';
+  /** Dense key-domain bound when `keysBacking === 'dense'`, else `null` (S17 N2). Cold. */
+  get maxKey(): number | null;
+  /** Whether a TTL column is configured (S17 N2). Cold, never throws. */
+  get ttlEnabled(): boolean;
+  /** Whether runtime stats are enabled (S17 N2); when false, `stats()` throws. Cold. */
+  get statsEnabled(): boolean;
 }
 
 /**
@@ -428,6 +471,14 @@ export class S3Fifo<K = unknown, V = unknown> implements LiteCache<K, V> {
   [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
+  /** Keyed-index backing (S17 N2): `'map'` | `'int'` | `'dense'`. Cold, never throws. */
+  get keysBacking(): 'map' | 'int' | 'dense';
+  /** Dense key-domain bound when `keysBacking === 'dense'`, else `null` (S17 N2). Cold. */
+  get maxKey(): number | null;
+  /** Whether a TTL column is configured (S17 N2). Cold, never throws. */
+  get ttlEnabled(): boolean;
+  /** Whether runtime stats are enabled (S17 N2); when false, `stats()` throws. Cold. */
+  get statsEnabled(): boolean;
 }
 
 /**
@@ -493,6 +544,14 @@ export class WTinyLfu<K = unknown, V = unknown> implements LiteCache<K, V> {
   [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
+  /** Keyed-index backing (S17 N2): `'map'` | `'int'` | `'dense'`. Cold, never throws. */
+  get keysBacking(): 'map' | 'int' | 'dense';
+  /** Dense key-domain bound when `keysBacking === 'dense'`, else `null` (S17 N2). Cold. */
+  get maxKey(): number | null;
+  /** Whether a TTL column is configured (S17 N2). Cold, never throws. */
+  get ttlEnabled(): boolean;
+  /** Whether runtime stats are enabled (S17 N2); when false, `stats()` throws. Cold. */
+  get statsEnabled(): boolean;
 }
 
 /**
@@ -551,6 +610,14 @@ export class Slru<K = unknown, V = unknown> implements LiteCache<K, V> {
   [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
+  /** Keyed-index backing (S17 N2): `'map'` | `'int'` | `'dense'`. Cold, never throws. */
+  get keysBacking(): 'map' | 'int' | 'dense';
+  /** Dense key-domain bound when `keysBacking === 'dense'`, else `null` (S17 N2). Cold. */
+  get maxKey(): number | null;
+  /** Whether a TTL column is configured (S17 N2). Cold, never throws. */
+  get ttlEnabled(): boolean;
+  /** Whether runtime stats are enabled (S17 N2); when false, `stats()` throws. Cold. */
+  get statsEnabled(): boolean;
 }
 
 /**
@@ -611,6 +678,14 @@ export class TwoQ<K = unknown, V = unknown> implements LiteCache<K, V> {
   [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
+  /** Keyed-index backing (S17 N2): `'map'` | `'int'` | `'dense'`. Cold, never throws. */
+  get keysBacking(): 'map' | 'int' | 'dense';
+  /** Dense key-domain bound when `keysBacking === 'dense'`, else `null` (S17 N2). Cold. */
+  get maxKey(): number | null;
+  /** Whether a TTL column is configured (S17 N2). Cold, never throws. */
+  get ttlEnabled(): boolean;
+  /** Whether runtime stats are enabled (S17 N2); when false, `stats()` throws. Cold. */
+  get statsEnabled(): boolean;
 }
 
 /**
@@ -672,6 +747,14 @@ export class Arc<K = unknown, V = unknown> implements LiteCache<K, V> {
   [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
+  /** Keyed-index backing (S17 N2): `'map'` | `'int'` | `'dense'`. Cold, never throws. */
+  get keysBacking(): 'map' | 'int' | 'dense';
+  /** Dense key-domain bound when `keysBacking === 'dense'`, else `null` (S17 N2). Cold. */
+  get maxKey(): number | null;
+  /** Whether a TTL column is configured (S17 N2). Cold, never throws. */
+  get ttlEnabled(): boolean;
+  /** Whether runtime stats are enabled (S17 N2); when false, `stats()` throws. Cold. */
+  get statsEnabled(): boolean;
 }
 
 /**
@@ -721,6 +804,14 @@ export class Lirs<K = unknown, V = unknown> implements LiteCache<K, V> {
   [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
+  /** Keyed-index backing (S17 N2): `'map'` | `'int'` | `'dense'`. Cold, never throws. */
+  get keysBacking(): 'map' | 'int' | 'dense';
+  /** Dense key-domain bound when `keysBacking === 'dense'`, else `null` (S17 N2). Cold. */
+  get maxKey(): number | null;
+  /** Whether a TTL column is configured (S17 N2). Cold, never throws. */
+  get ttlEnabled(): boolean;
+  /** Whether runtime stats are enabled (S17 N2); when false, `stats()` throws. Cold. */
+  get statsEnabled(): boolean;
 }
 
 /**
@@ -771,6 +862,14 @@ export class Lfu<K = unknown, V = unknown> implements LiteCache<K, V> {
   [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
+  /** Keyed-index backing (S17 N2): `'map'` | `'int'` | `'dense'`. Cold, never throws. */
+  get keysBacking(): 'map' | 'int' | 'dense';
+  /** Dense key-domain bound when `keysBacking === 'dense'`, else `null` (S17 N2). Cold. */
+  get maxKey(): number | null;
+  /** Whether a TTL column is configured (S17 N2). Cold, never throws. */
+  get ttlEnabled(): boolean;
+  /** Whether runtime stats are enabled (S17 N2); when false, `stats()` throws. Cold. */
+  get statsEnabled(): boolean;
 }
 
 /**
@@ -825,6 +924,14 @@ export class ClockPro<K = unknown, V = unknown> implements LiteCache<K, V> {
   [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
+  /** Keyed-index backing (S17 N2): `'map'` | `'int'` | `'dense'`. Cold, never throws. */
+  get keysBacking(): 'map' | 'int' | 'dense';
+  /** Dense key-domain bound when `keysBacking === 'dense'`, else `null` (S17 N2). Cold. */
+  get maxKey(): number | null;
+  /** Whether a TTL column is configured (S17 N2). Cold, never throws. */
+  get ttlEnabled(): boolean;
+  /** Whether runtime stats are enabled (S17 N2); when false, `stats()` throws. Cold. */
+  get statsEnabled(): boolean;
 }
 
 /**
@@ -878,6 +985,14 @@ export class LruK<K = unknown, V = unknown> implements LiteCache<K, V> {
   [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
+  /** Keyed-index backing (S17 N2): `'map'` | `'int'` | `'dense'`. Cold, never throws. */
+  get keysBacking(): 'map' | 'int' | 'dense';
+  /** Dense key-domain bound when `keysBacking === 'dense'`, else `null` (S17 N2). Cold. */
+  get maxKey(): number | null;
+  /** Whether a TTL column is configured (S17 N2). Cold, never throws. */
+  get ttlEnabled(): boolean;
+  /** Whether runtime stats are enabled (S17 N2); when false, `stats()` throws. Cold. */
+  get statsEnabled(): boolean;
 }
 
 /**
@@ -933,6 +1048,14 @@ export class Mq<K = unknown, V = unknown> implements LiteCache<K, V> {
   [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
+  /** Keyed-index backing (S17 N2): `'map'` | `'int'` | `'dense'`. Cold, never throws. */
+  get keysBacking(): 'map' | 'int' | 'dense';
+  /** Dense key-domain bound when `keysBacking === 'dense'`, else `null` (S17 N2). Cold. */
+  get maxKey(): number | null;
+  /** Whether a TTL column is configured (S17 N2). Cold, never throws. */
+  get ttlEnabled(): boolean;
+  /** Whether runtime stats are enabled (S17 N2); when false, `stats()` throws. Cold. */
+  get statsEnabled(): boolean;
 }
 
 /**
@@ -980,6 +1103,14 @@ export class Car<K = unknown, V = unknown> implements LiteCache<K, V> {
   [Symbol.iterator](): IterableIterator<[K, V]>;
   get size(): number;
   get capacity(): number;
+  /** Keyed-index backing (S17 N2): `'map'` | `'int'` | `'dense'`. Cold, never throws. */
+  get keysBacking(): 'map' | 'int' | 'dense';
+  /** Dense key-domain bound when `keysBacking === 'dense'`, else `null` (S17 N2). Cold. */
+  get maxKey(): number | null;
+  /** Whether a TTL column is configured (S17 N2). Cold, never throws. */
+  get ttlEnabled(): boolean;
+  /** Whether runtime stats are enabled (S17 N2); when false, `stats()` throws. Cold. */
+  get statsEnabled(): boolean;
 }
 
 /**
