@@ -1507,3 +1507,75 @@ worker (future separate package, item 11). (snapshot/restore SHIPPED as S14/D21.
 FIFO-reinsertion / lazy-promotion is a PRINCIPLE embodied by SIEVE/S3-FIFO, not a
 member (item 12). V2 EXPERIMENTAL research (item 14, RESEARCH.md): LiteMGLRU
 (userspace Multi-Gen LRU) and the self-measuring meta-policy.
+
+## 8. Research intake (2026-10-18) -- cache tiers, layout, test generators
+
+Evidence: RESEARCH.md section 10. Sources: `../Research/RESEARCH_EPOCH_O1.md`
+section 3, `../Research/CACHE_RESEARCH.md`, `../Research/BITWISE_RESEARCH.md`
+section 1. Every speed number there is REPORTED from another host
+(260 MB L3). None enters README, llms.txt or CHANGELOG until a run from
+this cycle reproduces it under `quiet-lock.mjs`.
+
+| id | item | status | size |
+| --- | --- | --- | --- |
+| R1 | Mixed-stream test generators: `Math.imul` + separate key / op bit ranges (11 sites) + `test/Generators.test.js` self-check with controls | **DONE in working tree, uncommitted** (2026-10-18): `npm test` 2,359 -> 2,364, all pass; revert check fails the lint | tiny |
+| R2 | Cache-tier curve in the benchmark: hit cost per policy x backing (map / int / dense) at 1e3 / 1e4 / 1e5 / 1e6 / 4e6 with uniform random keys, plus a random-read floor and bare `Map.get`; label the memory tier per size on the reference host | planned | small |
+| R3 | Interleaved `[key, slot]` index in `IntSlotStore` (one `Int32Array(2 * size)` replacing `_ixSlot` / `_ixKey`, `Lru.js:511-528`); no semantic change | planned, after R2 | small |
+| R4 | Opt-in numeric value lane (`values: 'f64' \| 'i32'`, one 16-byte bucket record per hit) | needs an ADR (single-surface law) | medium |
+| R5 | Key-interning guidance: "for caches >= ~1e5 entries, map keys to ints once and use `keys: 'int' \| 'dense'`" in README / GUIDE.md, plus the dual-index recipe (hash + lite-logn ordered side index) in GUIDE.md | planned | tiny (docs) |
+
+### R1 -- done
+
+- Finding, fix, numbers and the new gate: RESEARCH.md 10.4.
+- The patch is kept at `.handoff/lite-lru-test-generators.patch` (moved from
+  `../Research/`), with `/.handoff/` added to `.gitignore`.
+- Test-only: `Lru.js` is untouched, so no torture or perf re-run is
+  required. `npm run verify` is still worth one run before the next release.
+
+### R2 -- cache-tier curve (the enabler for R3 / R4)
+
+- Tier: REPORTED (a published curve, never a flatness gate; it is not meant
+  to be flat). It turns SIEVE's "fewer writes per hit" (DEBATE.md section 2)
+  into a measured locality claim.
+- Method: interleave policies within each capacity, K rounds, best-of and
+  median both recorded, with provenance (date, CPU, L2 / L3, Node, load
+  average). Run under `quiet-lock.mjs`. A noisy host is PRELIMINARY.
+- Ratios under ~1.3x at >= 1e6 are noise on a shared host.
+- `benchmark/Bench.mjs` ships (`files[]`), so a new section there is a
+  user-facing change and a CHANGELOG line. An alternative is a repo-only
+  script beside it.
+- A laptop-class run (12-36 MB L3) is where the curve should bend hardest.
+  Confirm with `perf stat -e cache-misses,LLC-load-misses` on Linux bare
+  metal if available.
+
+### R3 -- interleaved int index
+
+- Expected gain about 1.3x at >= 1e5, none at <= 1e4. These are prototype
+  numbers, single run (RESEARCH.md 10.2).
+- Gates:
+  - parity of every int-key op against `git show HEAD:Lru.js`;
+  - the existing torture and zero-alloc gates unchanged;
+  - the R2 curve re-run interleaved A/B (STATISTICAL tier, HOST verdict) for
+    any speed claim.
+- Footprint unchanged (same bytes, one buffer). `_ixSlotBytes` /
+  `_ixKeyBytes` accounting is updated to match.
+
+### Declined (measured or structural, do not reopen without new evidence)
+
+- **A pure-JS Swiss / flat table for string keys.** 1.5-2.5x slower than
+  `Map` (V8 caches the string hash; JS has no SIMD). RESEARCH.md 10.3.
+- **The visited bit packed into the bucket (layout C).** It needs a
+  slot -> bucket back-pointer kept up to date by backward-shift deletion.
+  Revisit only if R4's bare-metal numbers justify it.
+- **HAMT / structural sharing.** It allocates on every update.
+- **Paged sparse arrays.** They allocate on demand and do not fix random
+  access.
+- **A Bloom / cuckoo filter in front of the in-memory cache.** Its probe costs
+  about what it saves (`CACHE_RESEARCH.md` 3.4).
+
+### Cross-worker (deferred item 11, updated)
+
+The suite's lossless SharedArrayBuffer queue work now lives in lite-worker
+(`../LiteWorker/ROADMAP.md` track M, `../LiteWorker/RESEARCH.md`, built on
+Dmitry Vyukov's bounded MPMC queue). A cross-worker cache, if ever wanted,
+would ride that transport and stays a separate package.

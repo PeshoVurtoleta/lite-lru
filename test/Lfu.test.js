@@ -419,7 +419,7 @@ for (const cap of [1, 2, 3, 4]) {
         const o = makeLfuOracle(cap);
         const ks = cap * 3 + 2;
         let x = 12345 + cap;
-        const rnd = () => (x = (x * 1103515245 + 12345) & 0x7fffffff);
+        const rnd = () => (x = (Math.imul(x, 1103515245) + 12345) & 0x7fffffff, x >>> 8);
         for (let i = 0; i < 3000; i++) {
             const kind = rnd() % 5, key = rnd() % ks, val = rnd();
             let rv, ov;

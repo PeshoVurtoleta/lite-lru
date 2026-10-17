@@ -387,9 +387,9 @@ test('conservation invariant holds after a mixed op stream', () => {
     const c = new S3Fifo(8);
     let x = 1;
     for (let i = 0; i < 500; i++) {
-        x = (x * 1103515245 + 12345) & 0x7fffffff;
-        const k = x % 20;
-        const op = x % 5;
+        x = (Math.imul(x, 1103515245) + 12345) & 0x7fffffff;
+        const k = (x >>> 16) % 20;
+        const op = (x >>> 8) % 5;
         if (op === 0) c.get(k);
         else if (op === 1) c.put(k, i);
         else if (op === 2) c.delete(k);
@@ -541,9 +541,9 @@ test('int backing: conservation invariant holds after a mixed op stream (heavy c
     const c = new S3Fifo(8, { keys: 'int' });
     let x = 1;
     for (let i = 0; i < 500; i++) {
-        x = (x * 1103515245 + 12345) & 0x7fffffff;
-        const k = x % 20;
-        const op = x % 5;
+        x = (Math.imul(x, 1103515245) + 12345) & 0x7fffffff;
+        const k = (x >>> 16) % 20;
+        const op = (x >>> 8) % 5;
         if (op === 0) c.get(k);
         else if (op === 1) c.put(k, i);
         else if (op === 2) c.delete(k);

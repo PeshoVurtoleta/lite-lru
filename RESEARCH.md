@@ -608,5 +608,176 @@ and reproduced.
 
 ---
 
+## 10. Suite research intake (2026-10-18): cache tiers, layout, and the broken test generator
+
+Sources, all in `../Research/`:
+
+- `RESEARCH_EPOCH_O1.md` section 3 (2026-10-07; lite-lru 1.19.0 as the consumer);
+- `CACHE_RESEARCH.md` sections 3.4 and 4 (2026-10-07);
+- `BITWISE_RESEARCH.md` sections 1 and 8 (re-verified here 2026-10-18).
+
+The plan these feed is `ROADMAP.md` section 8.
+
+**Tier of every number below: REPORTED.** They were measured on a different
+host from the suite's (4 vCPU Xeon @ 2.3 GHz, L2 2 MB/core, **L3 260 MB
+shared**, Node 22.22.0, shared cloud VM; best of 5; no hardware counters).
+Cells varied 30-50% run to run at >= 10^6 entries. None was re-measured this
+cycle, so none may enter README or CHANGELOG as a measurement until a run of
+this cycle reproduces it (ROADMAP 8, R2). The 260 MB L3 keeps even 4e6-entry
+structures out of DRAM. On a 12-36 MB-L3 laptop the gaps below should be
+larger. That is a hypothesis, not a measurement.
+
+### 10.1 The hit cost is not flat as the cache grows (ns per hit, uniform random keys, 100% hits)
+
+| capacity | random-read floor | `Map.get` | LRU / map | LRU / int | LRU / dense | SIEVE / map | SIEVE / int | SIEVE / dense |
+|---|---|---|---|---|---|---|---|---|
+| 1e3 | 1.0 | 16 | 25 | 13 | 8.6 | 25 | 12.5 | 7.9 |
+| 1e4 | 0.9 | 14 | 29 | 20 | 12.8 | 25-28 | 17 | 9 |
+| 1e5 | 1.0 | 26-31 | 107-129 | 48-61 | 27-41 | 50-74 | 26-40 | 13-17 |
+| 1e6 | 2.8-4.5 | 63-66 | 176-180 | 102-128 | 84-109 | 100-129 | 42 | 43-50 |
+| 4e6 | 4.7-5.8 | 81-96 | 430-439 | 151-181 | 140-166 | 307-310 | 99-143 | 70-105 |
+
+Reading:
+
+1. From 1e3 to 4e6 a hit gets 9-17x more expensive on every policy and
+   backing. That rise is the cache-miss factor, and at scale it dwarfs the
+   gaps between policies.
+2. Up to ~1e4 entries everything fits in L1/L2 (8-29 ns per hit). Cache-miss
+   engineering pays only for caches >= ~1e5 entries: server-side Node, large
+   memo tables, asset / tile caches. Scope any layout work to that audience.
+3. The biggest levers are already pulled:
+   - writes per hit: SIEVE vs LRU is 1.4-2.6x at >= 1e5, which is DEBATE.md
+     section 2's "fewer writes per hit", now with a locality reading;
+   - a typed-array index instead of `Map`: 2-3x at >= 1e5 (SIEVE / int or
+     dense vs SIEVE / map).
+4. A Map-backed hit costs far more than `Map.get` alone at scale (307 vs
+   81-96 ns at 4e6). Hypothesis, not measured with counters: the
+   `_vis[s]` / `_vals[s]` loads depend on the slot the Map returns, so they
+   cannot overlap with the lookup. Confirm with
+   `perf stat -e cache-misses,LLC-load-misses` on bare metal.
+
+### 10.2 Layout prototype: cache lines touched by a SIEVE int-key hit
+
+Today's `IntSlotStore` (`Lru.js:511`) does
+`_ixSlot[b] -> _ixKey[b] -> _vis[s] -> _vals[s]`: four arrays, up to four
+lines. Prototype variants (same hash, load factor 0.75, linear probing,
+single run, so indicative only):
+
+| capacity | A: today | B: interleaved `[key, slot]` | C: B + visited bit in the slot word | D: one 16-byte record `[key, slot\|vis, value, -]` |
+|---|---|---|---|---|
+| 1e3 | 9.6 | 9.5 | 9.4 | 9.9 |
+| 1e4 | 13.5 | 13.8 | 13.2 | 14.1 |
+| 1e5 | 34.8 | 23.7 | 21.2 | 23.3 |
+| 1e6 | 49.0 | 49.5 | 65.5 (noise?) | 39.9 |
+| 4e6 | 107.7 | 97.2 | 67.8 | 73.5 |
+
+- No gain at <= 1e4. About 1.3-1.6x at >= 1e5 from touching fewer lines.
+- **B is the cheap one.** It interleaves `_ixSlot` / `_ixKey` into one
+  `Int32Array(2 * size)`, changes no semantics, and is local to
+  `IntSlotStore`.
+- **C costs real writes.** SIEVE's hand walks slots, so a visited bit in the
+  bucket needs a slot -> bucket back-pointer that backward-shift deletion
+  must maintain. That is extra writes on put / delete to save one line per
+  hit. Not recommended unless D's bare-metal numbers justify it.
+- **D works only for numeric values**: an opt-in `values: 'f64' | 'i32'`
+  lane. With object values the `_vals[s]` load (and then the object itself)
+  cannot be avoided. Real use cases: memoizing numeric functions,
+  id -> index maps, tile caches. It needs an ADR against the single-surface
+  law.
+
+### 10.3 Swiss / flat hashing for string keys: measured, a dead end
+
+A pure-JS open-addressed table with a 7-bit tag byte per bucket loses to
+native `Map` by **1.5-2.5x at every size** (1e3..1e6). The reasons are
+structural:
+
+- V8 caches each string's hash in the string header and `Map` uses it. JS
+  cannot read it, so every lookup re-hashes the characters.
+- There is no SIMD group probe in JS.
+
+`IntSlotStore` / `DirectSlotStore` already avoid `Map` for integer keys. The
+only route to a faster general-key index is to **not hash strings per
+lookup**: callers intern keys to ints once and use `keys: 'int' | 'dense'`,
+which gets the 2-3x from 10.1. That is API guidance, not a data structure
+(ROADMAP 8, R5). `CACHE_RESEARCH.md` section 4 counts lite-lru's
+typed-array SoA policies as the "flat eviction caches" item, already
+shipped.
+
+### 10.4 The broken mixed-stream generator (FIXED in the working tree, 2026-10-18)
+
+Eleven test sites used `x = (x * 1103515245 + 12345) & 0x7fffffff` with
+`k = x % 20` and `op = x % 5`:
+`test/{Lru:321,663; S3Fifo:390,544; Sieve:377,549; WTinyLfu:469,781; TwoQ:318; Slru:277; Lfu:422}`.
+Two independent defects:
+
+1. **The multiply runs in doubles.** `x` near 2^31 times 1103515245 is near
+   2^61, far past 2^53, so the low bits round away before the mask reads
+   them. Re-verified 2026-10-18: from `x = 1` the generator enters a cycle at
+   step 689 with **period 10,466** (a real LCG mod 2^31 has period 2^31).
+2. **Key and op come from the same draw.** 20 is a multiple of 5, so
+   `op === k % 5` always.
+
+Effect: 500 ops reached **7 of 100 (key, op) pairs**, and `put` touched only
+key 16. So the cap-8 "conservation invariant ... mixed op stream" tests,
+including the four labelled heavy churn, never filled the cache and never
+evicted. The Lfu degenerate-cap site draws kind, key and value separately,
+so it was less affected: 10/40 pairs at cap 2, 40/70 at cap 4, 73/130 at
+cap 8.
+
+Fix: `../Research/lite-lru-test-generators.patch`, moved to
+`.handoff/lite-lru-test-generators.patch` and applied with `patch -p1`.
+- Use `Math.imul(x, 1103515245)`, which is exact 32-bit multiplication.
+- Draw key and op from different high bit ranges: `k = (x >>> 16) % 20`,
+  `op = (x >>> 8) % 5`.
+- Lfu: `rnd` returns `x >>> 8`.
+
+Result: 99/100 pairs, and `put` touches 19 keys. Lfu is at full coverage:
+40/40, 70/70 and 130/130.
+
+Gate with teeth: `test/Generators.test.js`, 5 tests.
+- A source lint fails if any suite reintroduces `x * 1103515245`.
+- Coverage (>= 90 pairs, more than 8 put keys) and an eviction check on a
+  real cap-8 `LiteLru`.
+- A period check.
+- Each has a control that runs the OLD generator through the same predicate
+  and must fail it (7 pairs, 1 put key, 0 evictions, period 10,466).
+
+Revert check: restoring the old multiply in a test file makes the lint test
+fail.
+
+Suite: **2,359 / 2,359 before, 2,364 / 2,364 after** (`npm test`,
+2026-10-18, Node 26.8.2). The ten affected tests now exercise eviction and
+still pass, so no engine bug was hiding behind the gap.
+
+Lesson for the suite: a generator is part of the oracle. Before trusting a
+fuzz or soak run, measure the generator's period and its (key, op) coverage.
+Production hashing in lite-lru already uses `Math.imul` throughout.
+
+### 10.5 Bitwise notes that concern lite-lru (`BITWISE_RESEARCH.md` section 8)
+
+- W-TinyLFU's eight 4-bit counters per `Uint32` (SWAR), halved with
+  `(w >>> 1) & 0x77777777`, are done right. The trap to keep guarding is a
+  carry crossing lanes: saturate before adding.
+- Values >= 2^30 box in Chrome object fields under pointer compression
+  (section 9's audit already applies this suite-wide). Keep bit words in
+  typed arrays.
+
+### 10.6 Cross-package notes
+
+- **Dual index** (`CACHE_RESEARCH.md` section 5.5): for workloads that mix
+  point gets with range scans, pair a lite-lru / lite-o1 hash with a
+  lite-logn ordered side index over the same ids. Every mutation writes
+  twice, and index memory doubles. It is a recipe for GUIDE.md, not a
+  member.
+- **A filter in front of the cache is not a miss reducer in memory**
+  (`CACHE_RESEARCH.md` section 3.4). It pays off only in front of something
+  much more expensive than a memory probe.
+- **SharedArrayBuffer / cross-worker** (ROADMAP section 7, deferred item 11):
+  the suite's lossless cross-thread queue research now lives in
+  `../LiteWorker/RESEARCH.md`, built on Dmitry Vyukov's bounded MPMC queue.
+  A cross-worker cache would sit on that transport, not inside this package.
+
+---
+
 *This document consolidates design discussion, theoretical grounding, and experimental code for the lite-lru project. It
 is intended as an internal research reference.*
